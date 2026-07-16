@@ -1,7 +1,7 @@
 """Helper module for simulating cryo-EM volumes."""
 
-from ttsim3d.models import Simulator, SimulatorConfig
 import numpy as np
+from ttsim3d.models import Simulator, SimulatorConfig
 
 
 def simulate_volume(

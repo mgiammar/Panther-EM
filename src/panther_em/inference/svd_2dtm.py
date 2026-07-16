@@ -81,11 +81,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 import torch
 from tqdm import tqdm
 
-from panther_em.decomposition.result import DecompositionResult
 from panther_em.inference.correlation import (
     build_cartesian_kernels,
     compute_feature_stack,
@@ -535,32 +533,6 @@ class FeatureTiling:
             group.accumulate_into(Y_flat, W_flat, out, conjugate=True)
 
         return out
-
-
-# def correlogram_from_spectrum(spectrum: torch.Tensor, n_psi: int) -> torch.Tensor:
-#     r"""Inverse ``\kappa -> \psi`` transform of a ``(.., K)`` angular spectrum.
-
-#     Mirrors the convention pinned in :func:`contract_weights_to_correlations`: the
-#     conjugated forward-normalised :func:`torch.fft.irfft` over the ``k_max``
-#     non-negative bins, Hermitian-extending ``k < 0`` and leaving the kernels'
-#     ``1/sqrt(N_\psi)`` scale intact.
-
-#     Parameters
-#     ----------
-#     spectrum : torch.Tensor
-#         Complex spectrum ``(.., K)`` (e.g. the ``C`` returned by
-#         :meth:`FeatureTiling.run`).
-#     n_psi : int
-#         Number of in-plane samples ``N_\psi`` to synthesise.
-
-#     Returns
-#     -------
-#     torch.Tensor
-#         Real float32 correlogram ``(.., n_psi)``; index ``a`` is ``\psi_a =
-#         360 * a / n_psi`` degrees.
-#     """
-#     corr = torch.fft.irfft(spectrum.conj(), n=n_psi, dim=-1, norm="forward")
-#     return corr * _PSI_IRFFT_SCALE
 
 
 class FeaturizedImageStore:
