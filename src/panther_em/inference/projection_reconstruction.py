@@ -24,10 +24,6 @@ class ProjectionReconstructor:
         self._coordinate_transform = result.coordinate_transform
         self.image_shape: tuple[int, int] = self._coordinate_transform.cartesian_shape
 
-        # GridTransform is device-agnostic; GPU dispatch is handled internally.
-        self._coordinate_transform = result.coordinate_transform
-        self.image_shape: tuple[int, int] = self._coordinate_transform.cartesian_shape
-
     def clear_coordinate_transform_cache(self) -> None:
         """Remove any cached interpolation grids."""
         self._coordinate_transform.clear_cache()
