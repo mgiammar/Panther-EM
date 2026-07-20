@@ -1,0 +1,124 @@
+"""Multi-stage (multi-precision) incremental SVD-2DTM search."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+import torch
+
+from panther_em.inference.search.compressed import _run_stage, resolve_search_args
+from panther_em.inference.search.tiling import (
+    FeatureTiling,
+    FeaturizedImageStore,
+    Rectangle,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator, Sequence
+
+    from panther_em.inference.projection_reconstruction import ProjectionReconstructor
+
+
+@torch.no_grad()
+def incremental_search(
+    image: torch.Tensor,
+    reconstructor: ProjectionReconstructor,
+    stage_rectangles: Sequence[Sequence[Rectangle]],
+    *,
+    pixel_batch: int,
+    hyp_batch: int,
+    n_psi: int,
+    feature_chunk: int,
+    store: FeaturizedImageStore | None = None,
+    hypothesis_indexes: torch.Tensor | None = None,
+    pixel_index: torch.Tensor | None = None,
+    follow_up_fn: (
+        Callable[[dict[str, torch.Tensor], torch.Tensor], torch.Tensor | None] | None
+    ) = None,
+    **polar_to_cart_kwargs: Any,
+) -> Iterator[dict[str, torch.Tensor]]:
+    r"""Incremental SVD-2DTM search; yields per-pixel statistics per stage.
+
+    TODO: Integrate the error-aware decision process into the follow up function for
+          both pixel and hypothesis selection. Error-aware decision process not yet
+          implemented (see :mod:`panther_em.inference.search.statistics`).
+
+    Implements the multi-precision strategy: each stage selects a (typically higher-
+    rank) set of contiguous feature-space rectangles and runs one compressed search
+    (:func:`_run_stage`), reusing the image features computed in earlier stages. Between
+    stages an external caller narrows the pixel set through ``follow_up_fn``.
+
+    Parameters
+    ----------
+    image : torch.Tensor
+        Real image of shape ``(H, W)``.
+    reconstructor : ProjectionReconstructor
+        Holds the SVD tensors, polar transform, and device.
+    stage_rectangles : Sequence[Sequence[Rectangle]]
+        One list of ``(k_start, m_start, k_extent, m_extent)`` rectangles per stage.
+        Rectangles within a stage must be pairwise cell-disjoint.
+    pixel_batch : int
+        Batch size for the pixel loop.
+    hyp_batch : int
+        Batch size for the hypothesis loop.
+    n_psi : int
+        Number of in-plane samples.
+    feature_chunk : int
+        Kernel-correlation chunk size for featurizing missing cells.
+    store : FeaturizedImageStore, optional
+        Persistent feature store to reuse across calls. A fresh one sized to the image's
+        valid-correlation grid is created when omitted.
+    hypothesis_indexes : torch.Tensor, optional
+        Long indices into the flattened ``(FF * O)`` template space to search. Defaults
+        to all templates.
+    pixel_index : torch.Tensor, optional
+        Long indices into the ``P`` valid-correlation pixels for the *first* stage (e.g.
+        an initial mask). Defaults to all pixels. Subsequent stages use the mask
+        returned by ``follow_up_fn``.
+    follow_up_fn : callable, optional
+        ``(stats, pixel_index) -> next_pixel_index | None`` mapping a stage's finalized
+        statistics and the pixels it ran on to the follow-up pixel mask for the next
+        stage. Returning ``None`` (the default behaviour when omitted) keeps the same
+        pixel set.
+    **polar_to_cart_kwargs
+        Forwarded to kernel construction when featurizing cells.
+
+    Yields
+    ------
+    dict[str, torch.Tensor]
+        Per stage, the finalized :meth:`PixelStats.finalize` maps (``"mip"``,
+        ``"zscore"``, ``"mean"``, ``"variance"``, ``"best_index"``, ``"best_psi"``)
+        each of shape ``(P_stage,)``, indexed by the stage's pixel set.
+    """
+    device = reconstructor.device
+    n_px, hypothesis_indexes, pixel_index = resolve_search_args(
+        image, reconstructor, hypothesis_indexes, pixel_index
+    )
+
+    if store is None:
+        store = FeaturizedImageStore(n_px, device=device)
+
+    px = pixel_index
+    for rects in stage_rectangles:  # stages -- increasing rank
+        tiling = FeatureTiling.from_extents(rects, device=device)
+        stage_maps = _run_stage(
+            image,
+            reconstructor,
+            tiling,
+            store,
+            hypothesis_indexes=hypothesis_indexes,
+            pixel_index=px,
+            pixel_batch=pixel_batch,
+            hyp_batch=hyp_batch,
+            n_psi=n_psi,
+            feature_chunk=feature_chunk,
+            **polar_to_cart_kwargs,
+        )
+
+        yield stage_maps
+
+        # Hand the follow-up mask (selection logic) back to the next stage.
+        if follow_up_fn is not None:
+            nxt = follow_up_fn(stage_maps, px)
+            if nxt is not None:
+                px = nxt

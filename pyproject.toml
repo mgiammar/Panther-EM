@@ -145,10 +145,10 @@ show_error_codes = true
 pretty = true
 # plugins = ["pydantic.mypy"]
 
-# # module specific overrides
-# [[tool.mypy.overrides]]
-# module = ["numpy.*",]
-# ignore_errors = true
+# module specific overrides
+[[tool.mypy.overrides]]
+module = "panther_em.inference.search.*"
+disallow_untyped_decorators = false
 
 # https://coverage.readthedocs.io/
 [tool.coverage.report]
@@ -181,3 +181,5 @@ ignore = [
 # https://github.com/crate-ci/typos/blob/master/docs/reference.md
 [tool.typos.default]
 extend-ignore-identifiers-re = []
+
+
