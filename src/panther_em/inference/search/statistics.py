@@ -139,13 +139,14 @@ class PixelStats:
         std = variance.sqrt()
         zscore = (self.best_corr - mean) / std.clamp_min(1e-12)
 
+        # Calling .clone() on tensors ensures no overwriting on re-use after stats.clear
         return {
-            "mip": self.best_corr,
-            "zscore": zscore,
-            "mean": mean,
-            "variance": variance,
-            "best_index": self.best_hypothesis,
-            "best_psi": self.best_psi_angle,
+            "mip": self.best_corr.clone(),
+            "zscore": zscore.clone(),
+            "mean": mean.clone(),
+            "variance": variance.clone(),
+            "best_index": self.best_hypothesis.clone(),
+            "best_psi": self.best_psi_angle.clone(),
         }
 
 

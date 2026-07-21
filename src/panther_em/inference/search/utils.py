@@ -208,7 +208,8 @@ def featurize_cells(
     Parameters
     ----------
     image : torch.Tensor
-        Real image of shape ``(H, W)`` (single image; ``P = out_h * out_w``).
+        Real image of shape ``(H, W)`` (single image) or ``(B, H, W)`` (a batch of
+        images sharing the same valid-correlation grid ``P = out_h * out_w``).
     reconstructor : ProjectionReconstructor
         Builds the kernels and supplies the polar transform / device.
     cells : torch.Tensor
@@ -222,9 +223,8 @@ def featurize_cells(
     Returns
     -------
     torch.Tensor
-        Complex features of shape ``(n_cells, P)``.
+        Complex features of shape ``(n_cells, B * P)``.
     """
-    # TODO: Add support for >1 batch dimension (e.g. multiple image classes)
     z = build_block_feature_stack(
         image,
         reconstructor,
@@ -233,9 +233,10 @@ def featurize_cells(
         **polar_to_cart_kwargs,
     )
 
-    _b, n_cells, out_h, out_w = z.shape
+    b, n_cells, out_h, out_w = z.shape
 
-    return z.reshape(n_cells, out_h * out_w)
+    # (B, n_cells, out_h, out_w) -> (n_cells, B * out_h * out_w), batch-major pixels.
+    return z.permute(1, 0, 2, 3).reshape(n_cells, b * out_h * out_w)
 
 
 def build_block_weights(

@@ -10,6 +10,7 @@ feature store. The shared engine is :func:`_run_stage`.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -26,14 +27,73 @@ if TYPE_CHECKING:
     from panther_em.inference.projection_reconstruction import ProjectionReconstructor
 
 
-def _searchable_pixels(
+def _search_output_shape(
     image: torch.Tensor, reconstructor: ProjectionReconstructor
-) -> int:
-    """Number of valid cross-correlation output pixels ``P`` for ``image``."""
+) -> tuple[int, int, int]:
+    """``(B, out_h, out_w)`` valid cross-corr grid for a ``(..., H, W)`` image."""
+    leading_dims = image.shape[:-2] if image.dim() > 2 else None
+
     k_h, k_w = reconstructor.image_shape
-    out_h = image.shape[-2] - k_h + 1
-    out_w = image.shape[-1] - k_w + 1
-    return int(out_h * out_w)
+    out_h = int(image.shape[-2] - k_h + 1)
+    out_w = int(image.shape[-1] - k_w + 1)
+    b = math.prod(leading_dims) if leading_dims is not None else 1
+
+    return int(b), out_h, out_w
+
+
+def _resolve_pixel_layout(
+    pixel_index: torch.Tensor | None,
+    leading: tuple[int, ...],
+    batch: int,
+    n_px_per_image: int,
+    out_h: int,
+    out_w: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, tuple[int, ...] | None]:
+    """Map the caller's pixel selection to a flat ``batch * P`` index + output reshape.
+
+    Parameters
+    ----------
+    pixel_index : torch.Tensor | None
+        ``None`` for the whole search. A 1D tensor is a single per-image pixel
+        selection (indices into ``[0, P)``) applied identically to every batch element.
+        A tensor with **more than one dimension** is treated as caller-owned flat
+        indices into the ``batch * P`` axis.
+    leading : tuple[int, ...]
+        The image's leading batch dimensions (``()`` for a single ``(H, W)`` image).
+    batch : int
+        ``math.prod(leading)`` -- the flattened batch size.
+    n_px_per_image : int
+        ``P = out_h * out_w`` valid-correlation pixels per image.
+    out_h, out_w : int
+        Valid-correlation grid dimensions.
+    device : torch.device
+        Device for the built index tensors.
+
+    Returns
+    -------
+    flat_pixel_index : torch.Tensor
+        Long indices into the flattened ``batch * P`` pixel axis for :func:`_run_stage`.
+    reshape_shape : tuple[int, ...] | None
+        Target shape for every returned map, or ``None`` to leave the maps flat (the
+        caller is responsible for placing the values).
+    """
+    # All pixels selected
+    if pixel_index is None:
+        flat = torch.arange(batch * n_px_per_image, device=device)
+        return flat, (*leading, out_h, out_w)
+
+    pixel_index = pixel_index.to(device=device, dtype=torch.long)
+
+    # Consistent mask across all batches, reshape to (*leading, n_mask) for the maps
+    if pixel_index.dim() == 1:
+        n_mask = int(pixel_index.numel())
+        offsets = (torch.arange(batch, device=device) * n_px_per_image).view(batch, 1)
+        flat = (offsets + pixel_index.view(1, n_mask)).reshape(-1)
+        return flat, (*leading, n_mask)
+
+    # A higher-dimensional (inconsistent / per-batch) selection
+    return pixel_index.reshape(-1), None
 
 
 def resolve_search_args(
@@ -47,7 +107,7 @@ def resolve_search_args(
     Parameters
     ----------
     image : torch.Tensor
-        Real image of shape ``(..., H, W)``.
+        Real image of shape ``(H, W)`` or a batch ``(B, H, W)``.
     reconstructor : ProjectionReconstructor
         Holds the SVD tensors, polar transform, and device.
     hypothesis_indexes : torch.Tensor | None
@@ -55,14 +115,14 @@ def resolve_search_args(
         includes all hypotheses. Set to a non-None long tensor to restrict the search to
         a subset of hypotheses.
     pixel_index : torch.Tensor | None
-        Long indices into the ``P`` valid-correlation pixels. By default is ``None``
-        which includes all pixels. Set to a non-None long tensor to restrict the search
-        to a subset of pixels.
+        Long indices into the ``B * P`` valid-correlation pixels (batch flattened into
+        the pixel axis, batch-major). By default is ``None`` which includes all pixels.
+        Set to a non-None long tensor to restrict the search to a subset of pixels.
 
     Returns
     -------
     n_px : int
-        Number of valid cross-correlation pixels.
+        Total number of valid cross-correlation pixels ``B * out_h * out_w``.
     hypothesis_indexes : torch.Tensor
         Long indices into the flattened hypothesis space.
     pixel_index : torch.Tensor
@@ -73,7 +133,8 @@ def resolve_search_args(
     result = reconstructor.result
     device = reconstructor.device
 
-    n_px = _searchable_pixels(image, reconstructor)
+    b, out_h, out_w = _search_output_shape(image, reconstructor)
+    n_px = b * out_h * out_w
 
     if hypothesis_indexes is None:
         hypothesis_indexes = torch.arange(
@@ -212,14 +273,17 @@ def compressed_search(
 
     Builds a fresh feature store, featurizes the image for the selected ``(k, m)``
     cells, and reduces the search over hypotheses and in-plane angles to per-pixel
-    statistics. For a multi-stage (multi-precision) search that reuses features
-    across selections, see
+    statistics. For a multi-stage (multi-precision) search that reuses features across
+    selections, see
     :func:`panther_em.inference.search.incremental.incremental_search`.
 
     Parameters
     ----------
     image : torch.Tensor
-        Real image of shape ``(H, W)``.
+        Real image of shape ``(H, W)`` or a batch ``(*leading, H, W)`` with any number
+        of leading batch dimensions. All batch images must share the same valid
+        correlation grid; the leading dims are flattened into the pixel axis (batch
+        major) and reduced independently per pixel.
     reconstructor : ProjectionReconstructor
         Holds the SVD tensors, polar transform, and device.
     rectangles : list[Rectangle]
@@ -238,8 +302,7 @@ def compressed_search(
         Long indices into the flattened ``(FF * O)`` template space to search.
         Defaults to all templates.
     pixel_index : torch.Tensor, optional
-        Long indices into the ``P`` valid-correlation pixels (e.g. a mask). Defaults
-        to all pixels.
+        Pixel selection (mask). ``None`` (default) searches all pixels.
     **polar_to_cart_kwargs
         Forwarded to kernel construction.
 
@@ -247,29 +310,57 @@ def compressed_search(
     -------
     dict[str, torch.Tensor]
         The finalized per-pixel statistic maps (``"mip"``, ``"zscore"``, ``"mean"``,
-        ``"variance"``, ``"best_index"``, ``"best_psi"``), each of shape
-        ``(P_stage,)`` indexed by ``pixel_index``.
+        ``"variance"``, ``"best_index"``, ``"best_psi"``). Each map's shape depends on
+        the image rank and the ``pixel_index`` layout:
+
+        * no mask -> ``(*leading, out_h, out_w)`` (a single ``(H, W)`` image gives the
+          plain ``(out_h, out_w)`` grid);
+        * a 1D mask of ``n_mask`` pixels -> ``(*leading, n_mask)`` (a single image
+          gives ``(n_mask,)``);
+        * a multi-dimensional mask -> flat ``(n_selected,)``. Caller responsible for any
+          reshaping.
     """
     device = reconstructor.device
-    n_px, hypothesis_indexes, pixel_index = resolve_search_args(
-        image, reconstructor, hypothesis_indexes, pixel_index
+
+    # Flatten any leading batch dimensions into (B, H, W)
+    leading = tuple(image.shape[:-2])
+    h, w = int(image.shape[-2]), int(image.shape[-1])
+    batch = math.prod(leading) if leading else 1
+    image_bhw = image.reshape(batch, h, w)
+
+    _, out_h, out_w = _search_output_shape(image_bhw, reconstructor)
+    n_px_per_image = out_h * out_w
+    n_px = batch * n_px_per_image
+
+    if hypothesis_indexes is None:
+        meta = reconstructor.result
+        hypothesis_indexes = torch.arange(
+            meta.num_fourier_filters * meta.num_orientations, device=device
+        )
+
+    flat_pixel_index, reshape_shape = _resolve_pixel_layout(
+        pixel_index, leading, batch, n_px_per_image, out_h, out_w, device
     )
 
     store = FeaturizedImageStore(n_px, device=device)
     tiling = FeatureTiling.from_extents(rectangles, device=device)
 
     result: dict[str, torch.Tensor] = _run_stage(
-        image,
+        image_bhw,
         reconstructor,
         tiling,
         store,
         hypothesis_indexes=hypothesis_indexes,
-        pixel_index=pixel_index,
+        pixel_index=flat_pixel_index,
         pixel_batch=pixel_batch,
         hyp_batch=hyp_batch,
         n_psi=n_psi,
         feature_chunk=feature_chunk,
         **polar_to_cart_kwargs,
     )
+
+    # Restore leading batch dims + the valid-correlation grid where determinable.
+    if reshape_shape is not None:
+        result = {key: value.reshape(reshape_shape) for key, value in result.items()}
 
     return result
