@@ -75,6 +75,7 @@ def build_multichannel_correlogram(
     *,
     out: torch.Tensor | None = None,  # shape (B, r, out_H, out_W)
     feature_chunk: int | None = None,
+    show_progress: bool = True,
 ) -> torch.Tensor:  # shape (B, r, out_H, out_W)
     r"""Cross-correlate an image against a Cartesian feature stack.
 
@@ -92,6 +93,8 @@ def build_multichannel_correlogram(
     feature_chunk : int, optional
         Number of kernels to correlate per FFT batch, bounding transient FFT memory.
         Defaults to all kernels at once.
+    show_progress : bool, optional
+        Show a progress bar for the feature correlation loop. Defaults to True.
 
     Returns
     -------
@@ -139,14 +142,19 @@ def build_multichannel_correlogram(
         )
 
     chunk = feature_chunk if feature_chunk is not None else r
-    for start in tqdm(
+    feat_bar = tqdm(
         range(0, r, chunk),
-        desc="Building multi-channel corr",
-        unit="kernel",
-    ):
+        desc="correlating features",
+        unit="features",
+        unit_scale=True,
+        disable=not show_progress,
+    )
+    for start in range(0, r, chunk):
         stop = min(start + chunk, r)
         tmp = compute_feature_stack(image, kernels[start:stop])
         z_flat[:, start:stop] = tmp.to(z_flat.device)  # NOTE: may be different device
+
+        feat_bar.update(int(tmp.shape[0]))
 
     return z_flat
 

@@ -14,6 +14,7 @@ import math
 from typing import TYPE_CHECKING, Any
 
 import torch
+from tqdm import tqdm
 
 from panther_em.inference.search.statistics import PixelStats
 from panther_em.inference.search.tiling import (
@@ -160,6 +161,7 @@ def _run_stage(
     feature_chunk: int,
     hypothesis_indexes: torch.Tensor,
     pixel_index: torch.Tensor,
+    show_progress: bool = True,
     **polar_to_cart_kwargs: Any,
 ) -> dict[str, torch.Tensor]:
     r"""Run one tiling end-to-end and reduce it to per-pixel statistics.
@@ -194,6 +196,9 @@ def _run_stage(
         Long indices into the flattened hypothesis space.
     pixel_index : torch.Tensor
         Long indices into the ``P`` valid-correlation pixels to search.
+    show_progress : bool, optional
+        Show tqdm progress bars over the pixel-batch and hypothesis-batch loops.
+        Defaults to ``True``.
     **polar_to_cart_kwargs
         Forwarded to kernel construction when featurizing cells.
 
@@ -227,7 +232,20 @@ def _run_stage(
     w_layout = build_layout_weights(reconstructor, tiling)
     pixel_stats = PixelStats(pixel_batch, device=device)
 
-    for p0 in range(0, int(pixel_index.numel()), pixel_batch):
+    n_pixels = int(pixel_index.numel())
+    n_hypotheses = int(hypothesis_indexes.numel())
+
+    # Progress bars advance by the number of pixels / hypotheses actually processed
+    # each batch, so their rate reads in pixels/s and hypotheses/s (not batches/s).
+    pixel_bar = tqdm(
+        total=n_pixels,
+        desc="search pixels",
+        unit="pixel",
+        unit_scale=True,
+        disable=not show_progress,
+    )
+
+    for p0 in range(0, n_pixels, pixel_batch):
         px_b = pixel_index[p0 : p0 + pixel_batch]
         Y_flat = store.image_view(px_b)
 
@@ -237,7 +255,15 @@ def _run_stage(
         else:
             pixel_stats.clear()
 
-        for h0 in range(0, int(hypothesis_indexes.numel()), hyp_batch):
+        hyp_bar = tqdm(
+            total=n_hypotheses,
+            desc="hypotheses",
+            unit="hypothesis",
+            unit_scale=True,
+            disable=not show_progress,
+            leave=False,
+        )
+        for h0 in range(0, n_hypotheses, hyp_batch):
             hyp_b = hypothesis_indexes[h0 : h0 + hyp_batch]
             W_flat = w_layout[hyp_b]  # (N_b, r)
 
@@ -246,7 +272,14 @@ def _run_stage(
             corr = torch.fft.irfft(C.conj(), n=n_psi, dim=-1, norm="forward")
             pixel_stats.update(corr, hyp_b)
 
+            hyp_bar.update(int(hyp_b.numel()))
+
+        hyp_bar.close()
+
         stage_stats.append(pixel_stats.finalize())
+        pixel_bar.update(int(px_b.numel()))
+
+    pixel_bar.close()
 
     # Stitch the pixel batches back into stage-level maps.
     # NOTE: This return may change into a different dict or helper class in future...
@@ -267,6 +300,7 @@ def compressed_search(
     feature_chunk: int,
     hypothesis_indexes: torch.Tensor | None = None,
     pixel_index: torch.Tensor | None = None,
+    show_progress: bool = True,
     **polar_to_cart_kwargs: Any,
 ) -> dict[str, torch.Tensor]:
     r"""Single-stage SVD-2DTM search over one selection of feature rectangles.
@@ -303,6 +337,9 @@ def compressed_search(
         Defaults to all templates.
     pixel_index : torch.Tensor, optional
         Pixel selection (mask). ``None`` (default) searches all pixels.
+    show_progress : bool, optional
+        Show tqdm progress bars over the pixel-batch and hypothesis-batch loops.
+        Defaults to ``True``.
     **polar_to_cart_kwargs
         Forwarded to kernel construction.
 
@@ -356,6 +393,7 @@ def compressed_search(
         hyp_batch=hyp_batch,
         n_psi=n_psi,
         feature_chunk=feature_chunk,
+        show_progress=show_progress,
         **polar_to_cart_kwargs,
     )
 
