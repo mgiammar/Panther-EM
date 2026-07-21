@@ -185,6 +185,7 @@ def process_batch(
     transformer: CoordinateTransform,
     warp_polar_kwargs: dict,
     fftfreq_max: float = 0.5,
+    normalize_projections: bool = False,
 ) -> tuple[torch.Tensor, bool, int]:
     """Generate a batch of polar proj. from a DFT, FFT along angular dim.
 
@@ -208,6 +209,9 @@ def process_batch(
         Additional kwargs forwarded to ``transformer.to_transform_space``.
     fftfreq_max : float
         Maximum frequency in cycles per pixel for Fourier slicing. Default is 0.5.
+    normalize_projections : bool
+        If True, normalize projections to have mean zero and unit variance. Default is
+        False so projections are un-normalized.
 
     Returns
     -------
@@ -232,6 +236,10 @@ def process_batch(
     )
 
     projections_filtered = apply_fourier_filters(projections, fourier_filters)
+
+    if normalize_projections:
+        var, mean = torch.var_mean(projections_filtered, dim=(-2, -1), keepdim=True)
+        projections_filtered = (projections_filtered - mean) / torch.sqrt(var + 1e-8)
 
     # to_transform_space expects a single batch dimension; flatten the two outer dims.
     num_defocus = fourier_filters.shape[0]
@@ -278,6 +286,7 @@ def do_pipelined_projection_and_transforms(
     projection_batch_size: int = 128,
     pad_factor: float = 2.0,
     fftfreq_max: float = 0.5,
+    normalize_projections: bool = False,
     show_progress: bool = True,
 ) -> tuple[torch.Tensor, bool]:
     """Pipelined generation and transforms of projections in polar coordinates.
@@ -302,6 +311,9 @@ def do_pipelined_projection_and_transforms(
         Volume padding factor for Fourier slicing. Default is 2.0.
     fftfreq_max : float
         Maximum frequency in cycles per pixel. Default is 0.5.
+    normalize_projections : bool
+        If True, normalize projections to have mean zero and unit variance. Default is
+        False so projections are un-normalized.
     show_progress : bool
         Whether to show a tqdm progress bar. Default is True.
 
@@ -351,6 +363,7 @@ def do_pipelined_projection_and_transforms(
         transformer=transformer,
         warp_polar_kwargs=warp_polar_kwargs,
         fftfreq_max=fftfreq_max,
+        normalize_projections=normalize_projections,
     )
 
     # Allocate memory on CPU for full storage
@@ -387,6 +400,7 @@ def do_pipelined_projection_and_transforms(
             transformer=transformer,
             warp_polar_kwargs=warp_polar_kwargs,
             fftfreq_max=fftfreq_max,
+            normalize_projections=normalize_projections,
         )
 
         if is_complex:

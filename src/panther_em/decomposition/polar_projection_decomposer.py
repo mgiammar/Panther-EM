@@ -87,7 +87,8 @@ class PolarProjectionDecomposer:
         if coordinate_transform.cartesian_shape != tuple(self.volume.shape[-2:]):
             raise ValueError(
                 "coordinate_transform.cartesian_shape must match volume image shape "
-                f"{tuple(self.volume.shape[-2:])}, got {coordinate_transform.cartesian_shape}"
+                f"{tuple(self.volume.shape[-2:])}, got "
+                f"{coordinate_transform.cartesian_shape}"
             )
 
         self._coordinate_transform: CoordinateTransform = coordinate_transform
@@ -144,6 +145,7 @@ class PolarProjectionDecomposer:
         eig_max: int | None = None,
         projection_batch_size: int = 128,
         block_batch_size: int = 8,
+        normalize_projections: bool = False,
     ) -> DecompositionResult:
         """Run the block-circulant decomposition using the held orientations.
 
@@ -168,6 +170,9 @@ class PolarProjectionDecomposer:
         block_batch_size : int, optional
             Number of frequency blocks to process at a time on GPU for SVD.
             Default is 8.
+        normalize_projections : bool, optional
+            If True, normalize projections to have mean zero and unit variance before
+            decomposition. Default is False.
 
         Returns
         -------
@@ -190,6 +195,7 @@ class PolarProjectionDecomposer:
                 transformer=transformer,
                 warp_polar_kwargs={"preserve_energy": True},
                 projection_batch_size=projection_batch_size,
+                normalize_projections=normalize_projections,
             )
         )
 
@@ -206,6 +212,7 @@ class PolarProjectionDecomposer:
         )
 
         # Validate and select frequency block range
+        # TODO: bring this logic into its own helper function...
         # NOTE: For complex projection data (when `is_complex=True`) frequency blocks
         #       are stored in fftshifted order ranging from -k_max to +k_max. Select
         #       block indices accordingly
