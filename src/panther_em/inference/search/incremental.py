@@ -32,6 +32,8 @@ def incremental_search(
     store: FeaturizedImageStore | None = None,
     hypothesis_indexes: torch.Tensor | None = None,
     pixel_index: torch.Tensor | None = None,
+    compute_device: torch.device | str | None = None,
+    feature_store_device: torch.device | str | None = None,
     follow_up_fn: (
         Callable[[dict[str, torch.Tensor], torch.Tensor], torch.Tensor | None] | None
     ) = None,
@@ -75,6 +77,14 @@ def incremental_search(
         Long indices into the ``P`` valid-correlation pixels for the *first* stage (e.g.
         an initial mask). Defaults to all pixels. Subsequent stages use the mask
         returned by ``follow_up_fn``.
+    compute_device : torch.device or str, optional
+        Device for the contraction, ``irfft``, and per-pixel statistics. Defaults to
+        ``reconstructor.device``.
+    feature_store_device : torch.device or str, optional
+        Device the persistent feature store is held on. Defaults to ``compute_device``.
+        Set to ``"cpu"`` to keep large feature stacks off the compute device; each
+        pixel batch is streamed back to ``compute_device`` as it is processed. Ignored
+        when an explicit ``store`` is supplied.
     follow_up_fn : callable, optional
         ``(stats, pixel_index) -> next_pixel_index | None`` mapping a stage's finalized
         statistics and the pixels it ran on to the follow-up pixel mask for the next
@@ -90,17 +100,26 @@ def incremental_search(
         ``"zscore"``, ``"mean"``, ``"variance"``, ``"best_index"``, ``"best_psi"``)
         each of shape ``(P_stage,)``, indexed by the stage's pixel set.
     """
-    device = reconstructor.device
+    compute_device = (
+        torch.device(compute_device)
+        if compute_device is not None
+        else reconstructor.device
+    )
+    feature_store_device = (
+        torch.device(feature_store_device)
+        if feature_store_device is not None
+        else compute_device
+    )
     n_px, hypothesis_indexes, pixel_index = resolve_search_args(
         image, reconstructor, hypothesis_indexes, pixel_index
     )
 
     if store is None:
-        store = FeaturizedImageStore(n_px, device=device)
+        store = FeaturizedImageStore(n_px, device=feature_store_device)
 
     px = pixel_index
     for rects in stage_rectangles:  # stages -- increasing rank
-        tiling = FeatureTiling.from_extents(rects, device=device)
+        tiling = FeatureTiling.from_extents(rects, device=compute_device)
         stage_maps = _run_stage(
             image,
             reconstructor,
@@ -112,6 +131,7 @@ def incremental_search(
             hyp_batch=hyp_batch,
             n_psi=n_psi,
             feature_chunk=feature_chunk,
+            compute_device=compute_device,
             **polar_to_cart_kwargs,
         )
 

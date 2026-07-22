@@ -148,13 +148,14 @@ def build_multichannel_correlogram(
         unit="features",
         unit_scale=True,
         disable=not show_progress,
+        total=r
     )
     for start in range(0, r, chunk):
         stop = min(start + chunk, r)
         tmp = compute_feature_stack(image, kernels[start:stop])
         z_flat[:, start:stop] = tmp.to(z_flat.device)  # NOTE: may be different device
 
-        feat_bar.update(int(tmp.shape[0]))
+        feat_bar.update(stop - start)
 
     return z_flat
 
@@ -209,6 +210,7 @@ def featurize_cells(
     cells: torch.Tensor,
     *,
     feature_chunk: int | None = None,
+    feature_store_device: torch.device | str | None = None,
     **polar_to_cart_kwargs: Any,
 ) -> torch.Tensor:
     """Cross-correlate an image against the kernels for a set of feature cells.
@@ -225,19 +227,39 @@ def featurize_cells(
         :meth:`FeaturizedImageStore.missing_cells`.
     feature_chunk : int, optional
         Kernel-correlation chunk size (see :func:`build_multichannel_correlogram`).
+    feature_store_device : torch.device or str, optional
+        Device the returned features should land on. When set (e.g. ``"cpu"`` while
+        featurizing on the GPU), the output stack is allocated there and each
+        ``feature_chunk`` is copied over as it is computed. When omitted the features
+        stay on the kernels' (reconstructor's) device.
     **polar_to_cart_kwargs
         Forwarded to kernel construction.
 
     Returns
     -------
     torch.Tensor
-        Complex features of shape ``(n_cells, B * P)``.
+        Complex features of shape ``(n_cells, B * P)`` on ``feature_store_device``
+        (or the reconstructor's device when that is ``None``).
     """
+    out = None
+    if feature_store_device is not None:
+        image_bhw = _ensure_bhw(image)
+        k_h, k_w = reconstructor.image_shape
+        b = int(image_bhw.shape[0])
+        out_h = int(image_bhw.shape[-2] - k_h + 1)
+        out_w = int(image_bhw.shape[-1] - k_w + 1)
+        out = torch.empty(
+            (b, int(cells.shape[0]), out_h, out_w),
+            dtype=torch.complex64,
+            device=torch.device(feature_store_device),
+        )
+
     z = build_block_feature_stack(
         image,
         reconstructor,
         indices=cells.to(torch.long),
         feature_chunk=feature_chunk,
+        out=out,
         **polar_to_cart_kwargs,
     )
 

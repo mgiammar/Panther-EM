@@ -161,6 +161,7 @@ def _run_stage(
     feature_chunk: int,
     hypothesis_indexes: torch.Tensor,
     pixel_index: torch.Tensor,
+    compute_device: torch.device | str | None = None,
     show_progress: bool = True,
     **polar_to_cart_kwargs: Any,
 ) -> dict[str, torch.Tensor]:
@@ -196,6 +197,10 @@ def _run_stage(
         Long indices into the flattened hypothesis space.
     pixel_index : torch.Tensor
         Long indices into the ``P`` valid-correlation pixels to search.
+    compute_device : torch.device or str, optional
+        Device for the contraction (``bmm``), ``irfft``, and online statistics. The
+        contraction weights and each pixel batch are moved here. Defaults to
+        ``reconstructor.device``.
     show_progress : bool, optional
         Show tqdm progress bars over the pixel-batch and hypothesis-batch loops.
         Defaults to ``True``.
@@ -209,8 +214,11 @@ def _run_stage(
         ``"mean"``, ``"variance"``, ``"best_index"``, ``"best_psi"``) each of shape
         ``(P_stage,)``, indexed by ``pixel_index``.
     """
-    device = image.device
-    result = reconstructor.result
+    compute_device = (
+        torch.device(compute_device)
+        if compute_device is not None
+        else reconstructor.device
+    )
 
     # image feature reuse to avoid re-computation
     features_to_compute = store.missing_cells(tiling)
@@ -220,6 +228,7 @@ def _run_stage(
             reconstructor,
             features_to_compute,
             feature_chunk=feature_chunk,
+            feature_store_device=store.device,
             **polar_to_cart_kwargs,
         )
     else:
@@ -229,8 +238,10 @@ def _run_stage(
     store.relayout(tiling, feats)
 
     stage_stats: list[dict[str, torch.Tensor]] = []
-    w_layout = build_layout_weights(reconstructor, tiling)
-    pixel_stats = PixelStats(pixel_batch, device=device)
+    w_layout = build_layout_weights(reconstructor, tiling).to(compute_device)
+    hypothesis_indexes = hypothesis_indexes.to(compute_device)
+    pixel_index = pixel_index.to(compute_device)
+    pixel_stats = PixelStats(pixel_batch, device=compute_device)
 
     n_pixels = int(pixel_index.numel())
     n_hypotheses = int(hypothesis_indexes.numel())
@@ -248,10 +259,12 @@ def _run_stage(
     for p0 in range(0, n_pixels, pixel_batch):
         px_b = pixel_index[p0 : p0 + pixel_batch]
         Y_flat = store.image_view(px_b)
+        if Y_flat.device != compute_device:
+            Y_flat = Y_flat.to(compute_device, non_blocking=True)
 
         # If not 'pixel_batch' shape, create new 'pixel_stats'
         if Y_flat.shape[0] != pixel_batch:
-            pixel_stats = PixelStats(int(px_b.numel()), device=device)
+            pixel_stats = PixelStats(int(px_b.numel()), device=compute_device)
         else:
             pixel_stats.clear()
 
@@ -300,6 +313,8 @@ def compressed_search(
     feature_chunk: int,
     hypothesis_indexes: torch.Tensor | None = None,
     pixel_index: torch.Tensor | None = None,
+    compute_device: torch.device | str | None = None,
+    feature_store_device: torch.device | str | None = None,
     show_progress: bool = True,
     **polar_to_cart_kwargs: Any,
 ) -> dict[str, torch.Tensor]:
@@ -337,6 +352,13 @@ def compressed_search(
         Defaults to all templates.
     pixel_index : torch.Tensor, optional
         Pixel selection (mask). ``None`` (default) searches all pixels.
+    compute_device : torch.device or str, optional
+        Device for the contraction, ``irfft``, and per-pixel statistics. Defaults to
+        ``reconstructor.device``.
+    feature_store_device : torch.device or str, optional
+        Device the featurized image stack is held on between the featurization and
+        contraction stages. Defaults to ``compute_device``. Set to ``"cpu"`` for large
+        images or image stacks to keep the ``(B * P, r)``.
     show_progress : bool, optional
         Show tqdm progress bars over the pixel-batch and hypothesis-batch loops.
         Defaults to ``True``.
@@ -357,7 +379,16 @@ def compressed_search(
         * a multi-dimensional mask -> flat ``(n_selected,)``. Caller responsible for any
           reshaping.
     """
-    device = reconstructor.device
+    compute_device = (
+        torch.device(compute_device)
+        if compute_device is not None
+        else reconstructor.device
+    )
+    feature_store_device = (
+        torch.device(feature_store_device)
+        if feature_store_device is not None
+        else compute_device
+    )
 
     # Flatten any leading batch dimensions into (B, H, W)
     leading = tuple(image.shape[:-2])
@@ -372,15 +403,15 @@ def compressed_search(
     if hypothesis_indexes is None:
         meta = reconstructor.result
         hypothesis_indexes = torch.arange(
-            meta.num_fourier_filters * meta.num_orientations, device=device
+            meta.num_fourier_filters * meta.num_orientations, device=compute_device
         )
 
     flat_pixel_index, reshape_shape = _resolve_pixel_layout(
-        pixel_index, leading, batch, n_px_per_image, out_h, out_w, device
+        pixel_index, leading, batch, n_px_per_image, out_h, out_w, compute_device
     )
 
-    store = FeaturizedImageStore(n_px, device=device)
-    tiling = FeatureTiling.from_extents(rectangles, device=device)
+    store = FeaturizedImageStore(n_px, device=feature_store_device)
+    tiling = FeatureTiling.from_extents(rectangles, device=compute_device)
 
     result: dict[str, torch.Tensor] = _run_stage(
         image_bhw,
@@ -393,6 +424,7 @@ def compressed_search(
         hyp_batch=hyp_batch,
         n_psi=n_psi,
         feature_chunk=feature_chunk,
+        compute_device=compute_device,
         show_progress=show_progress,
         **polar_to_cart_kwargs,
     )
