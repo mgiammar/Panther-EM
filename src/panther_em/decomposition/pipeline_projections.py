@@ -275,6 +275,65 @@ def process_batch(
     return projections_polar_fft, is_complex, num_angular_mode
 
 
+def _compute_freq_crop(
+    is_complex: bool, num_angular_mode: int, k_max: int | None
+) -> tuple[int, int, int]:
+    """Compute angular-frequency crop indices for the given k_max.
+
+    Parameters
+    ----------
+    is_complex : bool
+        Whether the projections are complex-valued.
+    num_angular_mode : int
+        Total number of angular frequency modes from the FFT.
+    k_max : int | None
+        Maximum angular frequency index to retain. None means keep all.
+
+    Returns
+    -------
+    block_index_min : int
+        Start index (inclusive) along the angular-mode axis.
+    block_index_max : int
+        Stop index (exclusive) along the angular-mode axis.
+    k_max_actual : int
+        The resolved k_max value (after applying the None default).
+    """
+    if is_complex:
+        if num_angular_mode % 2 != 0:
+            raise ValueError(
+                "num_angular_mode must be even for complex projections in fftshifted storage; "
+                f"got num_angular_mode={num_angular_mode}"
+            )
+        allowable = num_angular_mode // 2
+        if k_max is None:
+            k_max_actual = allowable
+        elif k_max < 1 or k_max > allowable:
+            raise ValueError(
+                f"k_max must be in [1, {allowable}] for complex projection data "
+                f"with num_angular_mode={num_angular_mode}, got k_max={k_max}"
+            )
+        else:
+            k_max_actual = k_max
+        dc = num_angular_mode // 2
+        block_index_min = dc - k_max_actual
+        block_index_max = dc + k_max_actual
+    else:
+        allowable = num_angular_mode
+        if k_max is None:
+            k_max_actual = allowable
+        elif k_max < 1 or k_max > allowable:
+            raise ValueError(
+                f"k_max must be in [1, {allowable}] for real projection data "
+                f"with num_angular_mode={num_angular_mode}, got k_max={k_max}"
+            )
+        else:
+            k_max_actual = k_max
+        block_index_min = 0
+        block_index_max = k_max_actual
+
+    return block_index_min, block_index_max, k_max_actual
+
+
 def do_pipelined_projection_and_transforms(
     volume: torch.Tensor,
     phi: torch.Tensor,
@@ -288,7 +347,8 @@ def do_pipelined_projection_and_transforms(
     fftfreq_max: float = 0.5,
     normalize_projections: bool = False,
     show_progress: bool = True,
-) -> tuple[torch.Tensor, bool]:
+    k_max: int | None = None,
+) -> tuple[torch.Tensor, bool, int]:
     """Pipelined generation and transforms of projections in polar coordinates.
 
     Parameters
@@ -316,17 +376,24 @@ def do_pipelined_projection_and_transforms(
         False so projections are un-normalized.
     show_progress : bool
         Whether to show a tqdm progress bar. Default is True.
+    k_max : int | None
+        Maximum angular frequency index to store. Only the ``k_max`` lowest-index
+        blocks (real-valued projections) or the ``2 * k_max`` blocks centred on DC
+        (complex-valued) are written to the CPU buffer. None stores all blocks.
+        Default is None.
 
     Returns
     -------
     torch.Tensor
-        `(num_fourier_filters, num_projections, num_angular_mode, num_radius)`
+        `(num_fourier_filters, num_projections, num_freq_block, num_radius)`
         complex64 tensor on CPU. When underlying projections are complex, angular dim
         has been fft-shifted so that indices correspond to
-        [-N/2, -N/2 + 1, ..., 0, 1, ..., N/2 - 1]. When real valued, corresponds to
-        [0, 1, ..., N/2] frequencies.
+        ``[-k_max, ..., 0, ..., k_max - 1]``. When real valued, corresponds to
+        ``[0, 1, ..., k_max - 1]`` frequencies.
     bool
         Whether the projections are complex-valued.
+    int
+        The resolved ``k_max`` value actually used.
     """
     # TODO: check input shapes/types
 
@@ -366,11 +433,16 @@ def do_pipelined_projection_and_transforms(
         normalize_projections=normalize_projections,
     )
 
-    # Allocate memory on CPU for full storage
+    block_index_min, block_index_max, k_max_actual = _compute_freq_crop(
+        is_complex, num_angular_mode, k_max
+    )
+    num_freq_block = block_index_max - block_index_min
+
+    # Allocate memory on CPU for cropped storage
     num_orientations = phi.shape[0]
     num_filters = fourier_filters.shape[0]
     polar_projections_transformed_cpu = torch.empty(
-        (num_filters, num_orientations, num_angular_mode, num_radius),
+        (num_filters, num_orientations, num_freq_block, num_radius),
         dtype=torch.complex64,
         device="cpu",
         pin_memory=False,
@@ -406,9 +478,10 @@ def do_pipelined_projection_and_transforms(
         if is_complex:
             projections_polar_fft = torch.fft.fftshift(projections_polar_fft, dim=-3)
 
-        # Copy to CPU pinned memory (async for overlap with next batch compute)
+        # Copy to CPU, cropping to the requested k_max window
         polar_projections_transformed_cpu[:, slice_].copy_(
-            projections_polar_fft, non_blocking=True
+            projections_polar_fft[:, :, block_index_min:block_index_max, :],
+            non_blocking=True,
         )
         del projections_polar_fft
 
@@ -424,4 +497,4 @@ def do_pipelined_projection_and_transforms(
 
     del dft
 
-    return polar_projections_transformed_cpu, is_complex
+    return polar_projections_transformed_cpu, is_complex, k_max_actual

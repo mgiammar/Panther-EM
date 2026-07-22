@@ -46,6 +46,7 @@ def warp_numpy(
     order: int = 5,
     mode: str = "constant",
     cval: float = 0.0,
+    clip: bool = False,
     **kwargs: dict[Any, Any],
 ) -> np.ndarray:
     """Warp an image using scikit-image (CPU).
@@ -64,6 +65,9 @@ def warp_numpy(
         How to handle values outside boundaries, by default "constant".
     cval : float, optional
         The constant value to use for padding when mode is "constant", by default 0.0.
+    clip : bool, optional
+        Whether to clip the output values to the range of the input image, by default
+        False which is opposite of skimage.transform.warp's default behavior.
     **kwargs
         Additional arguments passed to skimage.transform.warp.
 
@@ -79,6 +83,7 @@ def warp_numpy(
         order=order,
         mode=mode,
         cval=cval,
+        clip=clip,
         **kwargs,
     )
 
@@ -95,6 +100,7 @@ def warp_torch_cuda(
     order: int = 5,
     mode: str = "constant",
     cval: float = 0.0,
+    clip: bool = False,
     **kwargs: dict[Any, Any],
 ) -> torch.Tensor:
     """Warp an image using cuCIM on GPU (for PyTorch CUDA tensors).
@@ -117,6 +123,9 @@ def warp_torch_cuda(
         How to handle values outside boundaries, by default "constant".
     cval : float, optional
         The constant value to use for padding when mode is "constant", by default 0.0.
+    clip : bool, optional
+        Whether to clip the output values to the range of the input image, by default
+        False which is opposite of skimage.transform.warp's default behavior.
     **kwargs
         Additional arguments passed to cucim.skimage.transform.warp.
 
@@ -175,6 +184,7 @@ def warp_torch_cuda(
             order=order,
             mode=mode,
             cval=cval,
+            clip=clip,
             **kwargs,
         )
 
