@@ -246,6 +246,15 @@ def _run_stage(
     n_pixels = int(pixel_index.numel())
     n_hypotheses = int(hypothesis_indexes.numel())
 
+    # Ensure requested psi bins are sufficient for maximum angular frequency
+    n_freq = tiling.k_stop
+    if n_freq > n_psi // 2 + 1:
+        raise ValueError(
+            f"tiling k_stop ({n_freq}) exceeds n_psi // 2 + 1 ({n_psi // 2 + 1}); "
+            f"increase n_psi to at least {2 * (n_freq - 1)} so the angular-frequency "
+            "content is not aliased away during irfft."
+        )
+
     # Progress bars advance by the number of pixels / hypotheses actually processed
     # each batch, so their rate reads in pixels/s and hypotheses/s (not batches/s).
     pixel_bar = tqdm(
@@ -280,9 +289,9 @@ def _run_stage(
             hyp_b = hypothesis_indexes[h0 : h0 + hyp_batch]
             W_flat = w_layout[hyp_b]  # (N_b, r)
 
-            # Accumulate correlogram rotational frequency spectrum (C)
-            C = tiling.run(Y_flat, W_flat, result.k_max)
-            corr = torch.fft.irfft(C.conj(), n=n_psi, dim=-1, norm="forward")
+            # Accumulate the angular-frequency spectrum C, then irfft
+            C = tiling.run(Y_flat, W_flat, n_freq)
+            corr = torch.fft.irfft(C, n=n_psi, dim=-1, norm="forward")
             pixel_stats.update(corr, hyp_b)
 
             hyp_bar.update(int(hyp_b.numel()))

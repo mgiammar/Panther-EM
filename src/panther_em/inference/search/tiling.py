@@ -385,7 +385,9 @@ class FeatureTiling:
         W_flat : torch.Tensor
             Contraction weights ``(N, r)`` in the same feature layout.
         n_freq : int
-            Size of the output angular-frequency axis (``result.k_max``). Ignored when
+            Size of the output angular-frequency axis. Should be ``self.k_stop`` (the
+            spectrum carries no content above it, downstream ``irfft`` zero-pads  rest),
+            which also enables the single-region assignment fast path. Ignored when
             ``out`` is supplied.
         out : torch.Tensor, optional
             Pre-allocated ``(P, N, n_freq)`` complex accumulator. A fresh zero tensor
@@ -399,6 +401,27 @@ class FeatureTiling:
             last axis.
         """
         if out is None:
+            region0 = self.regions[0]
+            single_full = (
+                len(self.regions) == 1
+                and region0.k_start == 0
+                and region0.k_stop == int(n_freq)
+            )
+
+            # Fast path which skips zero-fill and accumulation. Does direct assignment.
+            if single_full:
+                y = region0.gather(Y_flat)
+                w = region0.gather(W_flat)
+
+                if out is None:
+                    return _contract_region(y, w, conjugate=True)
+
+                # Do direct assignment if pre-allocated (assume caller zeroed)
+                out[:, :, region0.k_start : region0.k_stop] = _contract_region(
+                    y, w, conjugate=True
+                )
+                return out
+
             out = torch.zeros(
                 (Y_flat.shape[0], W_flat.shape[0], int(n_freq)),
                 dtype=Y_flat.dtype,

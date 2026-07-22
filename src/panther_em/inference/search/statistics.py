@@ -10,6 +10,18 @@ from __future__ import annotations
 import torch
 
 
+@torch.compile
+def _reduce_stats(
+    corr: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused per-pixel reductions over a ``(P, hyp, psi)`` correlogram batch."""
+    p = corr.shape[0]
+    s1 = corr.sum(dim=(1, 2))
+    s2 = corr.square().sum(dim=(1, 2))
+    vmax, amax = corr.reshape(p, -1).max(dim=1)
+    return s1, s2, vmax, amax
+
+
 class PixelStats:
     """Helper for tracing statistics over hypothesis space in a small pixel batch.
 
@@ -84,7 +96,12 @@ class PixelStats:
         self.best_psi_angle.fill_(-1)
 
     @torch.no_grad()
-    def update(self, corr: torch.Tensor, hyp_global_idx: torch.Tensor) -> None:
+    def update(
+        self,
+        corr: torch.Tensor,
+        hyp_global_idx: torch.Tensor,
+        reverse_psi_axis: bool = True,
+    ) -> None:
         """Update tracked statistics with new corr values and hypothesis indices.
 
         Parameters
@@ -96,19 +113,21 @@ class PixelStats:
         hyp_global_idx : torch.Tensor
             Integer tensor referencing which indices these hypotheses correspond to,
             shape (hyp_batch,).
+        reverse_psi_axis : bool, optional
+            Whether to reverse the psi axis when updating the best psi angle. By default
+            True because correlogram is produced by irfft(C) rather than irfft(C.conj())
         """
         corr_cast = corr.to(self.best_corr.dtype)
         num_psi = corr.shape[2]  # in-plane angle axis
         total_hypotheses = corr.shape[1] * corr.shape[2]  # num(other) * num(in-plane)
 
-        ### 1. Update sum and squared sum statistics
-        self.corr_sum += corr_cast.sum(dim=(1, 2))
-        self.corr_sum2 += (corr_cast**2).sum(dim=(1, 2))
+        ### 1. Fused reductions: moment sums + peak search in one sweep over corr
+        s1, s2, vmax, amax = _reduce_stats(corr_cast)
+        self.corr_sum += s1
+        self.corr_sum2 += s2
         self.hypothesis_count += total_hypotheses
 
         ### 2. Conditional update on best correlation and hypotheses
-        corr_flat = corr_cast.reshape(-1, total_hypotheses)
-        vmax, amax = corr_flat.max(dim=1)
         mask = vmax > self.best_corr
 
         if not mask.any():  # Short circuit if none of the indices improve
@@ -116,8 +135,12 @@ class PixelStats:
 
         # Decode indices for all pixels to undo flattening of last dim
         n_local = torch.div(amax, num_psi, rounding_mode="floor")
-        psi = amax % num_psi
-        global_hyp = hyp_global_idx[n_local]
+        if reverse_psi_axis:
+            psi = (num_psi - amax % num_psi) % num_psi
+            global_hyp = hyp_global_idx[n_local]
+        else:
+            psi = amax % num_psi
+            global_hyp = hyp_global_idx[n_local]
 
         self.best_corr[mask] = vmax[mask]
         self.best_hypothesis[mask] = global_hyp[mask]

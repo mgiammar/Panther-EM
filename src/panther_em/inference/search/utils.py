@@ -148,7 +148,7 @@ def build_multichannel_correlogram(
         unit="features",
         unit_scale=True,
         disable=not show_progress,
-        total=r
+        total=r,
     )
     for start in range(0, r, chunk):
         stop = min(start + chunk, r)
