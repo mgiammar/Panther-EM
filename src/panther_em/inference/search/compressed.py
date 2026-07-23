@@ -292,7 +292,9 @@ def _run_stage(
             # Accumulate the angular-frequency spectrum C, then irfft
             C = tiling.run(Y_flat, W_flat, n_freq)
             corr = torch.fft.irfft(C, n=n_psi, dim=-1, norm="forward")
-            pixel_stats.update(corr, hyp_b)
+
+            # Moments are read from C directly (Parseval) only the peak needs corr
+            pixel_stats.update(corr, C, hyp_b)
 
             hyp_bar.update(int(hyp_b.numel()))
 
