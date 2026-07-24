@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 
 
-@torch.compile(mode="max-autotune")
+@torch.compile
 def _reduce_stats(
     corr: torch.Tensor,
     spectrum_ri: torch.Tensor,
@@ -91,12 +91,21 @@ class PixelStats:
     -------
     clear : None
         Clear all tracked statistics.
-    update(corr: torch.Tensor, hyp_global_idx: torch.Tensor) : None
-        Update tracked statistics with new corr values and hypothesis indices.
+    update(spectrum: torch.Tensor, hyp_global_idx: torch.Tensor, num_psi: int) : None
+        Update tracked statistics with a new hypothesis batch's raw spectrum.
     finalize : dict[str, torch.Tensor]
         Return a dictionary of the final statistics (maximum intensity projection /
         maximum inner product, z-score, mean, variance, best hypothesis index,
         best psi index).
+
+    Notes
+    -----
+    :meth:`update` delegates the "reduce one hypothesis batch's spectrum to
+    ``(s1, s2, vmax, amax)``" step to the overridable :meth:`_reduce` method, so a
+    subclass can substitute a faster reduction (e.g. a fused CUDA kernel) without
+    duplicating the accumulate / branchless-best-update / psi-axis-decode logic in
+    :meth:`_accumulate`. See
+    :class:`panther_em.inference.search.fused_statistics.FusedPixelStats`.
     """
 
     hypothesis_count: int
@@ -138,62 +147,160 @@ class PixelStats:
         self.best_hypothesis.fill_(-1)
         self.best_psi_angle.fill_(-1)
 
-    @torch.no_grad()
-    def update(
-        self,
-        corr: torch.Tensor,
-        spectrum: torch.Tensor,
-        hyp_global_idx: torch.Tensor,
-        reverse_psi_axis: bool = True,
-    ) -> None:
-        """Update tracked statistics with new corr values and hypothesis indices.
+    def _reduce(
+        self, spectrum: torch.Tensor, num_psi: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reduce one hypothesis batch's spectrum to ``(s1, s2, vmax, amax)``.
 
         Parameters
         ----------
-        corr : torch.Tensor
-            Tensor with correlation values with shape (num_pixels, hyp_batch, num_psi)
-            where `num_pixels` must match held in `self.num_pixels`, `hyp_batch` is
-            number of hypotheses in the batch, and `num_psi` are all in-plane angles.
         spectrum : torch.Tensor
-            The rfft-form angular spectrum ``C`` this ``corr`` was produced from, shape
-            (num_pixels, hyp_batch, n_freq) with ``corr == irfft(spectrum, n=num_psi,
-            norm="forward")``. The two moment sums are computed from it directly (see
-            :func:`_reduce_stats`) instead of by reducing the full ``corr``.
+            The rfft-form angular spectrum ``C``, shape (num_pixels, hyp_batch, n_freq).
+        num_psi : int
+            Number of in-plane angles to reconstruct via irfft.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+            ``(s1, s2, vmax, amax)``, each shape (num_pixels,). See
+            :func:`_reduce_stats`.
+        """
+        corr = torch.fft.irfft(spectrum, n=num_psi, dim=-1, norm="forward")
+
+        return _reduce_stats(  # type: ignore[no-any-return]
+            corr.to(self.best_corr.dtype), torch.view_as_real(spectrum)
+        )
+
+    @torch.no_grad()
+    def update(
+        self,
+        spectrum: torch.Tensor,
+        hyp_global_idx: torch.Tensor,
+        num_psi: int,
+        reverse_psi_axis: bool = True,
+    ) -> None:
+        """Update tracked statistics with a new hypothesis batch's raw spectrum.
+
+        Parameters
+        ----------
+        spectrum : torch.Tensor
+            The rfft-form angular spectrum ``C``, shape (num_pixels, hyp_batch, n_freq)
+            where `num_pixels` must match held in `self.num_pixels`.
         hyp_global_idx : torch.Tensor
             Integer tensor referencing which indices these hypotheses correspond to,
             shape (hyp_batch,).
+        num_psi : int
+            Number of in-plane angles (the full irfft output length).
         reverse_psi_axis : bool, optional
             Whether to reverse the psi axis when updating the best psi angle. By default
             True because correlogram is produced by irfft(C) rather than irfft(C.conj())
         """
-        corr_cast = corr.to(self.best_corr.dtype)
-        num_psi = corr.shape[2]  # in-plane angle axis
-        total_hypotheses = corr.shape[1] * corr.shape[2]  # num(other) * num(in-plane)
+        total_hypotheses = spectrum.shape[1] * num_psi
+        s1, s2, vmax, amax = self._reduce(spectrum, num_psi)
+        self._accumulate(
+            s1,
+            s2,
+            vmax,
+            amax,
+            hyp_global_idx,
+            num_psi,
+            total_hypotheses,
+            reverse_psi_axis,
+        )
 
-        ### 1. Fused reductions: moment sums (from spectrum) + peak search (from corr)
-        s1, s2, vmax, amax = _reduce_stats(corr_cast, torch.view_as_real(spectrum))
-        self.corr_sum += s1
-        self.corr_sum2 += s2
+    @torch.compile
+    def _accumulate(
+        self,
+        s1: torch.Tensor,
+        s2: torch.Tensor,
+        vmax: torch.Tensor,
+        amax: torch.Tensor,
+        hyp_global_idx: torch.Tensor,
+        num_psi: int,
+        total_hypotheses: int,
+        reverse_psi_axis: bool,
+    ) -> None:
+        """Shared accumulate + branchless best-update logic for one reduced batch.
+
+        Parameters
+        ----------
+        s1, s2 : torch.Tensor
+            First and second moment sums, shape (num_pixels,).
+        vmax : torch.Tensor
+            Maximum correlation value per pixel, shape (num_pixels,).
+        amax : torch.Tensor
+            Flattened index of maximum (into the (hyp_batch, num_psi) grid), shape
+            (num_pixels,).
+        hyp_global_idx : torch.Tensor
+            Global hypothesis indices for this batch, shape (hyp_batch,).
+        num_psi : int
+            Number of in-plane angles (for decoding amax).
+        total_hypotheses : int
+            Number of (hypothesis, psi) pairs contributed by this batch, added to
+            ``self.hypothesis_count``.
+        reverse_psi_axis : bool
+            Whether to reverse the psi axis when updating the best psi angle.
+        """
+        vmax_cast = vmax.to(self.best_corr.dtype)
+        self.corr_sum += s1.to(self.best_corr.dtype)
+        self.corr_sum2 += s2.to(self.best_corr.dtype)
         self.hypothesis_count += total_hypotheses
 
-        ### 2. Conditional update on best correlation and hypotheses
-        mask = vmax > self.best_corr
-
-        if not mask.any():  # Short circuit if none of the indices improve
-            return
+        improved = vmax_cast > self.best_corr
 
         # Decode indices for all pixels to undo flattening of last dim
         n_local = torch.div(amax, num_psi, rounding_mode="floor")
+        global_hyp = hyp_global_idx[n_local]
         if reverse_psi_axis:
             psi = (num_psi - amax % num_psi) % num_psi
-            global_hyp = hyp_global_idx[n_local]
         else:
             psi = amax % num_psi
-            global_hyp = hyp_global_idx[n_local]
 
-        self.best_corr[mask] = vmax[mask]
-        self.best_hypothesis[mask] = global_hyp[mask]
-        self.best_psi_angle[mask] = psi[mask]
+        self.best_corr = torch.where(improved, vmax_cast, self.best_corr)
+        self.best_hypothesis = torch.where(improved, global_hyp, self.best_hypothesis)
+        self.best_psi_angle = torch.where(improved, psi, self.best_psi_angle)
+
+    @torch.no_grad()
+    def update_fused(
+        self,
+        s1: torch.Tensor,
+        s2: torch.Tensor,
+        vmax: torch.Tensor,
+        amax: torch.Tensor,
+        hyp_global_idx: torch.Tensor,
+        num_psi: int,
+        reverse_psi_axis: bool = True,
+    ) -> None:
+        """Accumulate pre-reduced ``(s1, s2, vmax, amax)`` directly (thin wrapper).
+
+        Parameters
+        ----------
+        s1, s2 : torch.Tensor
+            First and second moment sums, shape (num_pixels,). Already multiplied
+            by num_psi (i.e. the output of the fused kernel, not raw Parseval sums).
+        vmax : torch.Tensor
+            Maximum correlation value per pixel, shape (num_pixels,).
+        amax : torch.Tensor
+            Flattened index of maximum (into the (hyp_batch, num_psi) grid), shape
+            (num_pixels,).
+        hyp_global_idx : torch.Tensor
+            Global hypothesis indices for this batch, shape (hyp_batch,).
+        num_psi : int
+            Number of in-plane angles (for decoding amax).
+        reverse_psi_axis : bool, optional
+            Whether to reverse the psi axis when updating the best psi angle.
+        """
+        total_hypotheses = hyp_global_idx.numel() * num_psi
+        self._accumulate(
+            s1,
+            s2,
+            vmax,
+            amax,
+            hyp_global_idx,
+            num_psi,
+            total_hypotheses,
+            reverse_psi_axis,
+        )
 
     @torch.no_grad()
     def finalize(self) -> dict[str, torch.Tensor]:

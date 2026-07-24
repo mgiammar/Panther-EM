@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from tqdm import tqdm
 
+from panther_em.inference.search.fused_statistics import FusedPixelStats
 from panther_em.inference.search.statistics import PixelStats
 from panther_em.inference.search.tiling import (
     FeatureTiling,
@@ -163,6 +164,7 @@ def _run_stage(
     pixel_index: torch.Tensor,
     compute_device: torch.device | str | None = None,
     show_progress: bool = True,
+    use_fused_kernel: bool = True,
     **polar_to_cart_kwargs: Any,
 ) -> dict[str, torch.Tensor]:
     r"""Run one tiling end-to-end and reduce it to per-pixel statistics.
@@ -204,6 +206,11 @@ def _run_stage(
     show_progress : bool, optional
         Show tqdm progress bars over the pixel-batch and hypothesis-batch loops.
         Defaults to ``True``.
+    use_fused_kernel : bool, optional
+        Use :class:`~panther_em.inference.search.fused_statistics.FusedPixelStats`
+        (attempts the fused CUDA iRFFT+stats kernel, falling back to the pure-torch
+        :class:`PixelStats` reduction whenever the kernel is unavailable or
+        ``(n_psi, k_stop)`` is unsupported).
     **polar_to_cart_kwargs
         Forwarded to kernel construction when featurizing cells.
 
@@ -221,27 +228,30 @@ def _run_stage(
     )
 
     # image feature reuse to avoid re-computation
-    features_to_compute = store.missing_cells(tiling)
-    if features_to_compute.numel():
-        feats = featurize_cells(
-            image,
-            reconstructor,
-            features_to_compute,
-            feature_chunk=feature_chunk,
-            feature_store_device=store.device,
-            **polar_to_cart_kwargs,
-        )
-    else:
-        feats = torch.empty(
-            (0, store.num_pixels), dtype=store.dtype, device=store.device
-        )
-    store.relayout(tiling, feats)
+    with torch.cuda.nvtx.range("featurization"):
+        features_to_compute = store.missing_cells(tiling)
+        if features_to_compute.numel():
+            feats = featurize_cells(
+                image,
+                reconstructor,
+                features_to_compute,
+                feature_chunk=feature_chunk,
+                feature_store_device=store.device,
+                **polar_to_cart_kwargs,
+            )
+        else:
+            feats = torch.empty(
+                (0, store.num_pixels), dtype=store.dtype, device=store.device
+            )
+        store.relayout(tiling, feats)
+
+    stats_cls = FusedPixelStats if use_fused_kernel else PixelStats
 
     stage_stats: list[dict[str, torch.Tensor]] = []
     w_layout = build_layout_weights(reconstructor, tiling).to(compute_device)
     hypothesis_indexes = hypothesis_indexes.to(compute_device)
     pixel_index = pixel_index.to(compute_device)
-    pixel_stats = PixelStats(pixel_batch, device=compute_device)
+    pixel_stats = stats_cls(pixel_batch, device=compute_device)
 
     n_pixels = int(pixel_index.numel())
     n_hypotheses = int(hypothesis_indexes.numel())
@@ -267,13 +277,14 @@ def _run_stage(
 
     for p0 in range(0, n_pixels, pixel_batch):
         px_b = pixel_index[p0 : p0 + pixel_batch]
-        Y_flat = store.image_view(px_b)
-        if Y_flat.device != compute_device:
-            Y_flat = Y_flat.to(compute_device, non_blocking=True)
+        with torch.cuda.nvtx.range("pixel copy"):
+            Y_flat = store.image_view(px_b)
+            if Y_flat.device != compute_device:
+                Y_flat = Y_flat.to(compute_device, non_blocking=True)
 
         # If not 'pixel_batch' shape, create new 'pixel_stats'
         if Y_flat.shape[0] != pixel_batch:
-            pixel_stats = PixelStats(int(px_b.numel()), device=compute_device)
+            pixel_stats = stats_cls(int(px_b.numel()), device=compute_device)
         else:
             pixel_stats.clear()
 
@@ -289,12 +300,13 @@ def _run_stage(
             hyp_b = hypothesis_indexes[h0 : h0 + hyp_batch]
             W_flat = w_layout[hyp_b]  # (N_b, r)
 
-            # Accumulate the angular-frequency spectrum C, then irfft
-            C = tiling.run(Y_flat, W_flat, n_freq)
-            corr = torch.fft.irfft(C, n=n_psi, dim=-1, norm="forward")
+            # Accumulate the angular-frequency spectrum C
+            with torch.cuda.nvtx.range("batched multiply"):
+                C = tiling.run(Y_flat, W_flat, n_freq)
 
-            # Moments are read from C directly (Parseval) only the peak needs corr
-            pixel_stats.update(corr, C, hyp_b)
+            # psi recovery + statistics update, per-pixel
+            with torch.cuda.nvtx.range("psi recovery + statistics update"):
+                pixel_stats.update(C, hyp_b, num_psi=n_psi, reverse_psi_axis=True)
 
             hyp_bar.update(int(hyp_b.numel()))
 
@@ -327,6 +339,7 @@ def compressed_search(
     compute_device: torch.device | str | None = None,
     feature_store_device: torch.device | str | None = None,
     show_progress: bool = True,
+    use_fused_kernel: bool = True,
     **polar_to_cart_kwargs: Any,
 ) -> dict[str, torch.Tensor]:
     r"""Single-stage SVD-2DTM search over one selection of feature rectangles.
@@ -373,6 +386,11 @@ def compressed_search(
     show_progress : bool, optional
         Show tqdm progress bars over the pixel-batch and hypothesis-batch loops.
         Defaults to ``True``.
+    use_fused_kernel : bool, optional
+        Attempt the fused CUDA iRFFT+stats kernel (see
+        :class:`~panther_em.inference.search.fused_statistics.FusedPixelStats`),
+        falling back to the pure-torch reduction whenever the kernel is unavailable
+        or ``(n_psi, k_stop)`` is unsupported. Defaults to ``True``.
     **polar_to_cart_kwargs
         Forwarded to kernel construction.
 
@@ -437,6 +455,7 @@ def compressed_search(
         feature_chunk=feature_chunk,
         compute_device=compute_device,
         show_progress=show_progress,
+        use_fused_kernel=use_fused_kernel,
         **polar_to_cart_kwargs,
     )
 

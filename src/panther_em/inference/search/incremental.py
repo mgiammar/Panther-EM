@@ -37,6 +37,7 @@ def incremental_search(
     follow_up_fn: (
         Callable[[dict[str, torch.Tensor], torch.Tensor], torch.Tensor | None] | None
     ) = None,
+    use_fused_kernel: bool = True,
     **polar_to_cart_kwargs: Any,
 ) -> Iterator[dict[str, torch.Tensor]]:
     r"""Incremental SVD-2DTM search; yields per-pixel statistics per stage.
@@ -90,6 +91,11 @@ def incremental_search(
         statistics and the pixels it ran on to the follow-up pixel mask for the next
         stage. Returning ``None`` (the default behaviour when omitted) keeps the same
         pixel set.
+    use_fused_kernel : bool, optional
+        Attempt the fused CUDA iRFFT+stats kernel (see
+        :class:`~panther_em.inference.search.fused_statistics.FusedPixelStats`),
+        falling back to the pure-torch reduction whenever the kernel is unavailable
+        or ``(n_psi, k_stop)`` is unsupported. Defaults to ``True``.
     **polar_to_cart_kwargs
         Forwarded to kernel construction when featurizing cells.
 
@@ -132,6 +138,7 @@ def incremental_search(
             n_psi=n_psi,
             feature_chunk=feature_chunk,
             compute_device=compute_device,
+            use_fused_kernel=use_fused_kernel,
             **polar_to_cart_kwargs,
         )
 
