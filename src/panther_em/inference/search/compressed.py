@@ -256,7 +256,7 @@ def _run_stage(
 
     stage_stats: list[dict[str, torch.Tensor]] = []
 
-    with torch.nvtx.range("contraction + statistics"):
+    with torch.cuda.nvtx.range("contraction + statistics"):
         w_layout = build_layout_weights(reconstructor, tiling).to(compute_device)
         hypothesis_indexes = hypothesis_indexes.to(compute_device)
         pixel_index = pixel_index.to(compute_device)
