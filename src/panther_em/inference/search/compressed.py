@@ -17,6 +17,7 @@ import torch
 from tqdm import tqdm
 
 from panther_em.inference.search.fused_statistics import FusedPixelStats
+from panther_em.inference.search.staging import DEFAULT_STAGE_BYTES, PixelStager
 from panther_em.inference.search.statistics import PixelStats
 from panther_em.inference.search.tiling import (
     FeatureTiling,
@@ -165,6 +166,7 @@ def _run_stage(
     compute_device: torch.device | str | None = None,
     show_progress: bool = True,
     use_fused_kernel: bool = True,
+    stage_bytes: int = DEFAULT_STAGE_BYTES,
     **polar_to_cart_kwargs: Any,
 ) -> dict[str, torch.Tensor]:
     r"""Run one tiling end-to-end and reduce it to per-pixel statistics.
@@ -211,6 +213,11 @@ def _run_stage(
         (attempts the fused CUDA iRFFT+stats kernel, falling back to the pure-torch
         :class:`PixelStats` reduction whenever the kernel is unavailable or
         ``(n_psi, k_stop)`` is unsupported).
+    stage_bytes : int, optional
+        Byte budget per staging buffer used by
+        :class:`~panther_em.inference.search.staging.PixelStager` when ``store`` lives
+        on a different device than ``compute_device`` (e.g. a CPU-resident store feeding
+        a CUDA search).
     **polar_to_cart_kwargs
         Forwarded to kernel construction when featurizing cells.
 
@@ -248,74 +255,98 @@ def _run_stage(
     stats_cls = FusedPixelStats if use_fused_kernel else PixelStats
 
     stage_stats: list[dict[str, torch.Tensor]] = []
-    w_layout = build_layout_weights(reconstructor, tiling).to(compute_device)
-    hypothesis_indexes = hypothesis_indexes.to(compute_device)
-    pixel_index = pixel_index.to(compute_device)
-    pixel_stats = stats_cls(pixel_batch, device=compute_device)
 
-    n_pixels = int(pixel_index.numel())
-    n_hypotheses = int(hypothesis_indexes.numel())
+    with torch.nvtx.range("contraction + statistics"):
+        w_layout = build_layout_weights(reconstructor, tiling).to(compute_device)
+        hypothesis_indexes = hypothesis_indexes.to(compute_device)
+        pixel_index = pixel_index.to(compute_device)
+        pixel_stats = stats_cls(pixel_batch, device=compute_device)
 
-    # Ensure requested psi bins are sufficient for maximum angular frequency
-    n_freq = tiling.k_stop
-    if n_freq > n_psi // 2 + 1:
-        raise ValueError(
-            f"tiling k_stop ({n_freq}) exceeds n_psi // 2 + 1 ({n_psi // 2 + 1}); "
-            f"increase n_psi to at least {2 * (n_freq - 1)} so the angular-frequency "
-            "content is not aliased away during irfft."
-        )
+        n_pixels = int(pixel_index.numel())
+        n_hypotheses = int(hypothesis_indexes.numel())
 
-    # Progress bars advance by the number of pixels / hypotheses actually processed
-    # each batch, so their rate reads in pixels/s and hypotheses/s (not batches/s).
-    pixel_bar = tqdm(
-        total=n_pixels,
-        desc="search pixels",
-        unit="pixel",
-        unit_scale=True,
-        disable=not show_progress,
-    )
+        # Prepare hypothesis baches once (since independent of pixel batch)
+        with torch.cuda.nvtx.range("hypothesis batch weight preparation"):
+            hyp_batches = [
+                (
+                    hypothesis_indexes[h0 : h0 + hyp_batch],
+                    tiling.prepare_weights(
+                        w_layout[hypothesis_indexes[h0 : h0 + hyp_batch]]
+                    ),
+                )
+                for h0 in range(0, n_hypotheses, hyp_batch)
+            ]
 
-    for p0 in range(0, n_pixels, pixel_batch):
-        px_b = pixel_index[p0 : p0 + pixel_batch]
-        with torch.cuda.nvtx.range("pixel copy"):
-            Y_flat = store.image_view(px_b)
-            if Y_flat.device != compute_device:
-                Y_flat = Y_flat.to(compute_device, non_blocking=True)
+        # Ensure requested psi bins are sufficient for maximum angular frequency
+        n_freq = tiling.k_stop
+        if n_freq > n_psi // 2 + 1:
+            raise ValueError(
+                f"tiling k_stop ({n_freq}) exceeds n_psi // 2 + 1 "
+                f"({n_psi // 2 + 1}); increase n_psi to at least "
+                f"{2 * (n_freq - 1)} so the angular-frequency content is not aliased "
+                "away during irfft."
+            )
 
-        # If not 'pixel_batch' shape, create new 'pixel_stats'
-        if Y_flat.shape[0] != pixel_batch:
-            pixel_stats = stats_cls(int(px_b.numel()), device=compute_device)
-        else:
-            pixel_stats.clear()
-
-        hyp_bar = tqdm(
-            total=n_hypotheses,
-            desc="hypotheses",
-            unit="hypothesis",
+        # Progress bars advance by the number of pixels / hypotheses actually
+        # processed each batch, so their rate reads in pixels/s and hypotheses/s
+        # (not batches/s).
+        pixel_bar = tqdm(
+            total=n_pixels,
+            desc="search pixels",
+            unit="pixel",
             unit_scale=True,
             disable=not show_progress,
-            leave=False,
         )
-        for h0 in range(0, n_hypotheses, hyp_batch):
-            hyp_b = hypothesis_indexes[h0 : h0 + hyp_batch]
-            W_flat = w_layout[hyp_b]  # (N_b, r)
 
-            # Accumulate the angular-frequency spectrum C
-            with torch.cuda.nvtx.range("batched multiply"):
-                C = tiling.run(Y_flat, W_flat, n_freq)
+        # Streaming chunks of pixels through pinned memory and double buffering through
+        # asynchronous H2D copies. If `store_device == compute_device`, then a no-op.
+        stager = PixelStager(
+            store, pixel_index, compute_device, stage_bytes=stage_bytes
+        )
 
-            # psi recovery + statistics update, per-pixel
-            with torch.cuda.nvtx.range("psi recovery + statistics update"):
-                pixel_stats.update(C, hyp_b, num_psi=n_psi, reverse_psi_axis=True)
+        for stage_start, stage_end, Y_stage in stager.stages():
+            stage_size = stage_end - stage_start
+            for p0 in range(0, stage_size, pixel_batch):
+                n = min(pixel_batch, stage_size - p0)
+                px_b = pixel_index[stage_start + p0 : stage_start + p0 + n]
+                with torch.cuda.nvtx.range("pixel copy"):
+                    Y_flat = Y_stage[p0 : p0 + n]
 
-            hyp_bar.update(int(hyp_b.numel()))
+                # If not the previous batch's shape, create a fresh 'pixel_stats'.
+                if Y_flat.shape[0] != pixel_stats.num_pixels:
+                    pixel_stats = stats_cls(int(px_b.numel()), device=compute_device)
+                else:
+                    pixel_stats.clear()
 
-        hyp_bar.close()
+                hyp_bar = tqdm(
+                    total=n_hypotheses,
+                    desc="hypotheses",
+                    unit="hypothesis",
+                    unit_scale=True,
+                    disable=not show_progress,
+                    leave=False,
+                )
+                for hyp_b, prepared_weights in hyp_batches:
+                    # Accumulate the angular-frequency spectrum C
+                    with torch.cuda.nvtx.range("batched multiply"):
+                        C = tiling.run(
+                            Y_flat, None, n_freq, prepared_weights=prepared_weights
+                        )
 
-        stage_stats.append(pixel_stats.finalize())
-        pixel_bar.update(int(px_b.numel()))
+                    # psi recovery + statistics update, per-pixel
+                    with torch.cuda.nvtx.range("psi recovery + statistics update"):
+                        pixel_stats.update(
+                            C, hyp_b, num_psi=n_psi, reverse_psi_axis=True
+                        )
 
-    pixel_bar.close()
+                    hyp_bar.update(int(hyp_b.numel()))
+
+                hyp_bar.close()
+
+                stage_stats.append(pixel_stats.finalize())
+                pixel_bar.update(int(px_b.numel()))
+
+        pixel_bar.close()
 
     # Stitch the pixel batches back into stage-level maps.
     # NOTE: This return may change into a different dict or helper class in future...
@@ -338,16 +369,18 @@ def compressed_search(
     pixel_index: torch.Tensor | None = None,
     compute_device: torch.device | str | None = None,
     feature_store_device: torch.device | str | None = None,
+    store: FeaturizedImageStore | None = None,
     show_progress: bool = True,
     use_fused_kernel: bool = True,
+    stage_bytes: int = DEFAULT_STAGE_BYTES,
     **polar_to_cart_kwargs: Any,
 ) -> dict[str, torch.Tensor]:
     r"""Single-stage SVD-2DTM search over one selection of feature rectangles.
 
-    Builds a fresh feature store, featurizes the image for the selected ``(k, m)``
-    cells, and reduces the search over hypotheses and in-plane angles to per-pixel
-    statistics. For a multi-stage (multi-precision) search that reuses features across
-    selections, see
+    Builds a fresh feature store (unless one is supplied via ``store``), featurizes the
+    image for the selected ``(k, m)`` cells, and reduces the search over hypotheses and
+    in-plane angles to per-pixel statistics. For a multi-stage (multi-precision) search
+    that reuses features across selections, see
     :func:`panther_em.inference.search.incremental.incremental_search`.
 
     Parameters
@@ -382,7 +415,14 @@ def compressed_search(
     feature_store_device : torch.device or str, optional
         Device the featurized image stack is held on between the featurization and
         contraction stages. Defaults to ``compute_device``. Set to ``"cpu"`` for large
-        images or image stacks to keep the ``(B * P, r)``.
+        images or image stacks to keep the ``(B * P, r)``. Ignored when an explicit
+        ``store`` is supplied.
+    store : FeaturizedImageStore, optional
+        Persistent feature store to reuse across calls (e.g. repeated searches
+        against the same ``rectangles``, such as a batch-size tuning sweep). A fresh
+        one sized to the image's valid-correlation grid is created when omitted.
+        Cells already present for the requested ``rectangles`` are not
+        re-featurized; see :meth:`FeaturizedImageStore.missing_cells`.
     show_progress : bool, optional
         Show tqdm progress bars over the pixel-batch and hypothesis-batch loops.
         Defaults to ``True``.
@@ -391,6 +431,12 @@ def compressed_search(
         :class:`~panther_em.inference.search.fused_statistics.FusedPixelStats`),
         falling back to the pure-torch reduction whenever the kernel is unavailable
         or ``(n_psi, k_stop)`` is unsupported. Defaults to ``True``.
+    stage_bytes : int, optional
+        Byte budget per staging buffer for the pinned, double-buffered,
+        asynchronous transfer of ``store``'s rows to ``compute_device`` (see
+        :class:`~panther_em.inference.search.staging.PixelStager`). Only relevant
+        when ``feature_store_device`` differs from ``compute_device``; ignored
+        otherwise.
     **polar_to_cart_kwargs
         Forwarded to kernel construction.
 
@@ -439,7 +485,8 @@ def compressed_search(
         pixel_index, leading, batch, n_px_per_image, out_h, out_w, compute_device
     )
 
-    store = FeaturizedImageStore(n_px, device=feature_store_device)
+    if store is None:
+        store = FeaturizedImageStore(n_px, device=feature_store_device)
     tiling = FeatureTiling.from_extents(rectangles, device=compute_device)
 
     result: dict[str, torch.Tensor] = _run_stage(
@@ -456,6 +503,7 @@ def compressed_search(
         compute_device=compute_device,
         show_progress=show_progress,
         use_fused_kernel=use_fused_kernel,
+        stage_bytes=stage_bytes,
         **polar_to_cart_kwargs,
     )
 
