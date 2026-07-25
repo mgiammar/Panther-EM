@@ -143,6 +143,121 @@ void fused_irfft_stats_launch(const c10::complex<float> *c, float *s1,
   //   Blackwell: 1000, 1030, 1200, 1210 (sm_100, sm_103, sm_120, sm_121).
 }
 
+// ---------------------------------------------------------------------------
+// Architecture dispatch for the transposed-input ((NumFreq, P, Q)) kernel.
+// Mirrors fused_irfft_stats_launch above exactly, just calling into
+// launch_fused_irfft_stats_transposed instead.
+// ---------------------------------------------------------------------------
+template <unsigned int NPsi, unsigned int NumFreq, unsigned int FPB,
+          unsigned int EPT>
+void fused_irfft_stats_launch_transposed(const c10::complex<float> *c,
+                                         float *s1, float *s2,
+                                         unsigned long long *argmax_packed,
+                                         unsigned int p_total,
+                                         unsigned int q_total) {
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto arch = zipfft::get_cuda_device_arch();
+  const float2 *c2 = reinterpret_cast<const float2 *>(c);
+
+  /* clang-format off */
+    switch (arch) {
+#ifdef ENABLE_CUDA_ARCH_750
+        case 750: {
+            using Config = fused_stats::FusedIrfftStatsConfig<750, NPsi, NumFreq, FPB, EPT>;
+            fused_stats::launch_fused_irfft_stats_transposed<Config>(
+                reinterpret_cast<const typename Config::complex_type*>(c2), s1, s2, argmax_packed,
+                p_total, q_total, stream);
+            break;
+        }
+#endif
+#ifdef ENABLE_CUDA_ARCH_800
+        case 800: {
+            using Config = fused_stats::FusedIrfftStatsConfig<800, NPsi, NumFreq, FPB, EPT>;
+            fused_stats::launch_fused_irfft_stats_transposed<Config>(
+                reinterpret_cast<const typename Config::complex_type*>(c2), s1, s2, argmax_packed,
+                p_total, q_total, stream);
+            break;
+        }
+#endif
+#ifdef ENABLE_CUDA_ARCH_860
+        case 860: {
+            using Config = fused_stats::FusedIrfftStatsConfig<860, NPsi, NumFreq, FPB, EPT>;
+            fused_stats::launch_fused_irfft_stats_transposed<Config>(
+                reinterpret_cast<const typename Config::complex_type*>(c2), s1, s2, argmax_packed,
+                p_total, q_total, stream);
+            break;
+        }
+#endif
+#ifdef ENABLE_CUDA_ARCH_870
+        case 870: {
+            using Config = fused_stats::FusedIrfftStatsConfig<870, NPsi, NumFreq, FPB, EPT>;
+            fused_stats::launch_fused_irfft_stats_transposed<Config>(
+                reinterpret_cast<const typename Config::complex_type*>(c2), s1, s2, argmax_packed,
+                p_total, q_total, stream);
+            break;
+        }
+#endif
+#ifdef ENABLE_CUDA_ARCH_890
+        case 890: {
+            using Config = fused_stats::FusedIrfftStatsConfig<890, NPsi, NumFreq, FPB, EPT>;
+            fused_stats::launch_fused_irfft_stats_transposed<Config>(
+                reinterpret_cast<const typename Config::complex_type*>(c2), s1, s2, argmax_packed,
+                p_total, q_total, stream);
+            break;
+        }
+#endif
+#ifdef ENABLE_CUDA_ARCH_900
+        case 900: {
+            using Config = fused_stats::FusedIrfftStatsConfig<900, NPsi, NumFreq, FPB, EPT>;
+            fused_stats::launch_fused_irfft_stats_transposed<Config>(
+                reinterpret_cast<const typename Config::complex_type*>(c2), s1, s2, argmax_packed,
+                p_total, q_total, stream);
+            break;
+        }
+#endif
+#ifdef ENABLE_CUDA_ARCH_1000
+        case 1000: {
+            using Config = fused_stats::FusedIrfftStatsConfig<1000, NPsi, NumFreq, FPB, EPT>;
+            fused_stats::launch_fused_irfft_stats_transposed<Config>(
+                reinterpret_cast<const typename Config::complex_type*>(c2), s1, s2, argmax_packed,
+                p_total, q_total, stream);
+            break;
+        }
+#endif
+#ifdef ENABLE_CUDA_ARCH_1030
+        case 1030: {
+            using Config = fused_stats::FusedIrfftStatsConfig<1030, NPsi, NumFreq, FPB, EPT>;
+            fused_stats::launch_fused_irfft_stats_transposed<Config>(
+                reinterpret_cast<const typename Config::complex_type*>(c2), s1, s2, argmax_packed,
+                p_total, q_total, stream);
+            break;
+        }
+#endif
+#ifdef ENABLE_CUDA_ARCH_1200
+        case 1200: {
+            using Config = fused_stats::FusedIrfftStatsConfig<1200, NPsi, NumFreq, FPB, EPT>;
+            fused_stats::launch_fused_irfft_stats_transposed<Config>(
+                reinterpret_cast<const typename Config::complex_type*>(c2), s1, s2, argmax_packed,
+                p_total, q_total, stream);
+            break;
+        }
+#endif
+#ifdef ENABLE_CUDA_ARCH_1210
+        case 1210: {
+            using Config = fused_stats::FusedIrfftStatsConfig<1210, NPsi, NumFreq, FPB, EPT>;
+            fused_stats::launch_fused_irfft_stats_transposed<Config>(
+                reinterpret_cast<const typename Config::complex_type*>(c2), s1, s2, argmax_packed,
+                p_total, q_total, stream);
+            break;
+        }
+#endif
+        default:
+            throw std::runtime_error("fused_irfft_stats_transposed: unsupported CUDA architecture: " +
+                                     std::to_string(arch));
+    }
+  /* clang-format on */
+}
+
 // ===========================================================================
 //                         Config table + Python binding
 // ===========================================================================
@@ -221,6 +336,52 @@ get_fn(unsigned int num_psi, unsigned int num_freq) {
   return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// Dispatch table for the transposed-input ((NumFreq, P, Q)) kernel. Reuses
+// SUPPORTED_CONFIGS unchanged -- same (num_psi, num_freq, fpb, ept) space,
+// just a different kernel/launch path.
+// ---------------------------------------------------------------------------
+template <unsigned int NPsi, unsigned int NumFreq, unsigned int FPB,
+          unsigned int EPT>
+void dispatch_stats_transposed(const c10::complex<float> *c, float *s1,
+                               float *s2, unsigned long long *argmax_packed,
+                               unsigned int p_total, unsigned int q_total) {
+  fused_irfft_stats_launch_transposed<NPsi, NumFreq, FPB, EPT>(
+      c, s1, s2, argmax_packed, p_total, q_total);
+}
+
+template <std::size_t... Is>
+constexpr auto make_dispatch_table_transposed(std::index_sequence<Is...>) {
+  return std::array<
+      std::pair<IrfftStatsConfigEntry,
+                std::function<void(const c10::complex<float> *, float *,
+                                   float *, unsigned long long *, unsigned int,
+                                   unsigned int)>>,
+      sizeof...(Is)>{
+      {{IrfftStatsConfigEntry{std::get<0>(SUPPORTED_CONFIGS[Is]),
+                              std::get<1>(SUPPORTED_CONFIGS[Is]),
+                              std::get<3>(SUPPORTED_CONFIGS[Is]),
+                              std::get<2>(SUPPORTED_CONFIGS[Is])},
+        []() {
+          constexpr auto c = SUPPORTED_CONFIGS[Is];
+          return dispatch_stats_transposed<std::get<0>(c), std::get<1>(c),
+                                           std::get<3>(c), std::get<2>(c)>;
+        }()}...}};
+}
+
+static const auto dispatch_table_transposed = make_dispatch_table_transposed(
+    std::make_index_sequence<SUPPORTED_CONFIGS.size()>{});
+
+static std::function<void(const c10::complex<float> *, float *, float *,
+                          unsigned long long *, unsigned int, unsigned int)>
+get_fn_transposed(unsigned int num_psi, unsigned int num_freq) {
+  for (const auto &e : dispatch_table_transposed) {
+    if (e.first.num_psi == num_psi && e.first.num_freq == num_freq)
+      return e.second;
+  }
+  return nullptr;
+}
+
 std::vector<std::tuple<int, int, int, int>> get_supported_configs() {
   std::vector<std::tuple<int, int, int, int>> v;
   v.reserve(SUPPORTED_CONFIGS.size());
@@ -292,6 +453,65 @@ std::vector<torch::Tensor> fused_irfft_stats(torch::Tensor c, int64_t num_psi) {
   return {s1, s2, argmax_packed};
 }
 
+/**
+ * Zero-copy variant of fused_irfft_stats for input already laid out as
+ * (NumFreq, P, Q) contiguous -- the layout a cuBLAS strided-batched GEMM
+ * produces natively (frequency as the batch axis), with no permute/copy
+ * needed to feed this kernel. Same I/O contract as fused_irfft_stats
+ * otherwise (see its docstring); (s1, s2, vmax, amax) values are identical
+ * for the same logical spectrum, only the input tensor's physical layout
+ * differs.
+ *
+ * @param c      complex64, CUDA, contiguous, shape (NumFreq, P, Q).
+ *               Deliberately NOT materialized via .contiguous() here --
+ *               that would defeat the purpose of this entry point. Callers
+ *               that can't guarantee contiguity should use
+ *               fused_irfft_stats() instead.
+ * @param num_psi  full in-plane-angle length. (num_psi, NumFreq) must be in
+ *               get_supported_configs().
+ * @return (s1, s2, argmax_packed), same shapes/dtypes as fused_irfft_stats.
+ */
+std::vector<torch::Tensor> fused_irfft_stats_transposed(torch::Tensor c,
+                                                         int64_t num_psi) {
+  TORCH_CHECK(c.is_cuda(), "c must be CUDA");
+  TORCH_CHECK(c.dtype() == torch::kComplexFloat, "c must be complex64");
+  TORCH_CHECK(c.dim() == 3, "c must be (NumFreq, P, Q)");
+  TORCH_CHECK(c.is_contiguous(),
+              "c must already be (NumFreq,P,Q)-contiguous; this entry point "
+              "exists specifically to avoid a copy -- call fused_irfft_stats() "
+              "instead if c is not already contiguous");
+
+  const c10::cuda::CUDAGuard device_guard(c.device());
+
+  const auto num_freq = static_cast<unsigned int>(c.size(0));
+  const auto p_total = static_cast<unsigned int>(c.size(1));
+  const auto q_total = static_cast<unsigned int>(c.size(2));
+
+  auto fn = get_fn_transposed(static_cast<unsigned int>(num_psi), num_freq);
+  TORCH_CHECK(fn != nullptr, "Unsupported (num_psi, num_freq) = (", num_psi,
+              ", ", num_freq, "). See get_supported_configs().");
+
+  auto opts_f32 =
+      torch::TensorOptions().dtype(torch::kFloat32).device(c.device());
+  auto opts_i64 =
+      torch::TensorOptions().dtype(torch::kInt64).device(c.device());
+
+  torch::Tensor s1 = torch::zeros({p_total}, opts_f32);
+  torch::Tensor s2 = torch::zeros({p_total}, opts_f32);
+  torch::Tensor argmax_packed =
+      torch::full({p_total}, sentinel_packed_i64(), opts_i64);
+
+  const c10::complex<float> *c_ptr = c.data_ptr<c10::complex<float>>();
+  float *s1_ptr = s1.data_ptr<float>();
+  float *s2_ptr = s2.data_ptr<float>();
+  unsigned long long *packed_ptr =
+      reinterpret_cast<unsigned long long *>(argmax_packed.data_ptr<int64_t>());
+
+  fn(c_ptr, s1_ptr, s2_ptr, packed_ptr, p_total, q_total);
+
+  return {s1, s2, argmax_packed};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() =
       "Fused frequency-padded inverse real FFT + Parseval moments + max/argmax "
@@ -299,6 +519,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_irfft_stats", &fused_irfft_stats,
         "(s1, s2, argmax_packed) = fused psi-recovery + statistics-update for "
         "one hypothesis batch",
+        pybind11::arg("c"), pybind11::arg("num_psi"));
+  m.def("fused_irfft_stats_transposed", &fused_irfft_stats_transposed,
+        "Zero-copy variant of fused_irfft_stats for (NumFreq, P, Q)-contiguous "
+        "input",
         pybind11::arg("c"), pybind11::arg("num_psi"));
   m.def("get_supported_configs", &get_supported_configs,
         "List of supported (num_psi, num_freq, fpb, ept) tuples");

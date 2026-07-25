@@ -262,3 +262,59 @@ def fused_irfft_stats(
 
     vmax, amax = _decode_argmax_packed(argmax_packed)
     return s1, s2, vmax, amax
+
+
+def fused_irfft_stats_transposed(
+    c: torch.Tensor, n_psi: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Zero-copy variant of :func:`fused_irfft_stats` for ``(NumFreq, P, Q)`` input.
+
+    Notes
+    -----
+    Spectrum ``c`` is expected to be  contiguous in ``(NumFreq, P, Q)`` layout (the
+    layout a cuBLAS strided-batched GEMM produces natively). No ``.contiguous()`` call
+    is made which skips a strided copy kernel. Internal strided CUDA kernel uses staged
+    shared memory to transpose small tiles of memory upon load.
+
+    Parameters
+    ----------
+    c : torch.Tensor
+        complex64, CUDA, contiguous, shape (NumFreq, P, Q).
+    n_psi : int
+        Full in-plane-angle length.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ``(s1, s2, vmax, amax)``, same shapes/dtypes as
+        :func:`fused_irfft_stats`. ``None`` on any internal failure
+        (unsupported config, non-contiguous input, runtime error), in which
+        case callers should fall back to :func:`fused_irfft_stats` or the
+        pure-torch path.
+    """
+    global _warned_runtime_failure
+
+    module = _try_compile()
+    if module is None:
+        return None
+
+    n_freq = c.shape[0]
+    configs = {(cfg[0], cfg[1]) for cfg in module.get_supported_configs()}
+    if (int(n_psi), int(n_freq)) not in configs:
+        return None
+
+    try:
+        s1, s2, argmax_packed = module.fused_irfft_stats_transposed(c, int(n_psi))
+    except Exception as exc:
+        if not _warned_runtime_failure:
+            warnings.warn(
+                "Fused iRFFT+stats (transposed) CUDA kernel raised at runtime, "
+                f"falling back to the pure-torch path for this call: {exc}",
+                UserWarning,
+                stacklevel=2,
+            )
+            _warned_runtime_failure = True
+        return None
+
+    vmax, amax = _decode_argmax_packed(argmax_packed)
+    return s1, s2, vmax, amax

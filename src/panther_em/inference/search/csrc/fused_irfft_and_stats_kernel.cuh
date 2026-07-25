@@ -118,6 +118,61 @@ inline __device__ void load_padded_with_parseval_moments(
 }
 
 // ---------------------------------------------------------------------------
+// Variant of load_padded_with_parseval_moments that reads from a per-block
+// shared-memory staging tile (populated by a coalesced global->shared copy,
+// see fused_irfft_and_stats_kernel_transposed) instead of directly from
+// global memory. The register-to-frequency mapping (i*stride+threadIdx.x)
+// and the DC-bin/Nyquist-bin Parseval accumulation are identical to the
+// global-memory version above -- only the source address changes.
+// `tile` is shaped (FPB, PaddedNumFreq), lane-major/freq-minor.
+// ---------------------------------------------------------------------------
+template <class FFT, unsigned int NumFreq, unsigned int PaddedNumFreq,
+          bool HasNyquist>
+inline __device__ void load_padded_with_parseval_moments_shared(
+    const typename FFT::value_type *__restrict__ tile,
+    typename FFT::value_type *thread_data, unsigned int local_fft_id,
+    bool active, double *dc_real_out, double *power_sum_out) {
+
+  using complex_type = typename FFT::value_type;
+  using scalar_type = typename complex_type::value_type;
+
+  const unsigned int stride = FFT::stride;
+  const unsigned int row_offset = local_fft_id * PaddedNumFreq;
+
+  double dc_real = 0.0;
+  double power_sum = 0.0;
+
+#pragma unroll
+  for (unsigned int i = 0; i < FFT::input_ept; ++i) {
+    const unsigned int read_idx = i * stride + threadIdx.x;
+    const bool valid_read = active && (read_idx < NumFreq);
+    complex_type val = valid_read
+                           ? tile[row_offset + read_idx]
+                           : complex_type{scalar_type(0), scalar_type(0)};
+
+    thread_data[i] = val;
+
+    if (valid_read) {
+      const double re = static_cast<double>(val.real());
+      const double im = static_cast<double>(val.imag());
+
+      if (read_idx == 0) {
+        dc_real += re;
+      } else if (HasNyquist && read_idx == NumFreq - 1) {
+        power_sum += re * re;
+      } else {
+        power_sum += 2.0 * (re * re + im * im);
+      }
+    }
+  }
+
+  power_sum += dc_real * dc_real;
+
+  *dc_real_out = dc_real;
+  *power_sum_out = power_sum;
+}
+
+// ---------------------------------------------------------------------------
 // Scan this thread's slice of the post-FFT registers for local vmax/amax.
 // ---------------------------------------------------------------------------
 template <class FFT, unsigned int NumPsi>
@@ -164,6 +219,35 @@ local_argmax_from_registers(const typename FFT::value_type *thread_data,
 }
 
 // ---------------------------------------------------------------------------
+// Conservative (lower-bound) nominal per-block opt-in shared memory budgets,
+// keyed by the same SM/Arch values dispatched in irfft_stats_1d.cu. These
+// back a compile-time static_assert in FusedIrfftStatsConfig as a
+// best-effort guard for the transposed-input kernel's staging tile.
+// ---------------------------------------------------------------------------
+inline constexpr size_t arch_shared_memory_budget_bytes(unsigned int arch) {
+  switch (arch) {
+  case 750:
+    return 64ull * 1024; // Turing
+  case 800:
+    return 163ull * 1024; // Ampere (A100)
+  case 860:
+  case 870:
+    return 99ull * 1024; // Ampere (consumer / Orin)
+  case 890:
+    return 99ull * 1024; // Ada
+  case 900:
+    return 227ull * 1024; // Hopper
+  case 1000:
+  case 1030:
+  case 1200:
+  case 1210:
+    return 99ull * 1024; // Blackwell (conservative floor)
+  default:
+    return 48ull * 1024; // conservative floor for unlisted/older archs
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Compile-time configuration of (Arch, NumPsi, NumFreq, FPB, EPT).
 // ---------------------------------------------------------------------------
 template <unsigned int Arch, unsigned int NumPsi, unsigned int NumFreq,
@@ -199,7 +283,68 @@ struct FusedIrfftStatsConfig {
                 "NumFreq must be <= NumPsi/2 + 1 for RFFT");
 
   static constexpr size_t fft_shared_memory_bytes = FFT::shared_memory_size;
+
+  // -- Sizing for the transposed-input ((NumFreq, P, Q)) kernel variant,
+  //    which stages each block's data through a (FPB, NumFreq+1) shared tile
+  //    before the FFT's own working memory is used. The "+1" pads the row
+  //    stride since common NumFreq values are powers of two and would lead to
+  //    FPB-way bank conflicts on staging writes.
+  static constexpr unsigned int padded_num_freq = NumFreq + 1;
+  static constexpr size_t persistent_bytes_raw =
+      static_cast<size_t>(FPB) * padded_num_freq * sizeof(complex_type);
+  // Round up to 16 bytes so fft_shared_mem (below) stays 16-byte aligned.
+  static constexpr size_t persistent_bytes =
+      ((persistent_bytes_raw + 15) / 16) * 16;
+  static constexpr size_t total_shared_bytes_transposed =
+      persistent_bytes + fft_shared_memory_bytes;
+
+  static_assert(total_shared_bytes_transposed <=
+                    arch_shared_memory_budget_bytes(Arch),
+                "Transposed-input staging tile + FFT scratch exceeds this "
+                "architecture's nominal shared memory budget");
 };
+
+// ---------------------------------------------------------------------------
+// Final per-block reduction: thread 0 sums the FPB lanes' Parseval moments
+// and best (val, idx) pairs out of shared memory and atomically accumulates
+// them into the (P,)-sized global outputs.
+// ---------------------------------------------------------------------------
+template <unsigned int FPB, unsigned int NumPsi>
+inline __device__ void
+finalize_block_stats(unsigned int p, unsigned int q0, unsigned int q_total,
+                     const double *__restrict__ s_dc,
+                     const double *__restrict__ s_power,
+                     const unsigned long long *__restrict__ s_best_packed,
+                     float *__restrict__ s1, float *__restrict__ s2,
+                     unsigned long long *__restrict__ argmax_packed) {
+  if (threadIdx.x == 0 && threadIdx.y == 0) {
+    double block_dc_sum = 0.0;
+    double block_power_sum = 0.0;
+    float best_val = -FLT_MAX;
+    unsigned int best_flat_idx = 0;
+
+#pragma unroll
+    for (unsigned int l = 0; l < FPB; ++l) {
+      if (q0 + l >= q_total)
+        continue; // masks the trailing partial tile
+
+      block_dc_sum += s_dc[l];
+      block_power_sum += s_power[l];
+
+      const unsigned long long packed = s_best_packed[l];
+      const float val = unpack_val(packed);
+      if (val > best_val) {
+        best_val = val;
+        best_flat_idx = (q0 + l) * NumPsi + unpack_idx(packed);
+      }
+    }
+
+    const double n_psi_d = static_cast<double>(NumPsi);
+    atomicAdd(s1 + p, static_cast<float>(n_psi_d * block_dc_sum));
+    atomicAdd(s2 + p, static_cast<float>(n_psi_d * block_power_sum));
+    atomicMax(argmax_packed + p, pack_val_idx(best_val, best_flat_idx));
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Fused kernel definition.
@@ -276,49 +421,127 @@ __launch_bounds__(Config::FFT::max_threads_per_block) __global__
   }
   __syncthreads();
 
-  // Thread zero accumulates results into global memory
-  if (threadIdx.x == 0 && threadIdx.y == 0) {
-    double block_dc_sum = 0.0;
-    double block_power_sum = 0.0;
-    float best_val = -FLT_MAX;
-    unsigned int best_flat_idx = 0;
+  finalize_block_stats<fpb, n_psi>(p, q0, q_total, s_dc, s_power, s_best_packed,
+                                   s1, s2, argmax_packed);
+}
 
-#pragma unroll
-    for (unsigned int l = 0; l < fpb; ++l) {
-      if (q0 + l >= q_total)
-        continue; // masks the trailing partial tile
+// ---------------------------------------------------------------------------
+// Variant of fused_irfft_and_stats_kernel that consumes a (NumFreq, P, Q)
+// contiguous input (frequency as the OUTERMOST/batch axis, instead of
+// (P, Q, NumFreq). Each block does one coalesced global->shared copy of its
+// (pixel, Q-tile) span.
+// ---------------------------------------------------------------------------
+template <class Config>
+__launch_bounds__(Config::FFT::max_threads_per_block) __global__
+    void fused_irfft_and_stats_kernel_transposed(
+        const typename Config::complex_type *__restrict__ c, // (NumFreq, P, Q)
+        float *__restrict__ s1,                              // (P), pre-zeroed
+        float *__restrict__ s2,                              // (P), pre-zeroed
+        unsigned long long
+            *__restrict__ argmax_packed, // (P), sentinel pre-filled
+        unsigned int p_total, unsigned int q_total,
+        unsigned int n_tiles_per_pixel) {
 
-      block_dc_sum += s_dc[l];
-      block_power_sum += s_power[l];
+  using FFT = typename Config::FFT;
+  using complex_type = typename FFT::value_type;
 
-      const unsigned long long packed = s_best_packed[l];
-      const float val = unpack_val(packed);
-      if (val > best_val) {
-        best_val = val;
-        best_flat_idx = (q0 + l) * n_psi + unpack_idx(packed);
-      }
-    }
+  constexpr unsigned int num_freq = Config::num_freq;
+  constexpr unsigned int n_psi = Config::num_psi;
+  constexpr unsigned int fpb = Config::ffts_per_block;
+  constexpr bool has_nyquist = Config::has_nyquist;
+  constexpr unsigned int padded_num_freq = Config::padded_num_freq;
+  constexpr unsigned int real_tile_elems = fpb * num_freq;
 
-    const double n_psi_d = static_cast<double>(n_psi);
-    atomicAdd(s1 + p, static_cast<float>(n_psi_d * block_dc_sum));
-    atomicAdd(s2 + p, static_cast<float>(n_psi_d * block_power_sum));
-    atomicMax(argmax_packed + p, pack_val_idx(best_val, best_flat_idx));
+  const unsigned int p = blockIdx.x / n_tiles_per_pixel;
+  const unsigned int tile = blockIdx.x % n_tiles_per_pixel;
+  const unsigned int q0 = tile * fpb;
+  const unsigned int local_fft_id = threadIdx.y;
+  const unsigned int q = q0 + local_fft_id;
+  const bool active = q < q_total;
+
+  __shared__ double s_dc[fpb];
+  __shared__ double s_power[fpb];
+  __shared__ unsigned long long s_best_packed[fpb];
+
+  if (threadIdx.x == 0) {
+    s_dc[local_fft_id] = 0.0;
+    s_power[local_fft_id] = 0.0;
+    s_best_packed[local_fft_id] = 0ull;
   }
+
+  // Partition dynamic shared memory: staging tile first, FFT scratch after.
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  complex_type *stage_tile = reinterpret_cast<complex_type *>(smem_raw);
+  complex_type *fft_shared_mem =
+      reinterpret_cast<complex_type *>(smem_raw + Config::persistent_bytes);
+
+  __syncthreads(); // protects s_dc/s_power/s_best_packed init above
+
+  // Cooperative, block-wide coalesced global->shared staging copy.
+  {
+    const unsigned int tid = threadIdx.y * FFT::stride + threadIdx.x;
+    constexpr unsigned int block_threads = FFT::stride * fpb;
+    const unsigned long long pq_stride =
+        static_cast<unsigned long long>(p_total) * q_total;
+    const unsigned long long row_base =
+        static_cast<unsigned long long>(p) * q_total + q0;
+
+    for (unsigned int elem = tid; elem < real_tile_elems;
+         elem += block_threads) {
+      const unsigned int k = elem / fpb;
+      const unsigned int l = elem % fpb;
+      const bool valid = (q0 + l) < q_total;
+      complex_type val = valid ? c[k * pq_stride + row_base + l]
+                               : zipfft::get_zero<complex_type>();
+      stage_tile[l * padded_num_freq + k] = val;
+    }
+  }
+  __syncthreads(); // staging tile fully written before any thread reads it
+
+  double dc_real = 0.0;
+  double power_sum = 0.0;
+  complex_type thread_data[FFT::storage_size];
+  load_padded_with_parseval_moments_shared<FFT, num_freq, padded_num_freq,
+                                           has_nyquist>(
+      stage_tile, thread_data, local_fft_id, active, &dc_real, &power_sum);
+
+  if (active) {
+    atomicAdd(&s_dc[local_fft_id], dc_real);
+    atomicAdd(&s_power[local_fft_id], power_sum);
+  }
+
+  __syncthreads(); // existing barrier before FFT execute
+  FFT().execute(thread_data, fft_shared_mem);
+
+  float local_best_val;
+  unsigned int local_best_idx;
+  local_argmax_from_registers<FFT, n_psi>(thread_data, active, &local_best_val,
+                                          &local_best_idx);
+  if (active) {
+    atomicMax(&s_best_packed[local_fft_id],
+              pack_val_idx(local_best_val, local_best_idx));
+  }
+  __syncthreads();
+
+  finalize_block_stats<fpb, n_psi>(p, q0, q_total, s_dc, s_power, s_best_packed,
+                                   s1, s2, argmax_packed);
 }
 
 template <class Config>
-inline void launch_fused_irfft_stats(const typename Config::complex_type* c, float* s1,
-                                      float* s2, unsigned long long* argmax_packed,
-                                      unsigned int p_total, unsigned int q_total,
-                                      cudaStream_t stream = 0) {
+inline void launch_fused_irfft_stats(const typename Config::complex_type *c,
+                                     float *s1, float *s2,
+                                     unsigned long long *argmax_packed,
+                                     unsigned int p_total, unsigned int q_total,
+                                     cudaStream_t stream = 0) {
   static bool attr_set = false;
   if (!attr_set) {
-    auto err = cudaFuncSetAttribute(fused_irfft_and_stats_kernel<Config>,
-                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                     static_cast<int>(Config::fft_shared_memory_bytes));
+    auto err =
+        cudaFuncSetAttribute(fused_irfft_and_stats_kernel<Config>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(Config::fft_shared_memory_bytes));
     if (err != cudaSuccess) {
       throw std::runtime_error(std::string("cudaFuncSetAttribute failed: ") +
-                                cudaGetErrorString(err));
+                               cudaGetErrorString(err));
     }
     attr_set = true;
   }
@@ -328,14 +551,65 @@ inline void launch_fused_irfft_stats(const typename Config::complex_type* c, flo
   const unsigned int num_blocks = p_total * n_tiles_per_pixel;
 
   fused_irfft_and_stats_kernel<Config>
-      <<<num_blocks, Config::FFT::block_dim, Config::fft_shared_memory_bytes, stream>>>(
-          c, s1, s2, argmax_packed, q_total, n_tiles_per_pixel);
+      <<<num_blocks, Config::FFT::block_dim, Config::fft_shared_memory_bytes,
+         stream>>>(c, s1, s2, argmax_packed, q_total, n_tiles_per_pixel);
 
   auto launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
     throw std::runtime_error(std::string("fused_irfft_stats launch failed: ") +
-                              cudaGetErrorString(launch_err) +
-                              " num_blocks=" + std::to_string(num_blocks));
+                             cudaGetErrorString(launch_err) +
+                             " num_blocks=" + std::to_string(num_blocks));
+  }
+}
+
+template <class Config>
+inline void launch_fused_irfft_stats_transposed(
+    const typename Config::complex_type *c, float *s1, float *s2,
+    unsigned long long *argmax_packed, unsigned int p_total,
+    unsigned int q_total, cudaStream_t stream = 0) {
+  static bool attr_set = false;
+  if (!attr_set) {
+    int device = 0;
+    cudaGetDevice(&device);
+    int max_optin = 0;
+    auto attr_err = cudaDeviceGetAttribute(
+        &max_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (attr_err == cudaSuccess && static_cast<size_t>(max_optin) <
+                                       Config::total_shared_bytes_transposed) {
+      throw std::runtime_error(
+          "fused_irfft_stats_transposed: device's max shared memory per "
+          "block (" +
+          std::to_string(max_optin) + " bytes) is smaller than the " +
+          std::to_string(Config::total_shared_bytes_transposed) +
+          " bytes required for this configuration");
+    }
+
+    auto err = cudaFuncSetAttribute(
+        fused_irfft_and_stats_kernel_transposed<Config>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(Config::total_shared_bytes_transposed));
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaFuncSetAttribute failed: ") +
+                               cudaGetErrorString(err));
+    }
+    attr_set = true;
+  }
+
+  const unsigned int n_tiles_per_pixel =
+      (q_total + Config::ffts_per_block - 1) / Config::ffts_per_block;
+  const unsigned int num_blocks = p_total * n_tiles_per_pixel;
+
+  fused_irfft_and_stats_kernel_transposed<Config>
+      <<<num_blocks, Config::FFT::block_dim,
+         Config::total_shared_bytes_transposed, stream>>>(
+          c, s1, s2, argmax_packed, p_total, q_total, n_tiles_per_pixel);
+
+  auto launch_err = cudaGetLastError();
+  if (launch_err != cudaSuccess) {
+    throw std::runtime_error(
+        std::string("fused_irfft_stats_transposed launch failed: ") +
+        cudaGetErrorString(launch_err) +
+        " num_blocks=" + std::to_string(num_blocks));
   }
 }
 
