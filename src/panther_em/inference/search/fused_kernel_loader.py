@@ -23,6 +23,8 @@ from typing import Any
 
 import torch
 
+from panther_em.inference.search.statistics import decode_argmax_packed
+
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _CSRC_DIR = os.path.join(_THIS_DIR, "csrc")
 _INCLUDE_DIR = os.path.join(_CSRC_DIR, "include")
@@ -175,26 +177,6 @@ def _try_compile() -> Any:
 
 
 # --------------------------------------------------------------------------- #
-# Packed-argmax decode: inverse of the CUDA-side pack_val_idx (sortable-float
-# trick) in fused_irfft_and_stats_kernel.cuh. Vectorized bitwise torch ops on a
-# (P,)-sized tensor -- negligible cost, not worth a dedicated decode kernel.
-# --------------------------------------------------------------------------- #
-def _decode_argmax_packed(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    idx = (packed & 0xFFFFFFFF).to(torch.int64)
-    sortable = ((packed >> 32) & 0xFFFFFFFF).to(torch.int64)
-
-    sign_set = (sortable & 0x80000000) != 0
-    mask = torch.where(
-        sign_set,
-        torch.full_like(sortable, 0x80000000),
-        torch.full_like(sortable, 0xFFFFFFFF),
-    )
-    bits = (sortable ^ mask) & 0xFFFFFFFF
-    val = bits.to(torch.int32).view(torch.float32)
-    return val, idx
-
-
-# --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
 def get_supported_configs() -> list[tuple[int, int, int, int]] | None:
@@ -211,8 +193,12 @@ def get_supported_configs() -> list[tuple[int, int, int, int]] | None:
 
 
 def fused_irfft_stats(
-    c: torch.Tensor, n_psi: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    c: torch.Tensor, n_psi: int, decode: bool = True
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | None
+):
     """Fused psi-recovery + statistics-update for one hypothesis batch.
 
     Matches :func:`panther_em.inference.search.statistics._reduce_stats`'s I/O
@@ -227,14 +213,22 @@ def fused_irfft_stats(
         complex64, CUDA, shape (P, Q, NumFreq).
     n_psi : int
         Full in-plane-angle length.
+    decode : bool, optional
+        If ``True`` (default), decode the kernel's raw packed argmax into
+        ``(vmax, amax)`` before returning. Pass ``False`` to skip that decode and get
+        the raw packed value back instead -- useful when a caller wants to batch
+        several calls' raw outputs together and decode the whole batch once (see
+        :func:`panther_em.inference.search.statistics.decode_argmax_packed` and
+        :meth:`~panther_em.inference.search.statistics.PixelStats.accumulate_batch`).
 
     Returns
     -------
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
-        ``(s1, s2, vmax, amax)`` as Tensors with dtype (``float32``, ``float32``,
-        ``float32``, ``int64``) and all with shapes ``(P,)``. If an exception was raised
-        internally, then None is returned and a warning is issued, and finally the torch
-        fallback path is used instead.
+    tuple | None
+        ``(s1, s2, vmax, amax)`` with dtypes (``float32``, ``float32``, ``float32``,
+        ``int64``) when ``decode=True``; ``(s1, s2, argmax_packed)`` with dtypes
+        (``float32``, ``float32``, ``int64``) when ``decode=False``. All shapes
+        ``(P,)``. If an exception was raised internally, then None is returned and a
+        warning is issued, and finally the torch fallback path is used instead.
     """
     global _warned_runtime_failure
 
@@ -260,13 +254,19 @@ def fused_irfft_stats(
             _warned_runtime_failure = True
         return None
 
-    vmax, amax = _decode_argmax_packed(argmax_packed)
+    if not decode:
+        return s1, s2, argmax_packed
+    vmax, amax = decode_argmax_packed(argmax_packed)
     return s1, s2, vmax, amax
 
 
 def fused_irfft_stats_transposed(
-    c: torch.Tensor, n_psi: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    c: torch.Tensor, n_psi: int, decode: bool = True
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | None
+):
     """Zero-copy variant of :func:`fused_irfft_stats` for ``(NumFreq, P, Q)`` input.
 
     Notes
@@ -282,15 +282,17 @@ def fused_irfft_stats_transposed(
         complex64, CUDA, contiguous, shape (NumFreq, P, Q).
     n_psi : int
         Full in-plane-angle length.
+    decode : bool, optional
+        See :func:`fused_irfft_stats`'s ``decode`` parameter -- same contract here.
 
     Returns
     -------
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
-        ``(s1, s2, vmax, amax)``, same shapes/dtypes as
-        :func:`fused_irfft_stats`. ``None`` on any internal failure
-        (unsupported config, non-contiguous input, runtime error), in which
-        case callers should fall back to :func:`fused_irfft_stats` or the
-        pure-torch path.
+    tuple | None
+        ``(s1, s2, vmax, amax)`` when ``decode=True``, or ``(s1, s2, argmax_packed)``
+        when ``decode=False`` -- same shapes/dtypes as :func:`fused_irfft_stats`.
+        ``None`` on any internal failure (unsupported config, non-contiguous input,
+        runtime error), in which case callers should fall back to
+        :func:`fused_irfft_stats` or the pure-torch path.
     """
     global _warned_runtime_failure
 
@@ -316,5 +318,7 @@ def fused_irfft_stats_transposed(
             _warned_runtime_failure = True
         return None
 
-    vmax, amax = _decode_argmax_packed(argmax_packed)
+    if not decode:
+        return s1, s2, argmax_packed
+    vmax, amax = decode_argmax_packed(argmax_packed)
     return s1, s2, vmax, amax

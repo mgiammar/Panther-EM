@@ -267,12 +267,24 @@ def _run_stage(
 
         # Prepare hypothesis baches once (since independent of pixel batch)
         with torch.cuda.nvtx.range("hypothesis batch weight preparation"):
+            is_contiguous_hyps = n_hypotheses > 0 and bool(
+                torch.equal(
+                    hypothesis_indexes,
+                    torch.arange(
+                        int(hypothesis_indexes[0]),
+                        int(hypothesis_indexes[0]) + n_hypotheses,
+                        device=hypothesis_indexes.device,
+                        dtype=hypothesis_indexes.dtype,
+                    ),
+                )
+            )
             hyp_batches = [
                 (
                     hypothesis_indexes[h0 : h0 + hyp_batch],
                     tiling.prepare_weights(
                         w_layout[hypothesis_indexes[h0 : h0 + hyp_batch]]
                     ),
+                    h0 if is_contiguous_hyps else None,
                 )
                 for h0 in range(0, n_hypotheses, hyp_batch)
             ]
@@ -326,7 +338,10 @@ def _run_stage(
                     disable=not show_progress,
                     leave=False,
                 )
-                for hyp_b, prepared_weights in hyp_batches:
+
+                if not is_contiguous_hyps:
+                    pixel_stats.begin_hypothesis_batches(len(hyp_batches))
+                for hyp_b, prepared_weights, hyp_offset in hyp_batches:
                     # Accumulate the angular-frequency spectrum C
                     with torch.cuda.nvtx.range("batched multiply"):
                         C = tiling.run(
@@ -335,13 +350,24 @@ def _run_stage(
 
                     # psi recovery + statistics update, per-pixel
                     with torch.cuda.nvtx.range("psi recovery + statistics update"):
-                        pixel_stats.update(
-                            C, hyp_b, num_psi=n_psi, reverse_psi_axis=True
-                        )
+                        if is_contiguous_hyps:
+                            pixel_stats.update_graphed(
+                                C, hyp_offset, num_psi=n_psi, reverse_psi_axis=True
+                            )
+                        else:
+                            pixel_stats.accumulate_batch(
+                                C, hyp_b, num_psi=n_psi, hyp_offset=hyp_offset
+                            )
 
                     hyp_bar.update(int(hyp_b.numel()))
 
                 hyp_bar.close()
+
+                if not is_contiguous_hyps:
+                    with torch.cuda.nvtx.range("hypothesis-batch reduction"):
+                        pixel_stats.reduce_hypothesis_batches(
+                            num_psi=n_psi, reverse_psi_axis=True
+                        )
 
                 stage_stats.append(pixel_stats.finalize())
                 pixel_bar.update(int(px_b.numel()))
