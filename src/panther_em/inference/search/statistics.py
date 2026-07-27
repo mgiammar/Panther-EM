@@ -18,19 +18,19 @@ def _cuda_graph_capture_supported(device_index: int) -> bool:
     try:
         device = torch.device("cuda", device_index)
         x = torch.zeros(1, device=device)
-        warmup_stream = torch.cuda.Stream(device=device)
-        warmup_stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(warmup_stream):
+        capture_stream = torch.cuda.Stream(device=device)
+        capture_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(capture_stream):
             x.add_(1)
-        torch.cuda.current_stream(device).wait_stream(warmup_stream)
+        torch.cuda.current_stream(device).wait_stream(capture_stream)
         torch.cuda.synchronize(device)
 
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
+        with torch.cuda.graph(g, stream=capture_stream):
             x.add_(1)
         g.replay()
         torch.cuda.synchronize(device)
-        return True
+        return bool(x.item() == 2.0)
     except Exception:
         return False
 
@@ -409,12 +409,20 @@ class PixelStats:
             )
             torch.where(improved, psi, self.best_psi_angle, out=self.best_psi_angle)
 
-        warmup_stream = torch.cuda.Stream(device=device)
-        warmup_stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(warmup_stream):
+        # Explicitly bind both warm-up and capture to a stream on `device`. Without
+        # `stream=` here, torch.cuda.graph() falls back to a lazily-created,
+        # process-wide *default* capture stream pinned to whatever device happened
+        # to be ambient-current the first time any CUDA graph was captured in this
+        # process -- if `device` differs from that (e.g. a multi-GPU process that
+        # never called torch.cuda.set_device(device.index)), the capture silently
+        # records zero nodes (a "CUDA Graph is empty" warning) and replay becomes a
+        # no-op, leaving corr_sum/best_corr/etc. stuck at their initial values.
+        capture_stream = torch.cuda.Stream(device=device)
+        capture_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(capture_stream):
             for _ in range(3):
                 _step()
-        torch.cuda.current_stream(device).wait_stream(warmup_stream)
+        torch.cuda.current_stream(device).wait_stream(capture_stream)
         torch.cuda.synchronize(device)
 
         # Undo the warm-up's accumulation before it becomes "real" tracked state.
@@ -425,7 +433,7 @@ class PixelStats:
         self.best_psi_angle.fill_(-1)
 
         self._graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self._graph):
+        with torch.cuda.graph(self._graph, stream=capture_stream):
             _step()
         self._graph_num_psi = num_psi
         self._graph_reverse_psi_axis = reverse_psi_axis

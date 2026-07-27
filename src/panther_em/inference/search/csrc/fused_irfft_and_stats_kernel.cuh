@@ -73,7 +73,7 @@ template <class FFT, unsigned int NumFreq, bool HasNyquist>
 inline __device__ void load_padded_with_parseval_moments(
     const typename FFT::value_type *__restrict__ input,
     typename FFT::value_type *thread_data, unsigned long long flat_batch_idx,
-    bool active, double *dc_real_out, double *power_sum_out) {
+    bool active, float *dc_real_out, float *power_sum_out) {
 
   using complex_type = typename FFT::value_type;
   using scalar_type = typename complex_type::value_type;
@@ -82,8 +82,8 @@ inline __device__ void load_padded_with_parseval_moments(
   const unsigned long long batch_offset =
       static_cast<unsigned long long>(NumFreq) * flat_batch_idx;
 
-  double dc_real = 0.0;
-  double power_sum = 0.0;
+  float dc_real = 0.0f;
+  float power_sum = 0.0f;
 
 #pragma unroll
   for (unsigned int i = 0; i < FFT::input_ept; ++i) {
@@ -98,20 +98,23 @@ inline __device__ void load_padded_with_parseval_moments(
 
     // Accumulate moments from valid frequency bins.
     if (valid_read) {
-      const double re = static_cast<double>(val.real());
-      const double im = static_cast<double>(val.imag());
+      const float re = val.real();
+      const float im = val.imag();
 
       if (read_idx == 0) {
         dc_real += re; // DC bin only has real component
       } else if (HasNyquist && read_idx == NumFreq - 1) {
-        power_sum += re * re; // Nyquist bin only has real component, no double
+        power_sum = fmaf(re, re, power_sum); // Nyquist bin real component only
       } else {
-        power_sum += 2.0 * (re * re + im * im); // Double since RFFT symmetric
+        // 2*(re^2+im^2), as two FMAs: fmaf(2*im,im,sum) then fmaf(2*re,re,.)
+         // Doubled since RFFT symmetric
+        power_sum = fmaf(2.0f * im, im, power_sum);
+        power_sum = fmaf(2.0f * re, re, power_sum);
       }
     }
   }
 
-  power_sum += dc_real * dc_real; // Add DC contribution to power sum
+  power_sum = fmaf(dc_real, dc_real, power_sum); // Add DC contribution to power sum
 
   *dc_real_out = dc_real;
   *power_sum_out = power_sum;
@@ -131,7 +134,7 @@ template <class FFT, unsigned int NumFreq, unsigned int PaddedNumFreq,
 inline __device__ void load_padded_with_parseval_moments_shared(
     const typename FFT::value_type *__restrict__ tile,
     typename FFT::value_type *thread_data, unsigned int local_fft_id,
-    bool active, double *dc_real_out, double *power_sum_out) {
+    bool active, float *dc_real_out, float *power_sum_out) {
 
   using complex_type = typename FFT::value_type;
   using scalar_type = typename complex_type::value_type;
@@ -139,8 +142,8 @@ inline __device__ void load_padded_with_parseval_moments_shared(
   const unsigned int stride = FFT::stride;
   const unsigned int row_offset = local_fft_id * PaddedNumFreq;
 
-  double dc_real = 0.0;
-  double power_sum = 0.0;
+  float dc_real = 0.0f;
+  float power_sum = 0.0f;
 
 #pragma unroll
   for (unsigned int i = 0; i < FFT::input_ept; ++i) {
@@ -153,20 +156,21 @@ inline __device__ void load_padded_with_parseval_moments_shared(
     thread_data[i] = val;
 
     if (valid_read) {
-      const double re = static_cast<double>(val.real());
-      const double im = static_cast<double>(val.imag());
+      const float re = val.real();
+      const float im = val.imag();
 
       if (read_idx == 0) {
         dc_real += re;
       } else if (HasNyquist && read_idx == NumFreq - 1) {
-        power_sum += re * re;
+        power_sum = fmaf(re, re, power_sum);
       } else {
-        power_sum += 2.0 * (re * re + im * im);
+        power_sum = fmaf(2.0f * im, im, power_sum);
+        power_sum = fmaf(2.0f * re, re, power_sum);
       }
     }
   }
 
-  power_sum += dc_real * dc_real;
+  power_sum = fmaf(dc_real, dc_real, power_sum);
 
   *dc_real_out = dc_real;
   *power_sum_out = power_sum;
@@ -312,14 +316,14 @@ struct FusedIrfftStatsConfig {
 template <unsigned int FPB, unsigned int NumPsi>
 inline __device__ void
 finalize_block_stats(unsigned int p, unsigned int q0, unsigned int q_total,
-                     const double *__restrict__ s_dc,
-                     const double *__restrict__ s_power,
+                     const float *__restrict__ s_dc,
+                     const float *__restrict__ s_power,
                      const unsigned long long *__restrict__ s_best_packed,
                      float *__restrict__ s1, float *__restrict__ s2,
                      unsigned long long *__restrict__ argmax_packed) {
   if (threadIdx.x == 0 && threadIdx.y == 0) {
-    double block_dc_sum = 0.0;
-    double block_power_sum = 0.0;
+    float block_dc_sum = 0.0f;
+    float block_power_sum = 0.0f;
     float best_val = -FLT_MAX;
     unsigned int best_flat_idx = 0;
 
@@ -339,9 +343,9 @@ finalize_block_stats(unsigned int p, unsigned int q0, unsigned int q_total,
       }
     }
 
-    const double n_psi_d = static_cast<double>(NumPsi);
-    atomicAdd(s1 + p, static_cast<float>(n_psi_d * block_dc_sum));
-    atomicAdd(s2 + p, static_cast<float>(n_psi_d * block_power_sum));
+    const float n_psi_f = static_cast<float>(NumPsi);
+    atomicAdd(s1 + p, n_psi_f * block_dc_sum);
+    atomicAdd(s2 + p, n_psi_f * block_power_sum);
     atomicMax(argmax_packed + p, pack_val_idx(best_val, best_flat_idx));
   }
 }
@@ -378,21 +382,21 @@ __launch_bounds__(Config::FFT::max_threads_per_block) __global__
   const unsigned int q = q0 + local_fft_id;
   const bool active = q < q_total;
 
-  __shared__ double s_dc[fpb];
-  __shared__ double s_power[fpb];
+  __shared__ float s_dc[fpb];
+  __shared__ float s_power[fpb];
   __shared__ unsigned long long s_best_packed[fpb];
 
   // Initialize shared memory
   if (threadIdx.x == 0) {
-    s_dc[local_fft_id] = 0.0;
-    s_power[local_fft_id] = 0.0;
+    s_dc[local_fft_id] = 0.0f;
+    s_power[local_fft_id] = 0.0f;
     s_best_packed[local_fft_id] = 0ull; // sortable(-inf) has nonzero high bits
   }
   __syncthreads();
 
   // Initialize registers, load frequency data, and accumulate moments
-  double dc_real = 0.0;
-  double power_sum = 0.0;
+  float dc_real = 0.0f;
+  float power_sum = 0.0f;
   const unsigned long long flat_batch_idx =
       static_cast<unsigned long long>(p) * q_total + q;
   complex_type thread_data[FFT::storage_size];
@@ -459,13 +463,13 @@ __launch_bounds__(Config::FFT::max_threads_per_block) __global__
   const unsigned int q = q0 + local_fft_id;
   const bool active = q < q_total;
 
-  __shared__ double s_dc[fpb];
-  __shared__ double s_power[fpb];
+  __shared__ float s_dc[fpb];
+  __shared__ float s_power[fpb];
   __shared__ unsigned long long s_best_packed[fpb];
 
   if (threadIdx.x == 0) {
-    s_dc[local_fft_id] = 0.0;
-    s_power[local_fft_id] = 0.0;
+    s_dc[local_fft_id] = 0.0f;
+    s_power[local_fft_id] = 0.0f;
     s_best_packed[local_fft_id] = 0ull;
   }
 
@@ -498,8 +502,8 @@ __launch_bounds__(Config::FFT::max_threads_per_block) __global__
   }
   __syncthreads(); // staging tile fully written before any thread reads it
 
-  double dc_real = 0.0;
-  double power_sum = 0.0;
+  float dc_real = 0.0f;
+  float power_sum = 0.0f;
   complex_type thread_data[FFT::storage_size];
   load_padded_with_parseval_moments_shared<FFT, num_freq, padded_num_freq,
                                            has_nyquist>(

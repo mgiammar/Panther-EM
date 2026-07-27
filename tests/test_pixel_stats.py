@@ -389,6 +389,32 @@ def test_update_graphed_matches_streaming_update_varying_hyp_batch_size(stats_cl
     assert graphed.hypothesis_count == sum(hyp_sizes) * num_psi
 
 
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="requires a second CUDA device"
+)
+@pytest.mark.parametrize("stats_cls", [PixelStats, FusedPixelStats])
+def test_update_graphed_matches_streaming_update_on_non_default_device(stats_cls):
+    """Graph capture/replay must target `device`, not current device."""
+    num_pixels, hyp_batch, n_freq, num_psi = 6, 10, 9, 16
+    device = torch.device("cuda:1")
+    assert torch.cuda.current_device() != device.index
+
+    spectrum = _make_spectrum(num_pixels, hyp_batch, n_freq, device=device, seed=7)
+    hyp_idx = torch.arange(hyp_batch, device=device)
+
+    expected = _run_streaming(stats_cls, [spectrum], [hyp_idx], num_psi, device=device)
+
+    graphed = stats_cls(num_pixels, device=device)
+    graphed.update_graphed(
+        spectrum, hyp_offset=0, num_psi=num_psi, reverse_psi_axis=True
+    )
+    actual = graphed.finalize()
+
+    _assert_results_match(expected, actual)
+    assert graphed.hypothesis_count == hyp_batch * num_psi
+    assert not torch.all(graphed.best_hypothesis == -1), "graph replay was a no-op"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 def test_update_graphed_rejects_mismatched_num_psi_after_capture():
     num_pixels, n_freq = 4, 9
