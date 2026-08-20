@@ -122,23 +122,20 @@ class PixelStager:
         with torch.cuda.device(self.compute_device):
             # Block until the *previous* occupant has actually finished being read.
             if stage_idx >= self._n_slots:
-                with torch.cuda.nvtx.range("stager: wait host buffer free"):
-                    self._h2d_done[slot].synchronize()
+                self._h2d_done[slot].synchronize()
 
-            with torch.cuda.nvtx.range("stager: gather to pinned"):
-                if self._host_buffers is not None:
-                    host_buf = self._host_buffers[slot][:n]
-                    torch.index_select(self.store.Y, 0, idx, out=host_buf)
-                    src = host_buf
-                else:
-                    src = self.store.Y.index_select(0, idx)
+            if self._host_buffers is not None:
+                host_buf = self._host_buffers[slot][:n]
+                torch.index_select(self.store.Y, 0, idx, out=host_buf)
+                src = host_buf
+            else:
+                src = self.store.Y.index_select(0, idx)
 
-            with torch.cuda.nvtx.range("stager: issue async copy"):
-                with torch.cuda.stream(self._copy_stream):
-                    if stage_idx >= self._n_slots:
-                        self._copy_stream.wait_event(self._compute_done[slot])
-                    self._device_buffers[slot][:n].copy_(src, non_blocking=True)
-                    self._h2d_done[slot].record(self._copy_stream)
+            with torch.cuda.stream(self._copy_stream):
+                if stage_idx >= self._n_slots:
+                    self._copy_stream.wait_event(self._compute_done[slot])
+                self._device_buffers[slot][:n].copy_(src, non_blocking=True)
+                self._h2d_done[slot].record(self._copy_stream)
 
     def stages(self) -> Iterator[tuple[int, int, torch.Tensor]]:
         """Yield ``(start, end, Y_stage)`` chunks covering ``pixel_index`` in order."""

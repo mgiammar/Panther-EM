@@ -235,144 +235,131 @@ def _run_stage(
     )
 
     # image feature reuse to avoid re-computation
-    with torch.cuda.nvtx.range("featurization"):
-        features_to_compute = store.missing_cells(tiling)
-        if features_to_compute.numel():
-            feats = featurize_cells(
-                image,
-                reconstructor,
-                features_to_compute,
-                feature_chunk=feature_chunk,
-                feature_store_device=store.device,
-                **polar_to_cart_kwargs,
-            )
-        else:
-            feats = torch.empty(
-                (0, store.num_pixels), dtype=store.dtype, device=store.device
-            )
-        store.relayout(tiling, feats)
+    features_to_compute = store.missing_cells(tiling)
+    if features_to_compute.numel():
+        feats = featurize_cells(
+            image,
+            reconstructor,
+            features_to_compute,
+            feature_chunk=feature_chunk,
+            feature_store_device=store.device,
+            **polar_to_cart_kwargs,
+        )
+    else:
+        feats = torch.empty(
+            (0, store.num_pixels), dtype=store.dtype, device=store.device
+        )
+    store.relayout(tiling, feats)
 
     stats_cls = FusedPixelStats if use_fused_kernel else PixelStats
 
     stage_stats: list[dict[str, torch.Tensor]] = []
 
-    with torch.cuda.nvtx.range("contraction + statistics"):
-        w_layout = build_layout_weights(reconstructor, tiling).to(compute_device)
-        hypothesis_indexes = hypothesis_indexes.to(compute_device)
-        pixel_index = pixel_index.to(compute_device)
-        pixel_stats = stats_cls(pixel_batch, device=compute_device)
+    w_layout = build_layout_weights(reconstructor, tiling).to(compute_device)
+    hypothesis_indexes = hypothesis_indexes.to(compute_device)
+    pixel_index = pixel_index.to(compute_device)
+    pixel_stats = stats_cls(pixel_batch, device=compute_device)
 
-        n_pixels = int(pixel_index.numel())
-        n_hypotheses = int(hypothesis_indexes.numel())
+    n_pixels = int(pixel_index.numel())
+    n_hypotheses = int(hypothesis_indexes.numel())
 
-        # Prepare hypothesis baches once (since independent of pixel batch)
-        with torch.cuda.nvtx.range("hypothesis batch weight preparation"):
-            is_contiguous_hyps = n_hypotheses > 0 and bool(
-                torch.equal(
-                    hypothesis_indexes,
-                    torch.arange(
-                        int(hypothesis_indexes[0]),
-                        int(hypothesis_indexes[0]) + n_hypotheses,
-                        device=hypothesis_indexes.device,
-                        dtype=hypothesis_indexes.dtype,
-                    ),
-                )
-            )
-            hyp_batches = [
-                (
-                    hypothesis_indexes[h0 : h0 + hyp_batch],
-                    tiling.prepare_weights(
-                        w_layout[hypothesis_indexes[h0 : h0 + hyp_batch]]
-                    ),
-                    h0 if is_contiguous_hyps else None,
-                )
-                for h0 in range(0, n_hypotheses, hyp_batch)
-            ]
+    # Prepare hypothesis baches once (since independent of pixel batch)
+    is_contiguous_hyps = n_hypotheses > 0 and bool(
+        torch.equal(
+            hypothesis_indexes,
+            torch.arange(
+                int(hypothesis_indexes[0]),
+                int(hypothesis_indexes[0]) + n_hypotheses,
+                device=hypothesis_indexes.device,
+                dtype=hypothesis_indexes.dtype,
+            ),
+        )
+    )
+    hyp_batches = [
+        (
+            hypothesis_indexes[h0 : h0 + hyp_batch],
+            tiling.prepare_weights(w_layout[hypothesis_indexes[h0 : h0 + hyp_batch]]),
+            h0 if is_contiguous_hyps else None,
+        )
+        for h0 in range(0, n_hypotheses, hyp_batch)
+    ]
 
-        # Ensure requested psi bins are sufficient for maximum angular frequency
-        n_freq = tiling.k_stop
-        if n_freq > n_psi // 2 + 1:
-            raise ValueError(
-                f"tiling k_stop ({n_freq}) exceeds n_psi // 2 + 1 "
-                f"({n_psi // 2 + 1}); increase n_psi to at least "
-                f"{2 * (n_freq - 1)} so the angular-frequency content is not aliased "
-                "away during irfft."
-            )
-
-        # Progress bars advance by the number of pixels / hypotheses actually
-        # processed each batch, so their rate reads in pixels/s and hypotheses/s
-        # (not batches/s).
-        pixel_bar = tqdm(
-            total=n_pixels,
-            desc="search pixels",
-            unit="pixel",
-            unit_scale=True,
-            disable=not show_progress,
+    # Ensure requested psi bins are sufficient for maximum angular frequency
+    n_freq = tiling.k_stop
+    if n_freq > n_psi // 2 + 1:
+        raise ValueError(
+            f"tiling k_stop ({n_freq}) exceeds n_psi // 2 + 1 "
+            f"({n_psi // 2 + 1}); increase n_psi to at least "
+            f"{2 * (n_freq - 1)} so the angular-frequency content is not aliased "
+            "away during irfft."
         )
 
-        # Streaming chunks of pixels through pinned memory and double buffering through
-        # asynchronous H2D copies. If `store_device == compute_device`, then a no-op.
-        stager = PixelStager(
-            store, pixel_index, compute_device, stage_bytes=stage_bytes
-        )
+    # Progress bars advance by the number of pixels / hypotheses actually
+    # processed each batch, so their rate reads in pixels/s and hypotheses/s
+    # (not batches/s).
+    pixel_bar = tqdm(
+        total=n_pixels,
+        desc="search pixels",
+        unit="pixel",
+        unit_scale=True,
+        disable=not show_progress,
+    )
 
-        for stage_start, stage_end, Y_stage in stager.stages():
-            stage_size = stage_end - stage_start
-            for p0 in range(0, stage_size, pixel_batch):
-                n = min(pixel_batch, stage_size - p0)
-                px_b = pixel_index[stage_start + p0 : stage_start + p0 + n]
-                with torch.cuda.nvtx.range("pixel copy"):
-                    Y_flat = Y_stage[p0 : p0 + n]
+    # Streaming chunks of pixels through pinned memory and double buffering through
+    # asynchronous H2D copies. If `store_device == compute_device`, then a no-op.
+    stager = PixelStager(store, pixel_index, compute_device, stage_bytes=stage_bytes)
 
-                # If not the previous batch's shape, create a fresh 'pixel_stats'.
-                if Y_flat.shape[0] != pixel_stats.num_pixels:
-                    pixel_stats = stats_cls(int(px_b.numel()), device=compute_device)
+    for stage_start, stage_end, Y_stage in stager.stages():
+        stage_size = stage_end - stage_start
+        for p0 in range(0, stage_size, pixel_batch):
+            n = min(pixel_batch, stage_size - p0)
+            px_b = pixel_index[stage_start + p0 : stage_start + p0 + n]
+            Y_flat = Y_stage[p0 : p0 + n]
+
+            # If not the previous batch's shape, create a fresh 'pixel_stats'.
+            if Y_flat.shape[0] != pixel_stats.num_pixels:
+                pixel_stats = stats_cls(int(px_b.numel()), device=compute_device)
+            else:
+                pixel_stats.clear()
+
+            hyp_bar = tqdm(
+                total=n_hypotheses,
+                desc="hypotheses",
+                unit="hypothesis",
+                unit_scale=True,
+                disable=not show_progress,
+                leave=False,
+            )
+
+            if not is_contiguous_hyps:
+                pixel_stats.begin_hypothesis_batches(len(hyp_batches))
+            for hyp_b, prepared_weights, hyp_offset in hyp_batches:
+                # Accumulate the angular-frequency spectrum C
+                C = tiling.run(Y_flat, None, n_freq, prepared_weights=prepared_weights)
+
+                # psi recovery + statistics update, per-pixel
+                if is_contiguous_hyps:
+                    pixel_stats.update_graphed(
+                        C, hyp_offset, num_psi=n_psi, reverse_psi_axis=True
+                    )
                 else:
-                    pixel_stats.clear()
+                    pixel_stats.accumulate_batch(
+                        C, hyp_b, num_psi=n_psi, hyp_offset=hyp_offset
+                    )
 
-                hyp_bar = tqdm(
-                    total=n_hypotheses,
-                    desc="hypotheses",
-                    unit="hypothesis",
-                    unit_scale=True,
-                    disable=not show_progress,
-                    leave=False,
+                hyp_bar.update(int(hyp_b.numel()))
+
+            hyp_bar.close()
+
+            if not is_contiguous_hyps:
+                pixel_stats.reduce_hypothesis_batches(
+                    num_psi=n_psi, reverse_psi_axis=True
                 )
 
-                if not is_contiguous_hyps:
-                    pixel_stats.begin_hypothesis_batches(len(hyp_batches))
-                for hyp_b, prepared_weights, hyp_offset in hyp_batches:
-                    # Accumulate the angular-frequency spectrum C
-                    with torch.cuda.nvtx.range("batched multiply"):
-                        C = tiling.run(
-                            Y_flat, None, n_freq, prepared_weights=prepared_weights
-                        )
+            stage_stats.append(pixel_stats.finalize())
+            pixel_bar.update(int(px_b.numel()))
 
-                    # psi recovery + statistics update, per-pixel
-                    with torch.cuda.nvtx.range("psi recovery + statistics update"):
-                        if is_contiguous_hyps:
-                            pixel_stats.update_graphed(
-                                C, hyp_offset, num_psi=n_psi, reverse_psi_axis=True
-                            )
-                        else:
-                            pixel_stats.accumulate_batch(
-                                C, hyp_b, num_psi=n_psi, hyp_offset=hyp_offset
-                            )
-
-                    hyp_bar.update(int(hyp_b.numel()))
-
-                hyp_bar.close()
-
-                if not is_contiguous_hyps:
-                    with torch.cuda.nvtx.range("hypothesis-batch reduction"):
-                        pixel_stats.reduce_hypothesis_batches(
-                            num_psi=n_psi, reverse_psi_axis=True
-                        )
-
-                stage_stats.append(pixel_stats.finalize())
-                pixel_bar.update(int(px_b.numel()))
-
-        pixel_bar.close()
+    pixel_bar.close()
 
     # Stitch the pixel batches back into stage-level maps.
     # NOTE: This return may change into a different dict or helper class in future...
