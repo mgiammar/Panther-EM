@@ -8,7 +8,7 @@ cuFFTDx headers are located automatically, in this order:
 Notes
 -----
 Set ``PANTHER_EM_DISABLE_FUSED_KERNEL=1`` to force the pure-torch fallback path even
-when a CUDA device an toolchain are available and fused kernel requested. Set the
+when a CUDA device and toolchain are available and fused kernel requested. Set the
 environment variable ``PANTHER_EM_FUSED_KERNEL_VERBOSE=1`` to see the
 ``torch.utils.cpp_extension.load`` build log.
 """
@@ -19,9 +19,12 @@ import functools
 import glob
 import os
 import warnings
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import torch
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 from panther_em.inference.search.statistics import decode_argmax_packed
 
@@ -36,7 +39,7 @@ _warned_runtime_failure = False
 # --------------------------------------------------------------------------- #
 # Locating headers
 # --------------------------------------------------------------------------- #
-def _first_existing(*paths: str) -> str | None:
+def _first_existing(paths: Iterable[str]) -> str | None:
     for p in paths:
         if p and os.path.isdir(p):
             return p
@@ -97,8 +100,10 @@ def _find_cufftdx_includes() -> list[str]:
         if os.path.isfile(os.path.join(c, "cufftdx.hpp")):
             includes.append(c)
             cutlass = _first_existing(
-                os.path.join(os.path.dirname(c), "external", "cutlass", "include"),
-                os.path.join(conda, "include"),
+                [
+                    os.path.join(os.path.dirname(c), "external", "cutlass", "include"),
+                    os.path.join(conda, "include"),
+                ]
             )
             if cutlass and cutlass != c:
                 includes.append(cutlass)
@@ -106,7 +111,9 @@ def _find_cufftdx_includes() -> list[str]:
 
     raise RuntimeError(
         "Could not locate cuFFTDx headers (cufftdx.hpp). Set CUFFTDX_INCLUDE_DIR, "
-        "or `pip install panther-em[fused-kernels]`."
+        "or `pip install panther-em[fused-kernels]`. Alternatively, set "
+        "PANTHER_EM_DISABLE_FUSED_KERNEL=1 to skip the fused kernel and always use "
+        "the pure-torch fallback path."
     )
 
 
@@ -123,7 +130,7 @@ def _arch_flags() -> tuple[list[str], list[str]]:
 
 @functools.lru_cache(maxsize=1)
 def _try_compile() -> Any:
-    """Attempt to JIT-compile the fused extension with a LUR cache for repeated calls.
+    """Attempt to JIT-compile the fused extension with an LRU cache for repeated calls.
 
     Returns
     -------
@@ -192,6 +199,83 @@ def get_supported_configs() -> list[tuple[int, int, int, int]] | None:
     return list(module.get_supported_configs()) if module is not None else None
 
 
+def _dispatch_fused_kernel(
+    kernel_name: str,
+    c: torch.Tensor,
+    n_psi: int,
+    n_freq: int,
+    decode: bool,
+    label: str,
+    make_contiguous: bool,
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | None
+):
+    """Shared compile/config-check/dispatch/decode logic for the fused kernel.
+
+    Used by both :func:`fused_irfft_stats` and :func:`fused_irfft_stats_transposed`.
+
+    Parameters
+    ----------
+    kernel_name : str
+        Name of the compiled extension's function to call (``"fused_irfft_stats"`` or
+        ``"fused_irfft_stats_transposed"``).
+    c : torch.Tensor
+        complex64, CUDA spectrum tensor, in whichever layout ``kernel_name`` expects.
+    n_psi : int
+        Full in-plane-angle length.
+    n_freq : int
+        ``c``'s frequency-axis extent, for the ``(n_psi, n_freq)`` supported-config
+        check.
+    decode : bool
+        See :func:`fused_irfft_stats`'s ``decode`` parameter.
+    label : str
+        Suffix appended to the runtime-failure warning message (e.g. ``" (transposed)"``
+        or ``""``), to distinguish which entry point raised.
+    make_contiguous : bool
+        Whether to call ``c.contiguous()`` before dispatch (the non-transposed kernel
+        requires it; the transposed kernel expects ``c`` already contiguous in its
+        native ``(NumFreq, P, Q)`` layout and skips the copy).
+    """
+    global _warned_runtime_failure
+
+    module = _try_compile()
+    if module is None:
+        return None
+
+    configs = {(cfg[0], cfg[1]) for cfg in module.get_supported_configs()}
+    if (int(n_psi), int(n_freq)) not in configs:
+        return None
+
+    kernel_input = c.contiguous() if make_contiguous else c
+    try:
+        s1, s2, argmax_packed = getattr(module, kernel_name)(kernel_input, int(n_psi))
+    except Exception as exc:
+        if not _warned_runtime_failure:
+            warnings.warn(
+                f"Fused iRFFT+stats{label} CUDA kernel raised at runtime, falling "
+                f"back to the pure-torch path for this call: {exc}",
+                UserWarning,
+                stacklevel=3,
+            )
+            _warned_runtime_failure = True
+        return None
+
+    if not decode:
+        return s1, s2, argmax_packed
+    vmax, amax = decode_argmax_packed(argmax_packed)
+    return s1, s2, vmax, amax
+
+
+@overload
+def fused_irfft_stats(
+    c: torch.Tensor, n_psi: int, decode: Literal[True] = True
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None: ...
+@overload
+def fused_irfft_stats(
+    c: torch.Tensor, n_psi: int, decode: Literal[False]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None: ...
 def fused_irfft_stats(
     c: torch.Tensor, n_psi: int, decode: bool = True
 ) -> (
@@ -230,36 +314,25 @@ def fused_irfft_stats(
         ``(P,)``. If an exception was raised internally, then None is returned and a
         warning is issued, and finally the torch fallback path is used instead.
     """
-    global _warned_runtime_failure
-
-    module = _try_compile()
-    if module is None:
-        return None
-
-    n_freq = c.shape[-1]
-    configs = {(cfg[0], cfg[1]) for cfg in module.get_supported_configs()}
-    if (int(n_psi), int(n_freq)) not in configs:
-        return None
-
-    try:
-        s1, s2, argmax_packed = module.fused_irfft_stats(c.contiguous(), int(n_psi))
-    except Exception as exc:
-        if not _warned_runtime_failure:
-            warnings.warn(
-                "Fused iRFFT+stats CUDA kernel raised at runtime, falling back "
-                f"to the pure-torch path for this call: {exc}",
-                UserWarning,
-                stacklevel=2,
-            )
-            _warned_runtime_failure = True
-        return None
-
-    if not decode:
-        return s1, s2, argmax_packed
-    vmax, amax = decode_argmax_packed(argmax_packed)
-    return s1, s2, vmax, amax
+    return _dispatch_fused_kernel(
+        "fused_irfft_stats",
+        c,
+        n_psi,
+        n_freq=c.shape[-1],
+        decode=decode,
+        label="",
+        make_contiguous=True,
+    )
 
 
+@overload
+def fused_irfft_stats_transposed(
+    c: torch.Tensor, n_psi: int, decode: Literal[True] = True
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None: ...
+@overload
+def fused_irfft_stats_transposed(
+    c: torch.Tensor, n_psi: int, decode: Literal[False]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None: ...
 def fused_irfft_stats_transposed(
     c: torch.Tensor, n_psi: int, decode: bool = True
 ) -> (
@@ -294,31 +367,12 @@ def fused_irfft_stats_transposed(
         runtime error), in which case callers should fall back to
         :func:`fused_irfft_stats` or the pure-torch path.
     """
-    global _warned_runtime_failure
-
-    module = _try_compile()
-    if module is None:
-        return None
-
-    n_freq = c.shape[0]
-    configs = {(cfg[0], cfg[1]) for cfg in module.get_supported_configs()}
-    if (int(n_psi), int(n_freq)) not in configs:
-        return None
-
-    try:
-        s1, s2, argmax_packed = module.fused_irfft_stats_transposed(c, int(n_psi))
-    except Exception as exc:
-        if not _warned_runtime_failure:
-            warnings.warn(
-                "Fused iRFFT+stats (transposed) CUDA kernel raised at runtime, "
-                f"falling back to the pure-torch path for this call: {exc}",
-                UserWarning,
-                stacklevel=2,
-            )
-            _warned_runtime_failure = True
-        return None
-
-    if not decode:
-        return s1, s2, argmax_packed
-    vmax, amax = decode_argmax_packed(argmax_packed)
-    return s1, s2, vmax, amax
+    return _dispatch_fused_kernel(
+        "fused_irfft_stats_transposed",
+        c,
+        n_psi,
+        n_freq=c.shape[0],
+        decode=decode,
+        label=" (transposed)",
+        make_contiguous=False,
+    )

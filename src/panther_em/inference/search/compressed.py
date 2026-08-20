@@ -275,6 +275,14 @@ def _run_stage(
             ),
         )
     )
+    # Each entry is (hyp_b, prepared_weights, hyp_offset):
+    #   hyp_b : torch.Tensor -- this batch's global hypothesis indices, shape (b,).
+    #   prepared_weights : list[torch.Tensor] -- this batch's pre-gathered,
+    #       pre-conjugated weight blocks, one per tiling region (see
+    #       FeatureTiling.prepare_weights), passed straight through to
+    #       FeatureTiling.run's `prepared_weights` argument.
+    #   hyp_offset : int | None -- `hyp_b`'s starting global index when `hyp_b` is a
+    #       contiguous arange (`is_contiguous_hyps`), else None.
     hyp_batches = [
         (
             hypothesis_indexes[h0 : h0 + hyp_batch],
@@ -322,6 +330,8 @@ def _run_stage(
             else:
                 pixel_stats.clear()
 
+            # In practice the hypothesis loop below runs at roughly 10k pixels/second,
+            # so this bar completes before tqdm's first render.
             hyp_bar = tqdm(
                 total=n_hypotheses,
                 desc="hypotheses",
