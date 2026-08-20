@@ -512,48 +512,6 @@ class PixelStats:
         return None
 
     @torch.no_grad()
-    def update_fused(
-        self,
-        s1: torch.Tensor,
-        s2: torch.Tensor,
-        vmax: torch.Tensor,
-        amax: torch.Tensor,
-        hyp_global_idx: torch.Tensor,
-        num_psi: int,
-        reverse_psi_axis: bool = True,
-    ) -> None:
-        """Accumulate pre-reduced ``(s1, s2, vmax, amax)`` directly (thin wrapper).
-
-        Parameters
-        ----------
-        s1, s2 : torch.Tensor
-            First and second moment sums, shape (num_pixels,). Already multiplied
-            by num_psi (i.e. the output of the fused kernel, not raw Parseval sums).
-        vmax : torch.Tensor
-            Maximum correlation value per pixel, shape (num_pixels,).
-        amax : torch.Tensor
-            Flattened index of maximum (into the (hyp_batch, num_psi) grid), shape
-            (num_pixels,).
-        hyp_global_idx : torch.Tensor
-            Global hypothesis indices for this batch, shape (hyp_batch,).
-        num_psi : int
-            Number of in-plane angles (for decoding amax).
-        reverse_psi_axis : bool, optional
-            Whether to reverse the psi axis when updating the best psi angle.
-        """
-        total_hypotheses = hyp_global_idx.numel() * num_psi
-        self._accumulate(
-            s1,
-            s2,
-            vmax,
-            amax,
-            hyp_global_idx,
-            num_psi,
-            total_hypotheses,
-            reverse_psi_axis,
-        )
-
-    @torch.no_grad()
     def begin_hypothesis_batches(self, n_batches: int) -> None:
         """Preallocate staging buffers for the batch-then-reduce accumulation path."""
         device = self.corr_sum.device
