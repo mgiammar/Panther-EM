@@ -136,7 +136,7 @@ addopts = ["--color=yes"]
 testpaths = ["tests"]
 filterwarnings = [
     "error",
-    "ignore:.*torch.jit.script_method. is deprecated.*:DeprecationWarning",
+    "ignore:.*torch\\.jit\\.script_method.*:DeprecationWarning",
 ]
 
 # https://mypy.readthedocs.io/en/stable/config_file.html
