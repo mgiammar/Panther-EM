@@ -27,6 +27,8 @@ jobs:
     runs-on: ${{ matrix.platform }}
     env:
       UV_PRERELEASE: ${{ github.event_name == 'schedule' && 'allow' || 'if-necessary-or-explicit' }}
+      # Suppress torch.compile errors if no compilation toolchain available
+      TORCHDYNAMO_SUPPRESS_ERRORS: "1"
     strategy:
       fail-fast: false
       matrix:

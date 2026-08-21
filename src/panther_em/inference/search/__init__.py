@@ -96,7 +96,9 @@ the algorithm as:
 from __future__ import annotations
 
 from panther_em.inference.search.compressed import compressed_search
+from panther_em.inference.search.fused_statistics import FusedPixelStats
 from panther_em.inference.search.incremental import incremental_search
+from panther_em.inference.search.staging import PixelStager
 from panther_em.inference.search.statistics import PixelStats
 from panther_em.inference.search.tiling import (
     FeatureTiling,
@@ -117,6 +119,8 @@ from panther_em.inference.search.utils import (
 __all__ = [
     "FeatureTiling",
     "FeaturizedImageStore",
+    "FusedPixelStats",
+    "PixelStager",
     "PixelStats",
     "Rectangle",
     "RectangularFeatureRegion",

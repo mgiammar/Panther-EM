@@ -123,13 +123,30 @@ class RectangularFeatureRegion:
 
         return block.reshape(*block.shape[:-1], self.num_k, self.num_m)
 
+    def gather_conjugated_weights(self, W_flat: torch.Tensor) -> torch.Tensor:
+        """Pre-gather and conjugate this region's ``W`` block.
+
+        Parameters
+        ----------
+        W_flat : torch.Tensor
+            Complex contraction weights ``(N, r)`` in this region's feature layout.
+
+        Returns
+        -------
+        torch.Tensor
+            Pre-conjugated ``(N, num_k, num_m)`` block, ready to pass as
+            ``prepared_w`` to :meth:`accumulate_into`.
+        """
+        return self.gather(W_flat).conj()
+
     @torch.no_grad()
     def accumulate_into(
         self,
         Y_flat: torch.Tensor,
-        W_flat: torch.Tensor,
+        W_flat: torch.Tensor | None,
         out: torch.Tensor,
         conjugate: bool = True,
+        prepared_w: torch.Tensor | None = None,
     ) -> torch.Tensor:
         r"""Accumulate ``C[:, :, k] += sum_m Y[:, k, m] * conj(W[:, k, m])``.
 
@@ -137,14 +154,19 @@ class RectangularFeatureRegion:
         ----------
         Y_flat : torch.Tensor
             Complex featurized image ``(P, r)``; ``P`` pixels, ``r`` the feature axis.
-        W_flat : torch.Tensor
-            Complex contraction weights ``(N, r)`` in the same feature layout.
+        W_flat : torch.Tensor or None
+            Complex contraction weights ``(N, r)`` in the same feature layout. May be
+            ``None`` when ``prepared_w`` is supplied instead.
         out : torch.Tensor
             Complex output spectrum ``(P, N, n_freq)`` accumulated into in place; the
             region writes the contiguous slice ``[..., k_start:k_stop]``.
         conjugate : bool, optional
             Apply the matched-filter conjugation on ``W`` (``W = U * S`` is stored
-            un-conjugated). Defaults to ``True``.
+            un-conjugated). Ignored when ``prepared_w`` is supplied (it is already
+            conjugated). Defaults to ``True``.
+        prepared_w : torch.Tensor, optional
+            Pre-gathered, pre-conjugated weights from :meth:`gather_conjugated_weights`
+            / :meth:`FeatureTiling.prepare_weights`, reused across many calls.
 
         Returns
         -------
@@ -152,7 +174,11 @@ class RectangularFeatureRegion:
             The same ``out`` tensor, accumulated in place (returned for chaining).
         """
         y = self.gather(Y_flat)
-        w = self.gather(W_flat)
+        if prepared_w is not None:
+            w, conjugate = prepared_w, False
+        else:
+            assert W_flat is not None
+            w = self.gather(W_flat)
         out[:, :, self.k_start : self.k_stop] += _contract_region(y, w, conjugate)
 
         return out
@@ -201,6 +227,9 @@ class FeatureTiling:
         layout. The returned ``src`` and ``dst`` are long tensors of positions in
         ``other`` and *this* tiling's feature dimension, respectively. Used for copying
         already computed features into a new tiling layout.
+    prepare_weights(W_flat) : list[torch.Tensor]
+        Pre-gather and conjugate every region's ``W`` block once, for reuse across many
+        :meth:`run` calls that share the same hypothesis batch.
     """
 
     regions: list[RectangularFeatureRegion]
@@ -368,13 +397,30 @@ class FeatureTiling:
 
     # -- contraction -------------------------------------------------------
 
+    def prepare_weights(self, W_flat: torch.Tensor) -> list[torch.Tensor]:
+        """Pre-gather and conjugate every region's ``W`` block once.
+
+        Parameters
+        ----------
+        W_flat : torch.Tensor
+            Contraction weights ``(N, r)`` in this tiling's feature layout.
+
+        Returns
+        -------
+        list[torch.Tensor]
+            One pre-conjugated ``(N, num_k, num_m)`` block per region, in
+            :attr:`regions` order.
+        """
+        return [region.gather_conjugated_weights(W_flat) for region in self.regions]
+
     @torch.no_grad()
     def run(
         self,
         Y_flat: torch.Tensor,
-        W_flat: torch.Tensor,
+        W_flat: torch.Tensor | None,
         n_freq: int,
         out: torch.Tensor | None = None,
+        prepared_weights: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         r"""Accumulate every region into the dense spectrum ``C[P, N, n_freq]``.
 
@@ -382,8 +428,9 @@ class FeatureTiling:
         ----------
         Y_flat : torch.Tensor
             Featurized image ``(P, r)`` in this tiling's feature layout.
-        W_flat : torch.Tensor
-            Contraction weights ``(N, r)`` in the same feature layout.
+        W_flat : torch.Tensor or None
+            Contraction weights ``(N, r)`` in the same feature layout. May be ``None``
+            when ``prepared_weights`` is supplied instead.
         n_freq : int
             Size of the output angular-frequency axis. Should be ``self.k_stop`` (the
             spectrum carries no content above it, downstream ``irfft`` zero-pads  rest),
@@ -392,6 +439,10 @@ class FeatureTiling:
         out : torch.Tensor, optional
             Pre-allocated ``(P, N, n_freq)`` complex accumulator. A fresh zero tensor
             is allocated when omitted.
+        prepared_weights : list[torch.Tensor], optional
+            Output of :meth:`prepare_weights`, reused across many calls that share the
+            same hypothesis batch instead of re-gathering/re-conjugating ``W_flat``
+            here. Takes precedence over ``W_flat`` when supplied.
 
         Returns
         -------
@@ -411,25 +462,35 @@ class FeatureTiling:
             # Fast path which skips zero-fill and accumulation. Does direct assignment.
             if single_full:
                 y = region0.gather(Y_flat)
-                w = region0.gather(W_flat)
+                if prepared_weights is not None:
+                    w = prepared_weights[0]
+                    conjugate = False
+                else:
+                    assert W_flat is not None
+                    w = region0.gather(W_flat)
+                    conjugate = True
 
-                if out is None:
-                    return _contract_region(y, w, conjugate=True)
-
-                # Do direct assignment if pre-allocated (assume caller zeroed)
-                out[:, :, region0.k_start : region0.k_stop] = _contract_region(
-                    y, w, conjugate=True
-                )
-                return out
+                return _contract_region(y, w, conjugate)
 
             out = torch.zeros(
-                (Y_flat.shape[0], W_flat.shape[0], int(n_freq)),
+                (
+                    Y_flat.shape[0],
+                    (
+                        prepared_weights[0].shape[0]
+                        if prepared_weights is not None
+                        else W_flat.shape[0]  # type: ignore[union-attr]
+                    ),
+                    int(n_freq),
+                ),
                 dtype=Y_flat.dtype,
                 device=Y_flat.device,
             )
 
-        for region in self.regions:
-            region.accumulate_into(Y_flat, W_flat, out, conjugate=True)
+        for i, region in enumerate(self.regions):
+            prepared_w = prepared_weights[i] if prepared_weights is not None else None
+            region.accumulate_into(
+                Y_flat, W_flat, out, conjugate=True, prepared_w=prepared_w
+            )
 
         return out
 
@@ -566,6 +627,18 @@ class FeaturizedImageStore:
                 "FeaturizedImageStore holds a compacted feature axis; build the "
                 "tiling with FeatureTiling.from_extents, not on_full_grid."
             )
+
+        # Fast path: already laid out exactly as `tiling` wants
+        if (
+            self.tiling is not None
+            and self.Y is not None
+            and new_features.numel() == 0
+            and self.tiling.num_features == tiling.num_features
+            and torch.equal(self.tiling.k_indices, tiling.k_indices)
+            and torch.equal(self.tiling.m_indices, tiling.m_indices)
+        ):
+            self.tiling = tiling
+            return
 
         Y = torch.empty(
             (self.num_pixels, tiling.num_features),

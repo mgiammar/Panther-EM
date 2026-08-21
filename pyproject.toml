@@ -59,6 +59,7 @@ dependencies = [
 [project.optional-dependencies]
 cuda13 = ["cupy-cuda13x", "cucim-cu13"]
 cuda12 = ["cupy-cuda12x", "cucim-cu12"]
+fused-kernels = ["nvidia-mathdx", "ninja"]
 
 [project.urls]
 homepage = "https://github.com/mgiammar/panther-em"
@@ -133,7 +134,10 @@ skip-magic-trailing-comma = false # default is false
 minversion = "7.0"
 addopts = ["--color=yes"]
 testpaths = ["tests"]
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    "ignore:.*torch\\.jit\\.script_method.*:DeprecationWarning",
+]
 
 # https://mypy.readthedocs.io/en/stable/config_file.html
 [tool.mypy]
@@ -182,4 +186,6 @@ ignore = [
 [tool.typos.default]
 extend-ignore-identifiers-re = []
 
-
+[tool.typos.type.cu]
+extend-glob = ["*.cu", "*.cuh"]
+extend-ignore-words-re = ["(?i)^optin$"]
