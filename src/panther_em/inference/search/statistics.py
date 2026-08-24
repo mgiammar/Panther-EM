@@ -349,6 +349,8 @@ class PixelStats:
             reverse_psi_axis,
         )
 
+        return None
+
     @torch.compile
     def _accumulate(
         self,
@@ -400,6 +402,8 @@ class PixelStats:
         self.best_corr = torch.where(improved, vmax_cast, self.best_corr)
         self.best_hypothesis = torch.where(improved, global_hyp, self.best_hypothesis)
         self.best_psi_angle = torch.where(improved, psi, self.best_psi_angle)
+
+        return None
 
     def _build_graphed_accumulate(self, num_psi: int, reverse_psi_axis: bool) -> None:
         """One-time capture of a tiny CUDA graph for the streaming accumulate step.
@@ -696,17 +700,11 @@ class PixelStats:
 
 
 # ---------------------------------------------------------------------------
-# Error-aware partitioning (multi-precision follow-up) -- NOT YET IMPLEMENTED
+# Error-aware partitioning (multi-precision follow-up)
 # ---------------------------------------------------------------------------
 #
-# Between incremental stages the reconstructed correlations are partitioned,
-# using the reconstruction-accuracy bounds implied by the retained singular
-# values, into three sets:
-#
-#   * accepted   -- score far above expectation; record and stop refining.
-#   * rejected   -- score far below expectation; record and stop refining.
-#   * follow-up  -- ambiguous; carry forward to the next (higher-rank) stage.
-#
-# The follow-up set becomes the pixel mask (and joint hypothesis mask) handed to the
-# next stage. This is the home for that logic; it is intentionally unimplemented for
-# now.
+# Between incremental stages the reconstructed correlations are partitioned, using
+# the reconstruction-accuracy bounds implied by the retained singular values, into
+# accepted / rejected / follow-up sets. This is implemented as a pluggable
+# `follow_up_fn` rather than as part of `PixelStats` -- see
+# panther_em.inference.search.tracking.MultiPrecisionPixelTracker.

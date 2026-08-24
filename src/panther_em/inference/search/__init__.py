@@ -8,12 +8,15 @@ This package splits the SVD-2DTM search into composable pieces:
 * :mod:`~panther_em.inference.search.utils` -- reconstructor-facing helpers that
   build Cartesian kernels, featurize an image, and build contraction weights.
 * :mod:`~panther_em.inference.search.statistics` -- online per-pixel statistics
-  (:class:`PixelStats`) and the error-aware partitioning process for incremental search.
+  (:class:`PixelStats`).
 * :mod:`~panther_em.inference.search.compressed` -- a single-stage search
   (:func:`compressed_search`) for producing approximate 2DTM results.
 * :mod:`~panther_em.inference.search.incremental` -- the multi-stage,
   multi-precision driver (:func:`incremental_search`) to enable initial, low-precision,
   and low-cost searches followed by sparse, higher-precision searches.
+* :mod:`~panther_em.inference.search.tracking` -- the error-aware accept/reject/
+  follow-up pixel partitioning process (:class:`MultiPrecisionPixelTracker`) plugged
+  into :func:`incremental_search` via its ``follow_up_fn`` hook.
 
 
 Pre-processing Stage
@@ -95,7 +98,10 @@ the algorithm as:
 
 from __future__ import annotations
 
-from panther_em.inference.search.compressed import compressed_search
+from panther_em.inference.search.compressed import (
+    compressed_search,
+    search_output_shape,
+)
 from panther_em.inference.search.fused_statistics import FusedPixelStats
 from panther_em.inference.search.incremental import incremental_search
 from panther_em.inference.search.staging import PixelStager
@@ -105,6 +111,11 @@ from panther_em.inference.search.tiling import (
     FeaturizedImageStore,
     Rectangle,
     RectangularFeatureRegion,
+)
+from panther_em.inference.search.tracking import (
+    MultiPrecisionPixelTracker,
+    PixelLabel,
+    classify_zscore_interval,
 )
 from panther_em.inference.search.utils import (
     build_block_feature_stack,
@@ -120,6 +131,8 @@ __all__ = [
     "FeatureTiling",
     "FeaturizedImageStore",
     "FusedPixelStats",
+    "MultiPrecisionPixelTracker",
+    "PixelLabel",
     "PixelStager",
     "PixelStats",
     "Rectangle",
@@ -129,8 +142,10 @@ __all__ = [
     "build_block_weights",
     "build_layout_weights",
     "build_multichannel_correlogram",
+    "classify_zscore_interval",
     "compressed_search",
     "featurize_cells",
     "incremental_search",
     "psi_degrees",
+    "search_output_shape",
 ]

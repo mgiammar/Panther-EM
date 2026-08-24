@@ -20,6 +20,47 @@ if TYPE_CHECKING:
     from panther_em.inference.projection_reconstruction import ProjectionReconstructor
 
 
+def compute_zscore_error_intervals(
+    error: float,
+    corr: torch.Tensor,  # (P,)
+    mu: torch.Tensor,  # (P,)
+    sigma: torch.Tensor,  # (P,)
+) -> torch.Tensor:  # (P, 2)
+    r"""Compute worst-case intervals for z-scores for a fixed reconstruction error.
+
+    Parameters
+    ----------
+    error : float
+        Estimated reconstruction error.
+    corr : torch.Tensor
+        Per-pixel correlation values, shape ``(P,)``, estimated from low-rank SVD.
+    mu : torch.Tensor
+        Per-pixel mean values, shape ``(P,)``, estimated from low-rank SVD.
+    sigma : torch.Tensor
+        Per-pixel standard deviation values, shape ``(P,)``, estimated from low-rank
+        SVD.
+
+    Returns
+    -------
+    torch.Tensor
+        Per-pixel error intervals, shape ``(P, 2)``, where the second axis is
+        ``[lower_bound, upper_bound]``. If error is correct, then interval guaranteed to
+        contain the true z-score for each pixel.
+    """
+    sigma_min = sigma - error
+    sigma_max = torch.sqrt(sigma**2 + 2 * error**2) + error
+    sigma_min = torch.clamp(sigma_min, min=1e-6)
+    sigma_max = torch.clamp(sigma_max, min=1e-6)
+
+    a_max = 2 * error / sigma_min
+    b_max = error * (2 * sigma_max + error) / (sigma * (sigma_min + sigma))
+
+    zscore = (corr - mu) / sigma
+    delta_z = (a_max + b_max * torch.abs(zscore)) / (1 - b_max)
+
+    return torch.stack([zscore - delta_z, zscore + delta_z], dim=-1)
+
+
 @torch.no_grad()
 def incremental_search(
     image: torch.Tensor,
@@ -44,14 +85,14 @@ def incremental_search(
 ) -> Iterator[dict[str, torch.Tensor]]:
     r"""Incremental SVD-2DTM search; yields per-pixel statistics per stage.
 
-    TODO: Integrate the error-aware decision process into the follow up function for
-          both pixel and hypothesis selection. Error-aware decision process not yet
-          implemented (see :mod:`panther_em.inference.search.statistics`).
-
     Implements the multi-precision strategy: each stage selects a (typically higher-
     rank) set of contiguous feature-space rectangles and runs one compressed search
     (:func:`_run_stage`), reusing the image features computed in earlier stages. Between
     stages an external caller narrows the pixel set through ``follow_up_fn``.
+
+    See :class:`panther_em.inference.search.tracking.MultiPrecisionPixelTracker` for a
+    ready-made error-aware ``follow_up_fn`` implementing pixel accept/reject/absorb
+    partitioning across stages, built on :func:`compute_zscore_error_intervals` above.
 
     Parameters
     ----------
@@ -132,6 +173,8 @@ def incremental_search(
 
     px = pixel_index
     for rects in stage_rectangles:  # stages -- increasing rank
+        if px.numel() == 0:
+            return
         tiling = FeatureTiling.from_extents(rects, device=compute_device)
         stage_maps = _run_stage(
             image,

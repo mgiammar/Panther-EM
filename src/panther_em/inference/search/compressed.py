@@ -30,10 +30,24 @@ if TYPE_CHECKING:
     from panther_em.inference.projection_reconstruction import ProjectionReconstructor
 
 
-def _search_output_shape(
+def search_output_shape(
     image: torch.Tensor, reconstructor: ProjectionReconstructor
 ) -> tuple[int, int, int]:
-    """``(B, out_h, out_w)`` valid cross-corr grid for a ``(..., H, W)`` image."""
+    """Valid cross-correlation output grid shape for a ``(..., H, W)`` image.
+
+    Parameters
+    ----------
+    image : torch.Tensor
+        Real image of shape ``(H, W)`` or a batch ``(..., H, W)``.
+    reconstructor : ProjectionReconstructor
+        Holds the template/kernel box size via ``reconstructor.image_shape``.
+
+    Returns
+    -------
+    tuple[int, int, int]
+        ``(B, out_h, out_w)`` where ``B`` is the flattened leading batch size and
+        ``out_h = H - k_h + 1``, ``out_w = W - k_w + 1`` for kernel size ``(k_h, k_w)``.
+    """
     leading_dims = image.shape[:-2] if image.dim() > 2 else None
 
     k_h, k_w = reconstructor.image_shape
@@ -136,7 +150,7 @@ def resolve_search_args(
     result = reconstructor.result
     device = reconstructor.device
 
-    b, out_h, out_w = _search_output_shape(image, reconstructor)
+    b, out_h, out_w = search_output_shape(image, reconstructor)
     n_px = b * out_h * out_w
 
     if hypothesis_indexes is None:
@@ -494,7 +508,7 @@ def compressed_search(
     batch = math.prod(leading) if leading else 1
     image_bhw = image.reshape(batch, h, w)
 
-    _, out_h, out_w = _search_output_shape(image_bhw, reconstructor)
+    _, out_h, out_w = search_output_shape(image_bhw, reconstructor)
     n_px_per_image = out_h * out_w
     n_px = batch * n_px_per_image
 
