@@ -20,6 +20,32 @@ from panther_em.coordinates.transform_base import (
 )
 
 
+def _read_paired_last_two_axes(
+    source: np.ndarray | h5py.Dataset,
+    idx0: np.ndarray,
+    idx1: np.ndarray,
+) -> np.ndarray:
+    """Read ``source[..., idx0, idx1]``, pairing ``idx0``/``idx1`` elementwise."""
+    if isinstance(source, h5py.Dataset):
+        return np.stack(
+            [source[..., int(i0), int(i1)] for i0, i1 in zip(idx0, idx1, strict=False)],
+            axis=-1,
+        )
+    return source[..., idx0, idx1]
+
+
+def _read_fancy_last_axis(
+    source: np.ndarray | h5py.Dataset, idx: np.ndarray
+) -> np.ndarray:
+    """Read ``source[..., idx]`` for an arbitrary (unsorted/duplicated) ``idx``."""
+    if isinstance(source, h5py.Dataset):
+        idx = np.asarray(idx)
+        unique_idx, inverse = np.unique(idx, return_inverse=True)
+        data = source[..., unique_idx]
+        return data[..., inverse]
+    return source[..., idx]
+
+
 @dataclass
 class DecompositionResult:
     """Stores the full results of a polar projection decomposition.
@@ -52,13 +78,19 @@ class DecompositionResult:
     `(fourier_filter, orientation)` samples simultaneously.
 
     Results are saved and loaded as HDF5 files (``.h5`` / ``.hdf5``) via
-    :meth:`save` and :meth:`load`.
+    :meth:`save` and :meth:`load`. For results whose ``U`` array is too large to
+    fit in memory (e.g. >100GB), pass ``mmap=True`` to :meth:`load` to keep the
+    HDF5 file open on disk and read ``U`` lazily on demand; call :meth:`close`
+    (or use the result as a context manager) to release the file handle when
+    done.
 
     Attributes
     ----------
-    U : np.ndarray
-        Left singular vectors with shape (num_volumes, num_fourier_filters,
-        num_orientations, num_freq_blocks, num_radial_components).
+    U : np.ndarray | h5py.Dataset
+        Left singular vectors with shape
+        (num_volumes, num_filters, num_orient, num_freq_blocks, num_radial_components).
+        A disk-backed ``h5py.Dataset`` rather than an in-memory array when the
+        result was loaded with ``mmap=True``.
     S : np.ndarray
         Singular values with shape (num_freq_blocks, num_radial_components).
     Vh : np.ndarray
@@ -98,7 +130,7 @@ class DecompositionResult:
     """
 
     # Core SVD components
-    U: np.ndarray
+    U: np.ndarray | h5py.Dataset
     S: np.ndarray
     Vh: np.ndarray
 
@@ -199,6 +231,27 @@ class DecompositionResult:
 
         # Per-instance cache for top-n queries
         self._top_n_cache: dict[tuple[int, bool], np.ndarray] = {}
+
+        # Open HDF5 file handle backing lazily-loaded arrays (set by load(mmap=True)).
+        if not hasattr(self, "_h5_file"):
+            self._h5_file: h5py.File | None = None
+
+    def close(self) -> None:
+        """Close the HDF5 file handle opened by ``load(..., mmap=True)``.
+
+        No-op if this result was not loaded with ``mmap=True``, or the file handle has
+        already been closed. Any arrays not yet read from disk (e.g. ``U``) become
+        unusable after this call.
+        """
+        if self._h5_file is not None:
+            self._h5_file.close()
+            self._h5_file = None
+
+    def __enter__(self) -> "DecompositionResult":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
     def __repr__(self) -> str:
         """String representation of the DecompositionResult."""
@@ -363,7 +416,7 @@ class DecompositionResult:
         k_stored_arr = pairs[:, 0].astype(int)
         eig_idx_arr = pairs[:, 1].astype(int)
 
-        U_data = self.U[..., k_stored_arr, eig_idx_arr]
+        U_data = _read_paired_last_two_axes(self.U, k_stored_arr, eig_idx_arr)
         S_data = self.S[k_stored_arr, eig_idx_arr]
         Vh_data = self.Vh[k_stored_arr, eig_idx_arr, :]
         selected_indices = np.stack([k_stored_arr, eig_idx_arr], axis=1)
@@ -390,13 +443,19 @@ class DecompositionResult:
         )
 
     @classmethod
-    def load(cls, path: str | Path) -> "DecompositionResult":
+    def load(cls, path: str | Path, mmap: bool = False) -> "DecompositionResult":
         """Load a decomposition result from an HDF5 file written by :meth:`save`.
 
         Parameters
         ----------
         path : str | Path
             Path to the ``.h5`` or ``.hdf5`` file.
+        mmap : bool, optional
+            If True, keep the HDF5 file open on disk and read ``U`` lazily on demand.
+            ``S``, ``Vh``, and other metadata/arrays are always loaded eagerly since
+            they are typically tiny compared to ``U``. Useful when ``U`` is larger than
+            available RAM. Call :meth:`close` (or use the result as a context manager)
+            to release the file handle when done. Default is False.
 
         Returns
         -------
@@ -421,12 +480,23 @@ class DecompositionResult:
                     f"File '{path}' contains a sparse result. "
                     "Use SparseDecompositionResult.load() instead."
                 )
-        return cls._load_hdf5(path)
+        return cls._load_hdf5(path, mmap=mmap)
 
     @classmethod
-    def _load_hdf5(cls, path: Path) -> "DecompositionResult":
-        """Load from an HDF5 file produced by :meth:`save`."""
-        with h5py.File(path, "r") as f:
+    def _load_hdf5(cls, path: Path, mmap: bool = False) -> "DecompositionResult":
+        """Load from an HDF5 file produced by :meth:`save`.
+
+        Parameters
+        ----------
+        path : Path
+            Path to the HDF5 file.
+        mmap : bool, optional
+            If True, ``U`` is left as a disk-backed ``h5py.Dataset`` and the
+            underlying file handle is kept open on the returned instance
+            (``result._h5_file``) rather than closed. Default is False.
+        """
+        f = h5py.File(path, "r")
+        try:
             k_max = int(f.attrs["k_max"])
             eig_max = int(f.attrs["eig_max"])
             is_complex = bool(f.attrs["is_complex_projection"])
@@ -491,7 +561,7 @@ class DecompositionResult:
             else:
                 coordinate_transform = reconstruct_transform(transform_params)
 
-            U = f["U"][()]
+            U: np.ndarray | h5py.Dataset = f["U"] if mmap else f["U"][()]
             S = f["S"][()]
             Vh = f["Vh"][()]
 
@@ -500,7 +570,7 @@ class DecompositionResult:
             if U.ndim == 4:
                 U = U[np.newaxis, ...]
 
-            return cls(
+            result = cls(
                 U=U,
                 S=S,
                 Vh=Vh,
@@ -519,6 +589,15 @@ class DecompositionResult:
                 volume_labels=volume_labels,
                 coordinate_transform=coordinate_transform,
             )
+        except Exception:
+            f.close()
+            raise
+
+        if mmap:
+            result._h5_file = f
+        else:
+            f.close()
+        return result
 
     # ------------------------------------------------------------------
     # Index helpers
@@ -647,7 +726,7 @@ class DecompositionResult:
         vh = None
 
         if return_u:
-            u = self.U[..., k_stored, eig_idx]
+            u = _read_paired_last_two_axes(self.U, k_stored, eig_idx)
             if conj_mask.any():
                 u = u.copy()
                 u[..., conj_mask] = u[..., conj_mask].conj()
@@ -682,7 +761,7 @@ class DecompositionResult:
         Returns
         -------
         U : torch.Tensor
-            Left singular vectors, shape ``(FF, O, L)``, complex64.
+            Left singular vectors, shape ``(V, FF, O, L)``, complex64.
         S : torch.Tensor
             Singular values, shape ``(L,)``, float32.
         Vh : torch.Tensor
@@ -804,7 +883,7 @@ class SparseDecompositionResult(DecompositionResult):
     """
 
     # Class-level annotations for private compact arrays (set by from_sparse_arrays).
-    _U_data: np.ndarray
+    _U_data: np.ndarray | h5py.Dataset
     _S_data: np.ndarray
     _Vh_data: np.ndarray
     _selected_indices: np.ndarray
@@ -869,6 +948,7 @@ class SparseDecompositionResult(DecompositionResult):
         theta_values: np.ndarray | None = None,
         fourier_filters: np.ndarray | None = None,
         volume_labels: np.ndarray | None = None,
+        _h5_file: h5py.File | None = None,
     ) -> "SparseDecompositionResult":
         """Construct from compact arrays.
 
@@ -911,6 +991,9 @@ class SparseDecompositionResult(DecompositionResult):
             Fourier-space filters applied during decomposition.
         volume_labels : np.ndarray | None, optional
             Per-volume labels/coordinates, shape ``(num_volumes,)``.
+        _h5_file : h5py.File | None, optional
+            Open HDF5 file handle backing ``U_data`` when it is a disk-backed
+            ``h5py.Dataset`` (set internally by ``load(..., mmap=True)``).
         """
         L = int(selected_indices.shape[0])
         if selected_indices.shape != (L, 2):
@@ -947,6 +1030,7 @@ class SparseDecompositionResult(DecompositionResult):
             (int(k), int(e)): i for i, (k, e) in enumerate(obj._selected_indices)
         }
         obj._top_n_cache = {}
+        obj._h5_file = _h5_file
         return obj
 
     # ------------------------------------------------------------------
@@ -1044,7 +1128,7 @@ class SparseDecompositionResult(DecompositionResult):
         )
 
         return SparseDecompositionResult.from_sparse_arrays(
-            U_data=self._U_data[..., compact_indices],
+            U_data=_read_fancy_last_axis(self._U_data, compact_indices),
             S_data=self._S_data[compact_indices],
             Vh_data=self._Vh_data[compact_indices],
             selected_indices=self._selected_indices[compact_indices],
@@ -1130,7 +1214,9 @@ class SparseDecompositionResult(DecompositionResult):
                 dtype=np.complex64,
             )
             if found.any():
-                u[..., found] = self._U_data[..., compact_indices[found]]
+                u[..., found] = _read_fancy_last_axis(
+                    self._U_data, compact_indices[found]
+                )
             if conj_mask.any():
                 u[..., conj_mask] = u[..., conj_mask].conj()
 
@@ -1225,13 +1311,16 @@ class SparseDecompositionResult(DecompositionResult):
             self._write_hdf5_transform_arrays(f)
 
     @classmethod
-    def load(cls, path: str | Path) -> "SparseDecompositionResult":
+    def load(cls, path: str | Path, mmap: bool = False) -> "SparseDecompositionResult":
         """Load a sparse result from an HDF5 file written by :meth:`save`.
 
         Parameters
         ----------
         path : str | Path
             Path to the ``.h5`` or ``.hdf5`` file.
+        mmap : bool, optional
+            If True, keep the HDF5 file open on disk to read ``U`` lazily. Other data
+            and metadata loaded eagerly. Default is False.
 
         Returns
         -------
@@ -1250,7 +1339,8 @@ class SparseDecompositionResult(DecompositionResult):
                 f"Unknown file extension '{path.suffix}'. Expected '.h5' or '.hdf5'."
             )
 
-        with h5py.File(path, "r") as f:
+        f = h5py.File(path, "r")
+        try:
             if not bool(f.attrs.get("is_sparse", False)):
                 raise ValueError(
                     f"File '{path}' contains a dense result. "
@@ -1319,35 +1409,43 @@ class SparseDecompositionResult(DecompositionResult):
                 coordinate_transform = reconstruct_transform(transform_params)
 
             selected_indices = f["selected_indices"][()]
-            U_data = f["U"][()]
+            U_data: np.ndarray | h5py.Dataset = f["U"] if mmap else f["U"][()]
             S_data = f["S"][()]
             Vh_data = f["Vh"][()]
 
-        # Legacy files (pre multi-volume support) stored U_data without the
-        # leading volume axis; insert it so num_volumes=1 is self-consistent.
-        if U_data.ndim == 3:
-            U_data = U_data[np.newaxis, ...]
+            # Legacy files (pre multi-volume support) stored U_data without the
+            # leading volume axis; insert it so num_volumes=1 is self-consistent.
+            if U_data.ndim == 3:
+                U_data = U_data[np.newaxis, ...]
 
-        return cls.from_sparse_arrays(
-            U_data=U_data,
-            S_data=S_data,
-            Vh_data=Vh_data,
-            selected_indices=selected_indices,
-            k_max=k_max,
-            eig_max=eig_max,
-            is_complex_projection=is_complex,
-            num_volumes=num_vol,
-            num_fourier_filters=num_ff,
-            num_orientations=num_or,
-            num_angular_components=num_ang,
-            num_radial_components=num_r,
-            coordinate_transform=coordinate_transform,
-            created_at=created_at,
-            phi_values=phi_values,
-            theta_values=theta_values,
-            fourier_filters=fourier_filters,
-            volume_labels=volume_labels,
-        )
+            result = cls.from_sparse_arrays(
+                U_data=U_data,
+                S_data=S_data,
+                Vh_data=Vh_data,
+                selected_indices=selected_indices,
+                k_max=k_max,
+                eig_max=eig_max,
+                is_complex_projection=is_complex,
+                num_fourier_filters=num_ff,
+                num_orientations=num_or,
+                num_angular_components=num_ang,
+                num_radial_components=num_r,
+                num_volumes=num_vol,
+                coordinate_transform=coordinate_transform,
+                created_at=created_at,
+                phi_values=phi_values,
+                theta_values=theta_values,
+                fourier_filters=fourier_filters,
+                volume_labels=volume_labels,
+                _h5_file=f if mmap else None,
+            )
+        except Exception as e:
+            f.close()
+            raise e
+
+        if not mmap:
+            f.close()
+        return result
 
     # ------------------------------------------------------------------
     # Display
