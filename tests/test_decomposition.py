@@ -2,7 +2,7 @@
 
 Covers:
 - _compute_freq_crop: index math for k_max cropping (real and complex modes)
-- precompute_volume_dft: shape, padding, DC zeroing
+- precompute_volume_dft: shape, padding, edge-value handling
 - apply_fourier_filters: output shape and identity behaviour
 - DecompositionResult: shape validation, index helpers, get_component, get_top_n
 - DecompositionResult save/load round-trip
@@ -13,7 +13,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
-from torch_fourier_slice.volume_utils import separable_sinc2_correction
 
 from panther_em.coordinates.offset_polar import OffsetPolarTransform
 from panther_em.decomposition.pipeline_projections import (
@@ -170,7 +169,7 @@ class TestComputeFreqCrop:
 
 
 class TestPrecomputeVolumeDft:
-    """precompute_volume_dft: shape, padding, DC zeroing."""
+    """precompute_volume_dft: shape, padding, edge-value handling."""
 
     # compute_cube_face_averages requires n=4 < d//2, so d >= 10; use 16.
 
@@ -189,32 +188,20 @@ class TestPrecomputeVolumeDft:
         assert dft.shape == (d_padded, d_padded, d_padded // 2 + 1)
         assert pad_width > 0
 
-    def test_dc_is_zeroed(self):
-        vol = torch.ones(16, 16, 16)
+    def test_dc_is_not_zeroed(self):
+        vol = torch.zeros(16, 16, 16)
+        vol[6:10, 6:10, 6:10] = 5.0
         dft, _, _ = precompute_volume_dft(vol, pad_factor=1.0)
         dc_row = dft.shape[0] // 2
         dc_col = dft.shape[1] // 2
-        assert dft[dc_row, dc_col, 0].abs().item() == pytest.approx(0.0, abs=1e-6)
+        assert dft[dc_row, dc_col, 0].abs().item() > 1e-3
 
-    def test_volume_mean_scaled_zero_after_background_subtraction(self):
+    def test_edge_value_scaled_matches_edge_average_times_d(self):
         d = 16
         vol = torch.ones(d, d, d) * 3.0
-        _, volume_mean_scaled, _ = precompute_volume_dft(vol, pad_factor=1.0)
-        # Constant volume: after edge subtraction the mean → 0
-        assert abs(volume_mean_scaled) < 1e-4
-
-    def test_zero_background_false_preserves_mean(self):
-        d = 16
-        vol = torch.ones(d, d, d) * 2.0
-        _, volume_mean_scaled, _ = precompute_volume_dft(
-            vol, pad_factor=1.0, zero_background=False
-        )
-        # The sinc^2 correction (applied before the mean is computed) is not
-        # spatially uniform, so a constant volume's mean is only preserved up
-        # to that reweighting.
-        sinc2 = separable_sinc2_correction((d, d, d))
-        expected = (vol / sinc2).mean() * d
-        assert volume_mean_scaled == pytest.approx(expected.item(), rel=1e-4)
+        _, edge_value_scaled, _ = precompute_volume_dft(vol, pad_factor=1.0)
+        # Constant volume: cube-face average equals the constant value.
+        assert edge_value_scaled == pytest.approx(3.0 * d, rel=1e-4)
 
     def test_output_is_complex(self):
         vol = torch.zeros(16, 16, 16)

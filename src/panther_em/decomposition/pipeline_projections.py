@@ -41,7 +41,6 @@ from panther_em.coordinates.transform_base import CoordinateTransform
 def precompute_volume_dft(
     volume: torch.Tensor,
     pad_factor: float = 2.0,
-    zero_background: bool = True,
 ) -> tuple[torch.Tensor, float, int]:
     """Precompute the 3D RFFT of a volume with padding.
 
@@ -51,31 +50,26 @@ def precompute_volume_dft(
         `(d, d, d)` cubic volume.
     pad_factor : float
         Padding factor for the volume. Default is 2.0.
-    zero_background : bool
-        When True, zero out the background by subtracting an average edge value from
-        the volume.
 
     Returns
     -------
     dft : torch.Tensor
-        The fftshifted 3D RFFT of the sinc^2-corrected, padded volume, with DC zeroed
-        out.
-    volume_mean_scaled : float
-        `volume.mean() * d`, the constant to add back to projections after IFFT.
+        The fftshifted 3D RFFT of the sinc^2-corrected, padded volume.
+    edge_value_scaled : float
+        `edge_value * d`, the constant to add back to projections after IFFT, where
+        `edge_value` is the cube-face average of the volume subtracted before padding.
     pad_width : int
         Number of pixels padded on each side (0 if pad_factor <= 1.0).
     """
     d = volume.shape[-1]
-    edge_value = compute_cube_face_averages(volume, n=4)
 
-    if zero_background:
-        volume = volume - edge_value
-        edge_value = 0.0  # for pad_factor case
+    edge_value = compute_cube_face_averages(volume, n=4)
+    volume = volume - edge_value
 
     pad_width = 0
     if pad_factor > 1.0:
         pad_width = int((d * (pad_factor - 1.0)) // 2)
-        volume = F.pad(volume, pad=[pad_width] * 6, mode="constant", value=edge_value)
+        volume = F.pad(volume, pad=[pad_width] * 6, mode="constant", value=0.0)
 
     # Divide by sinc^2 in real space to correct for the blur introduced by
     # trilinear interpolation during central-slice extraction (see
@@ -83,21 +77,20 @@ def precompute_volume_dft(
     sinc2 = separable_sinc2_correction(volume.shape[-3:], device=volume.device)
     volume = volume / sinc2
 
-    volume_mean_scaled = volume.mean() * d
-
     # Center-to-origin shift, then 3D RFFT
     dft = torch.fft.fftshift(volume, dim=(-3, -2, -1))
     dft = torch.fft.rfftn(dft, dim=(-3, -2, -1))
-    dft[..., 0, 0, 0] = 0.0  # zero DC to avoid low-res artifacts
     dft = torch.fft.fftshift(dft, dim=(-3, -2))  # shift so DC is at center
 
-    return dft, volume_mean_scaled, pad_width
+    edge_value_scaled = edge_value * d
+
+    return dft, edge_value_scaled, pad_width
 
 
 def project_from_precomputed_dft(
     dft: torch.Tensor,
     rotation_matrices: torch.Tensor,
-    volume_mean_scaled: float,
+    edge_value_scaled: float,
     pad_width: int,
     fftfreq_max: float | None = 0.5,
     zyx_matrices: bool = False,
@@ -110,8 +103,8 @@ def project_from_precomputed_dft(
         Precomputed fftshifted 3D RFFT from `precompute_volume_dft`.
     rotation_matrices : torch.Tensor
         `(..., 3, 3)` rotation matrices for slice extraction.
-    volume_mean_scaled : float
-        Constant to add back after IFFT (volume_mean * d).
+    edge_value_scaled : float
+        Constant to add back after IFFT (edge_value * d), from `precompute_volume_dft`.
     pad_width : int
         Padding width to remove from projections.
     fftfreq_max : float | None
@@ -140,16 +133,15 @@ def project_from_precomputed_dft(
     if pad_width > 0:
         projections = F.pad(projections, pad=[-pad_width] * 4)
 
-    # TEST: Try keeping zero-mean projections
-    # Add back the mean
-    projections += volume_mean_scaled
+    # Add back the edge value subtracted in precompute_volume_dft.
+    projections += edge_value_scaled
 
     return projections
 
 
 def generate_projection_batch(
     dft: torch.Tensor,
-    volume_mean_scaled: float,
+    edge_value_scaled: float,
     pad_width: int,
     phi: torch.Tensor,  # (B,)
     theta: torch.Tensor,  # (B,)
@@ -162,7 +154,7 @@ def generate_projection_batch(
     return project_from_precomputed_dft(
         dft=dft,
         rotation_matrices=rot_matrix,
-        volume_mean_scaled=volume_mean_scaled,
+        edge_value_scaled=edge_value_scaled,
         pad_width=pad_width,
         fftfreq_max=fftfreq_max,
     )
@@ -191,7 +183,7 @@ def apply_fourier_filters(
 
 def process_batch(
     dft: torch.Tensor,
-    volume_mean_scaled: float,
+    edge_value_scaled: float,
     pad_width: int,
     phi: torch.Tensor,
     theta: torch.Tensor,
@@ -207,8 +199,8 @@ def process_batch(
     ----------
     dft : torch.Tensor
         Precomputed fftshifted 3D RFFT from `precompute_volume_dft`.
-    volume_mean_scaled : float
-        Constant to add back after IFFT (volume_mean * d).
+    edge_value_scaled : float
+        Constant to add back after IFFT (edge_value * d), from `precompute_volume_dft`.
     pad_width : int
         Padding width to remove from projections.
     phi, theta, psi : torch.Tensor
@@ -238,7 +230,7 @@ def process_batch(
     """
     projections = generate_projection_batch(
         dft=dft,
-        volume_mean_scaled=volume_mean_scaled,
+        edge_value_scaled=edge_value_scaled,
         pad_width=pad_width,
         phi=phi,
         theta=theta,
@@ -537,12 +529,12 @@ def do_pipelined_projection_and_transforms(
     # NOTE: Doing a dummy batch on the first volume before allocating memory to get
     #       the `is_complex` flag and the number of angular modes which need stored.
     #       Orientations/filters/k_max are assumed identical across all volumes.
-    dft0, volume_mean_scaled0, pad_width0 = precompute_volume_dft(
+    dft0, edge_value_scaled0, pad_width0 = precompute_volume_dft(
         volume[0].to(compute_device, non_blocking=True), pad_factor=pad_factor
     )
     _, is_complex, num_angular_mode = process_batch(
         dft=dft0,
-        volume_mean_scaled=volume_mean_scaled0,
+        edge_value_scaled=edge_value_scaled0,
         pad_width=pad_width0,
         phi=phi[:2],
         theta=theta[:2],
@@ -591,10 +583,10 @@ def do_pipelined_projection_and_transforms(
 
     for vol_idx in range(num_volumes):
         if vol_idx == 0:
-            dft, volume_mean_scaled, pad_width = dft0, volume_mean_scaled0, pad_width0
+            dft, edge_value_scaled, pad_width = dft0, edge_value_scaled0, pad_width0
         else:
             vol_i = volume[vol_idx].to(compute_device, non_blocking=True)
-            dft, volume_mean_scaled, pad_width = precompute_volume_dft(
+            dft, edge_value_scaled, pad_width = precompute_volume_dft(
                 vol_i, pad_factor=pad_factor
             )
             del vol_i
@@ -606,7 +598,7 @@ def do_pipelined_projection_and_transforms(
 
             result, is_complex, _ = process_batch(
                 dft=dft,
-                volume_mean_scaled=volume_mean_scaled,
+                edge_value_scaled=edge_value_scaled,
                 pad_width=pad_width,
                 phi=phi[slice_],
                 theta=theta[slice_],
