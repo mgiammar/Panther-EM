@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from torch_fourier_slice.volume_utils import separable_sinc2_correction
 
 from panther_em.coordinates.offset_polar import OffsetPolarTransform
 from panther_em.decomposition.pipeline_projections import (
@@ -208,7 +209,12 @@ class TestPrecomputeVolumeDft:
         _, volume_mean_scaled, _ = precompute_volume_dft(
             vol, pad_factor=1.0, zero_background=False
         )
-        assert volume_mean_scaled == pytest.approx(2.0 * d, rel=1e-4)
+        # The sinc^2 correction (applied before the mean is computed) is not
+        # spatially uniform, so a constant volume's mean is only preserved up
+        # to that reweighting.
+        sinc2 = separable_sinc2_correction((d, d, d))
+        expected = (vol / sinc2).mean() * d
+        assert volume_mean_scaled == pytest.approx(expected.item(), rel=1e-4)
 
     def test_output_is_complex(self):
         vol = torch.zeros(16, 16, 16)

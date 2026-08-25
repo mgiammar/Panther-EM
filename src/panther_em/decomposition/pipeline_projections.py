@@ -30,7 +30,10 @@ import torch
 import torch.nn.functional as F
 import tqdm
 from torch_fourier_slice.slice_extraction import extract_central_slices_rfft_3d
-from torch_fourier_slice.volume_utils import compute_cube_face_averages
+from torch_fourier_slice.volume_utils import (
+    compute_cube_face_averages,
+    separable_sinc2_correction,
+)
 
 from panther_em.coordinates.transform_base import CoordinateTransform
 
@@ -55,7 +58,8 @@ def precompute_volume_dft(
     Returns
     -------
     dft : torch.Tensor
-        The fftshifted 3D RFFT of the padded volume, with DC zeroed out.
+        The fftshifted 3D RFFT of the sinc^2-corrected, padded volume, with DC zeroed
+        out.
     volume_mean_scaled : float
         `volume.mean() * d`, the constant to add back to projections after IFFT.
     pad_width : int
@@ -72,6 +76,12 @@ def precompute_volume_dft(
     if pad_factor > 1.0:
         pad_width = int((d * (pad_factor - 1.0)) // 2)
         volume = F.pad(volume, pad=[pad_width] * 6, mode="constant", value=edge_value)
+
+    # Divide by sinc^2 in real space to correct for the blur introduced by
+    # trilinear interpolation during central-slice extraction (see
+    # torch_fourier_slice issue #65).
+    sinc2 = separable_sinc2_correction(volume.shape[-3:], device=volume.device)
+    volume = volume / sinc2
 
     volume_mean_scaled = volume.mean() * d
 
