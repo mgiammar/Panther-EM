@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -35,6 +35,67 @@ def _contract_region(
     return torch.bmm(y_b, w_b).permute(1, 2, 0)  # (num_k, P, N) -> (P, N, num_k)
 
 
+# Contraction precisions. "fp32" is cuBLAS cgemm; "tf32" the same with TF32 tensor
+# cores enabled around the call; "fp16" the real-valued "4M" formulation below on
+# FP16 tensor cores (~4x the cgemm rate on Ada, ~4e-4 relative error).
+Precision = Literal["fp32", "tf32", "fp16"]
+
+
+def _weights_fp16_4m(w_conj: torch.Tensor) -> torch.Tensor:
+    r"""Interleave a pre-conjugated ``(N, num_k, num_m)`` block for the fp16 4M GEMM.
+
+    The complex product ``C = Y @ w`` (``w`` already conjugated) is computed as ONE real
+    GEMM per ``k``:  ``[Yr | Yi] (P, 2 num_m) @ B (2 num_m, 2N)`` with the columns of
+    ``B`` interleaved so that ``out[:, 2n] = Cr[:, n]`` and ``out[:, 2n+1] = Ci[:, n]``::
+
+        Cr = Yr wr - Yi wi      ->  B[:num_m, 2n] =  wr[:, n],  B[num_m:, 2n]   = -wi[:, n]
+        Ci = Yr wi + Yi wr      ->  B[:num_m, 2n+1] = wi[:, n], B[num_m:, 2n+1] =  wr[:, n]
+
+    The real ``(num_k, P, 2N)`` output is therefore bit-identical in memory to a
+    ``(num_k, P, N)`` complex tensor -- exactly the layout the fused reduce kernels
+    consume, with no transposes or copies.
+
+    Parameters
+    ----------
+    w_conj : torch.Tensor
+        Pre-conjugated complex weights ``(N, num_k, num_m)``.
+
+    Returns
+    -------
+    torch.Tensor
+        float16 ``(num_k, 2 num_m, 2N)``, contiguous.
+    """
+    n, num_k, num_m = w_conj.shape
+    wk = w_conj.permute(1, 2, 0)  # (num_k, num_m, N)
+    b = torch.empty((num_k, 2 * num_m, 2 * n), dtype=torch.float16, device=w_conj.device)
+    b[:, :num_m, 0::2] = wk.real
+    b[:, num_m:, 0::2] = -wk.imag
+    b[:, :num_m, 1::2] = wk.imag
+    b[:, num_m:, 1::2] = wk.real
+    return b
+
+
+def _features_fp16_4m(y: torch.Tensor) -> torch.Tensor:
+    """``(P, num_k, num_m)`` complex features -> fp16 ``(num_k, P, 2 num_m)`` ``[Yr | Yi]``."""
+    yk = y.permute(1, 0, 2)  # (num_k, P, num_m)
+    return torch.cat((yk.real, yk.imag), dim=-1).to(torch.float16)
+
+
+def _contract_region_fp16(
+    a16: torch.Tensor,  # (num_k, P, 2 num_m) fp16, from _features_fp16_4m
+    b16: torch.Tensor,  # (num_k, 2 num_m, 2N) fp16, from _weights_fp16_4m
+    accumulate_fp32: bool,
+) -> torch.Tensor:  # (P, N, num_k) complex view (complex32, or complex64 if accumulate_fp32)
+    """fp16 tensor-core contraction; output viewed as the ``(P, N, num_k)`` spectrum."""
+    num_k, p, _ = a16.shape
+    n = b16.shape[-1] // 2
+    if accumulate_fp32:
+        out = torch.bmm(a16, b16, out_dtype=torch.float32)  # (num_k, P, 2N) fp32
+    else:
+        out = torch.bmm(a16, b16)  # (num_k, P, 2N) fp16
+    return torch.view_as_complex(out.view(num_k, p, n, 2)).permute(1, 2, 0)
+
+
 @dataclass
 class RectangularFeatureRegion:
     """Single rectangle in ``(k, m)`` component space with helpers for contraction.
@@ -60,6 +121,9 @@ class RectangularFeatureRegion:
     m_start: int
     m_stop: int
     indices: torch.Tensor | None = None  # (num_k * num_m,) long, set by FeatureTiling
+    # (start, stop) when `indices` is a contiguous arange (compacted layouts), so
+    # `gather` can slice instead of index_select. Set by FeatureTiling.
+    slice_bounds: tuple[int, int] | None = None
 
     @property
     def num_k(self) -> int:
@@ -118,8 +182,14 @@ class RectangularFeatureRegion:
             raise ValueError(
                 "region has no feature indices; build it through a FeatureTiling."
             )
-        idx = self.indices.to(tensor.device)
-        block = tensor.index_select(-1, idx)  # (..., num_k * num_m)
+        if self.slice_bounds is not None:
+            # Compacted layouts give every region a contiguous slot range: slice
+            # instead of gathering (a view, no copy).
+            start, stop = self.slice_bounds
+            block = tensor[..., start:stop]
+        else:
+            idx = self.indices.to(tensor.device)
+            block = tensor.index_select(-1, idx)  # (..., num_k * num_m)
 
         return block.reshape(*block.shape[:-1], self.num_k, self.num_m)
 
@@ -184,6 +254,37 @@ class RectangularFeatureRegion:
         return out
 
 
+@dataclass
+class KInterval:
+    """A run ``[k_start, k_stop)`` of angular frequencies covered by a fixed region set.
+
+    See :meth:`FeatureTiling._build_k_intervals`. ``indices`` (``(num_k * num_m,)``,
+    row-major in ``(k, m)``) addresses the concatenated ``m``-ranges of the covering
+    regions in the tiling's flat feature layout; ``slice_bounds`` is set when that is a
+    contiguous run (so gathering is a view).
+    """
+
+    k_start: int
+    k_stop: int
+    num_m: int
+    indices: torch.Tensor
+    slice_bounds: tuple[int, int] | None = None
+
+    @property
+    def num_k(self) -> int:
+        """Number of angular frequencies in the run."""
+        return self.k_stop - self.k_start
+
+    def gather(self, tensor: torch.Tensor) -> torch.Tensor:
+        """``(..., num_k, num_m)`` block of a tensor whose last axis is the feature axis."""
+        if self.slice_bounds is not None:
+            start, stop = self.slice_bounds
+            block = tensor[..., start:stop]
+        else:
+            block = tensor.index_select(-1, self.indices.to(tensor.device))
+        return block.reshape(*block.shape[:-1], self.num_k, self.num_m)
+
+
 class FeatureTiling:
     """Group of feature regions which tile some portion of ``(k, m)`` space.
 
@@ -227,9 +328,11 @@ class FeatureTiling:
         layout. The returned ``src`` and ``dst`` are long tensors of positions in
         ``other`` and *this* tiling's feature dimension, respectively. Used for copying
         already computed features into a new tiling layout.
-    prepare_weights(W_flat) : list[torch.Tensor]
-        Pre-gather and conjugate every region's ``W`` block once, for reuse across many
-        :meth:`run` calls that share the same hypothesis batch.
+    prepare_weights(W_flat, precision) : list[torch.Tensor]
+        Pre-gather and conjugate every k-interval's ``W`` block once, for reuse across
+        many :meth:`run` calls that share the same hypothesis batch.
+    prepare_features(Y_flat, precision) : list[torch.Tensor]
+        Per-k-interval blocks of the featurized image, once per pixel batch.
     """
 
     regions: list[RectangularFeatureRegion]
@@ -238,6 +341,9 @@ class FeatureTiling:
     k_indices: torch.Tensor  # (num_features,)
     m_indices: torch.Tensor  # (num_features,)
     is_compacted: bool  # False for an uncropped `K * num_m` layout
+    # Contraction plan: k-runs with a constant covering-region set (see
+    # _build_k_intervals); prepare_weights / prepare_features / run work per interval.
+    k_intervals: list[KInterval]
 
     def __init__(
         self,
@@ -288,7 +394,62 @@ class FeatureTiling:
         offset = 0
         for region in self.regions:
             region.indices = indices[offset : offset + region.num_features]
+            if self.is_compacted:
+                region.slice_bounds = (offset, offset + region.num_features)
             offset += region.num_features
+
+        self.k_intervals = self._build_k_intervals(device)
+
+    def _build_k_intervals(self, device: torch.device | str) -> list[KInterval]:
+        """Partition the ``k`` axis into runs with a constant set of covering regions.
+
+        Within one run every covering region contributes a disjoint ``m``-range (the
+        tiling is cell-disjoint), so the contraction over the run is ONE GEMM whose
+        inner dimension is the concatenation of those ``m``-ranges. That turns any
+        multi-rectangle tiling into a handful of independent GEMMs, each written
+        straight into its own ``k``-slab of the spectrum -- no accumulation pass, no
+        zero-fill except for ``k`` no rectangle covers. A single full-height rectangle
+        yields exactly one interval, the classic fast path.
+        """
+        bounds = sorted({r.k_start for r in self.regions} | {r.k_stop for r in self.regions})
+        intervals: list[KInterval] = []
+        for k_start, k_stop in zip(bounds[:-1], bounds[1:], strict=True):
+            members = [
+                r for r in self.regions if r.k_start <= k_start and r.k_stop >= k_stop
+            ]
+            if not members:
+                continue
+            num_k = k_stop - k_start
+            num_m = sum(r.num_m for r in members)
+            # slot(region, k, m) = region_offset + (k - k_start_r) * num_m_r + (m - m_start_r)
+            rows = []
+            for k in range(k_start, k_stop):
+                parts = []
+                for r in members:
+                    assert r.indices is not None
+                    base = (k - r.k_start) * r.num_m
+                    parts.append(r.indices[base : base + r.num_m])
+                rows.append(torch.cat(parts))
+            indices = torch.stack(rows).reshape(-1).to(device=device, dtype=torch.long)
+            first = int(indices[0])
+            is_slice = bool(
+                torch.equal(
+                    indices,
+                    torch.arange(
+                        first, first + indices.numel(), device=indices.device
+                    ),
+                )
+            )
+            intervals.append(
+                KInterval(
+                    k_start=k_start,
+                    k_stop=k_stop,
+                    num_m=num_m,
+                    indices=indices,
+                    slice_bounds=(first, first + int(indices.numel())) if is_slice else None,
+                )
+            )
+        return intervals
 
     @classmethod
     def from_extents(
@@ -397,37 +558,76 @@ class FeatureTiling:
 
     # -- contraction -------------------------------------------------------
 
-    def prepare_weights(self, W_flat: torch.Tensor) -> list[torch.Tensor]:
+    def prepare_weights(
+        self, W_flat: torch.Tensor, precision: Precision = "fp32"
+    ) -> list[torch.Tensor]:
         """Pre-gather and conjugate every region's ``W`` block once.
 
         Parameters
         ----------
         W_flat : torch.Tensor
             Contraction weights ``(N, r)`` in this tiling's feature layout.
+        precision : {"fp32", "tf32", "fp16"}, optional
+            Contraction precision :meth:`run` will be called with. For ``"fp16"`` the
+            blocks are returned pre-interleaved for the real 4M GEMM (see
+            :func:`_weights_fp16_4m`), ``(num_k, 2 num_m, 2N)`` float16.
 
         Returns
         -------
         list[torch.Tensor]
-            One pre-conjugated ``(N, num_k, num_m)`` block per region, in
-            :attr:`regions` order.
+            One block per :attr:`k_intervals` entry: pre-conjugated ``(N, num_k, num_m)``
+            complex for fp32/tf32 (``num_m`` = the interval's concatenated eigenvector
+            count), or the fp16 4M layout ``(num_k, 2 num_m, 2N)``.
         """
-        return [region.gather_conjugated_weights(W_flat) for region in self.regions]
+        blocks = [interval.gather(W_flat).conj() for interval in self.k_intervals]
+        if precision == "fp16":
+            return [_weights_fp16_4m(block) for block in blocks]
+        return blocks
 
-    @torch.no_grad()
-    def run(
-        self,
-        Y_flat: torch.Tensor,
-        W_flat: torch.Tensor | None,
-        n_freq: int,
-        out: torch.Tensor | None = None,
-        prepared_weights: list[torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        r"""Accumulate every region into the dense spectrum ``C[P, N, n_freq]``.
+    def prepare_features(
+        self, Y_flat: torch.Tensor, precision: Precision = "fp32"
+    ) -> list[torch.Tensor]:
+        """Slice (and for fp16, convert) every region's block of the featurized image.
+
+        Doing this once per pixel batch, outside the hypothesis loop, means the
+        per-hypothesis-batch work in :meth:`run` is exactly one ``bmm`` per region.
 
         Parameters
         ----------
         Y_flat : torch.Tensor
             Featurized image ``(P, r)`` in this tiling's feature layout.
+        precision : {"fp32", "tf32", "fp16"}, optional
+            See :meth:`prepare_weights`.
+
+        Returns
+        -------
+        list[torch.Tensor]
+            Per :attr:`k_intervals` entry: ``(P, num_k, num_m)`` complex (fp32/tf32) or
+            fp16 ``(num_k, P, 2 num_m)`` ``[Yr | Yi]`` (fp16).
+        """
+        blocks = [interval.gather(Y_flat) for interval in self.k_intervals]
+        if precision == "fp16":
+            return [_features_fp16_4m(block) for block in blocks]
+        return blocks
+
+    @torch.no_grad()
+    def run(
+        self,
+        Y_flat: torch.Tensor | None,
+        W_flat: torch.Tensor | None,
+        n_freq: int,
+        out: torch.Tensor | None = None,
+        prepared_weights: list[torch.Tensor] | None = None,
+        prepared_features: list[torch.Tensor] | None = None,
+        precision: Precision = "fp32",
+    ) -> torch.Tensor:
+        r"""Accumulate every region into the dense spectrum ``C[P, N, n_freq]``.
+
+        Parameters
+        ----------
+        Y_flat : torch.Tensor or None
+            Featurized image ``(P, r)`` in this tiling's feature layout. May be ``None``
+            when ``prepared_features`` is supplied instead.
         W_flat : torch.Tensor or None
             Contraction weights ``(N, r)`` in the same feature layout. May be ``None``
             when ``prepared_weights`` is supplied instead.
@@ -440,9 +640,18 @@ class FeatureTiling:
             Pre-allocated ``(P, N, n_freq)`` complex accumulator. A fresh zero tensor
             is allocated when omitted.
         prepared_weights : list[torch.Tensor], optional
-            Output of :meth:`prepare_weights`, reused across many calls that share the
-            same hypothesis batch instead of re-gathering/re-conjugating ``W_flat``
-            here. Takes precedence over ``W_flat`` when supplied.
+            Output of :meth:`prepare_weights` (with the same ``precision``), reused
+            across many calls that share the same hypothesis batch instead of
+            re-gathering/re-conjugating ``W_flat`` here. Takes precedence over
+            ``W_flat`` when supplied. Required for ``precision="fp16"``.
+        prepared_features : list[torch.Tensor], optional
+            Output of :meth:`prepare_features` (same ``precision``), reused across the
+            hypothesis batches of one pixel batch. Takes precedence over ``Y_flat``.
+        precision : {"fp32", "tf32", "fp16"}, optional
+            Contraction precision. ``"fp16"`` runs the real 4M GEMM on FP16 tensor
+            cores; the single-full-rectangle fast path then returns a **complex32**
+            spectrum (the fused reduce kernel consumes it directly), while the
+            multi-region path accumulates in fp32 and returns complex64.
 
         Returns
         -------
@@ -451,48 +660,119 @@ class FeatureTiling:
             Recover the real ``\psi``-resolved correlogram with an ``irfft`` over the
             last axis.
         """
-        if out is None:
-            region0 = self.regions[0]
-            single_full = (
-                len(self.regions) == 1
-                and region0.k_start == 0
-                and region0.k_stop == int(n_freq)
+        if precision == "fp16":
+            return self._run_fp16(Y_flat, n_freq, out, prepared_weights, prepared_features)
+        if precision == "tf32":
+            prev = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = True
+            try:
+                return self.run(
+                    Y_flat, W_flat, n_freq, out, prepared_weights, prepared_features
+                )
+            finally:
+                torch.backends.cuda.matmul.allow_tf32 = prev
+
+        if Y_flat is None and prepared_features is None:
+            raise ValueError("run() needs Y_flat or prepared_features")
+
+        if out is not None:
+            # Caller-provided accumulator: original per-region accumulate-into semantics.
+            for region in self.regions:
+                region.accumulate_into(Y_flat, W_flat, out, conjugate=True)  # type: ignore[arg-type]
+            return out
+
+        if prepared_weights is None:
+            assert W_flat is not None
+            prepared_weights = self.prepare_weights(W_flat)
+        if prepared_features is None:
+            assert Y_flat is not None
+            prepared_features = self.prepare_features(Y_flat)
+
+        # Fast path: one interval spanning the whole frequency axis (e.g. a single
+        # full-height rectangle) -- the bmm output IS the spectrum, no fill or copy.
+        iv0 = self.k_intervals[0]
+        if len(self.k_intervals) == 1 and iv0.k_start == 0 and iv0.k_stop == int(n_freq):
+            return _contract_region(prepared_features[0], prepared_weights[0], False)
+
+        # General: frequency-major (n_freq, P, N) buffer handed out as the (P, N, n_freq)
+        # permuted view (the layout the fused reduce kernels take zero-copy). Every
+        # interval's GEMM is written straight into its contiguous k-slab via out=; only
+        # k no rectangle covers is zero-filled.
+        p = prepared_features[0].shape[0]
+        n_hyp = prepared_weights[0].shape[0]
+        slab_base = torch.empty(
+            (int(n_freq), p, n_hyp),
+            dtype=prepared_features[0].dtype,
+            device=prepared_features[0].device,
+        )
+        covered = [False] * int(n_freq)
+        for iv, y, w in zip(self.k_intervals, prepared_features, prepared_weights, strict=True):
+            torch.bmm(
+                y.permute(1, 0, 2),  # (num_k, P, num_m)
+                w.permute(1, 2, 0),  # (num_k, num_m, N)
+                out=slab_base[iv.k_start : iv.k_stop],
+            )
+            for k in range(iv.k_start, iv.k_stop):
+                covered[k] = True
+        for k, is_covered in enumerate(covered):
+            if not is_covered:
+                slab_base[k].zero_()
+        return slab_base.permute(1, 2, 0)
+
+    def _run_fp16(
+        self,
+        Y_flat: torch.Tensor | None,
+        n_freq: int,
+        out: torch.Tensor | None,
+        prepared_weights: list[torch.Tensor] | None,
+        prepared_features: list[torch.Tensor] | None,
+    ) -> torch.Tensor:
+        """fp16 4M contraction; see :meth:`run` (``precision="fp16"``)."""
+        if prepared_weights is None:
+            raise ValueError('precision="fp16" requires prepared_weights')
+        if prepared_features is None:
+            if Y_flat is None:
+                raise ValueError("run() needs Y_flat or prepared_features")
+            prepared_features = self.prepare_features(Y_flat, precision="fp16")
+
+        if out is not None:
+            # Caller-provided (complex64) accumulator: fp32-accumulated per interval.
+            for iv, a16, b16 in zip(
+                self.k_intervals, prepared_features, prepared_weights, strict=True
+            ):
+                out[:, :, iv.k_start : iv.k_stop] += _contract_region_fp16(
+                    a16, b16, accumulate_fp32=True
+                )
+            return out
+
+        iv0 = self.k_intervals[0]
+        if len(self.k_intervals) == 1 and iv0.k_start == 0 and iv0.k_stop == int(n_freq):
+            # complex32 (P, N, n_freq) view of the fp16 GEMM output, zero copies.
+            return _contract_region_fp16(
+                prepared_features[0], prepared_weights[0], accumulate_fp32=False
             )
 
-            # Fast path which skips zero-fill and accumulation. Does direct assignment.
-            if single_full:
-                y = region0.gather(Y_flat)
-                if prepared_weights is not None:
-                    w = prepared_weights[0]
-                    conjugate = False
-                else:
-                    assert W_flat is not None
-                    w = region0.gather(W_flat)
-                    conjugate = True
-
-                return _contract_region(y, w, conjugate)
-
-            out = torch.zeros(
-                (
-                    Y_flat.shape[0],
-                    (
-                        prepared_weights[0].shape[0]
-                        if prepared_weights is not None
-                        else W_flat.shape[0]  # type: ignore[union-attr]
-                    ),
-                    int(n_freq),
-                ),
-                dtype=Y_flat.dtype,
-                device=Y_flat.device,
+        # General: complex32 frequency-major slabs, one fp16 GEMM per interval written
+        # directly (as its (num_k, P, 2N) real view) into its k-slab.
+        p = prepared_features[0].shape[1]
+        n = prepared_weights[0].shape[-1] // 2
+        slab_base = torch.empty(
+            (int(n_freq), p, n), dtype=torch.complex32, device=prepared_features[0].device
+        )
+        covered = [False] * int(n_freq)
+        for iv, a16, b16 in zip(
+            self.k_intervals, prepared_features, prepared_weights, strict=True
+        ):
+            slab_real = torch.view_as_real(slab_base[iv.k_start : iv.k_stop]).view(
+                iv.num_k, p, 2 * n
             )
-
-        for i, region in enumerate(self.regions):
-            prepared_w = prepared_weights[i] if prepared_weights is not None else None
-            region.accumulate_into(
-                Y_flat, W_flat, out, conjugate=True, prepared_w=prepared_w
-            )
-
-        return out
+            torch.bmm(a16, b16, out=slab_real)
+            for k in range(iv.k_start, iv.k_stop):
+                covered[k] = True
+        for k, is_covered in enumerate(covered):
+            if not is_covered:
+                slab_base[k].zero_()
+        return slab_base.permute(1, 2, 0)
 
     # -- incremental search: diffing and re-layout -------------------------
 

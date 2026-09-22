@@ -22,6 +22,7 @@ from panther_em.inference.search.statistics import PixelStats
 from panther_em.inference.search.tiling import (
     FeatureTiling,
     FeaturizedImageStore,
+    Precision,
     Rectangle,
 )
 from panther_em.inference.search.utils import build_layout_weights, featurize_cells
@@ -164,6 +165,122 @@ def resolve_search_args(
     return n_px, hypothesis_indexes, pixel_index
 
 
+class _HypLoopGraph:
+    """One pixel batch's whole hypothesis loop as a replayable CUDA graph.
+
+    Captures: ``pixel_stats.clear()`` (tensor fills), the per-region feature
+    conversion of a static ``(P, r)`` input buffer, and for every hypothesis batch
+    the contraction plus the fused reduce accumulating **in-kernel** into
+    ``pixel_stats``' state tensors. :meth:`run` copies a pixel batch into the static
+    buffer and replays; only Python-side bookkeeping (``hypothesis_count``, the
+    packed-best marker) is done outside the graph.
+
+    Built through :meth:`try_capture`, which returns ``None`` (leaving the caller to
+    run eagerly) when the in-kernel accumulate path cannot serve every batch --
+    a child-graph replay inside a capture is what the parent's accumulate would need.
+    """
+
+    def __init__(
+        self,
+        graph: torch.cuda.CUDAGraph,
+        y_static: torch.Tensor,
+        pixel_stats: FusedPixelStats,
+        n_hypotheses: int,
+        n_psi: int,
+    ) -> None:
+        self.graph = graph
+        self.y_static = y_static
+        self.pixel_stats = pixel_stats
+        self.n_hypotheses = n_hypotheses
+        self.n_psi = n_psi
+
+    @property
+    def num_pixels(self) -> int:
+        """Pixel-batch size the graph was captured for."""
+        return int(self.y_static.shape[0])
+
+    @classmethod
+    @torch.no_grad()
+    def try_capture(
+        cls,
+        tiling: FeatureTiling,
+        hyp_batches: list[tuple[torch.Tensor, list[torch.Tensor], int | None]],
+        pixel_stats: FusedPixelStats,
+        y_example: torch.Tensor,
+        *,
+        n_freq: int,
+        n_psi: int,
+        precision: Precision,
+    ) -> _HypLoopGraph | None:
+        device = y_example.device
+        y_static = y_example.detach().clone().contiguous()
+
+        # Every batch must take the in-kernel path (same shape/layout for all but
+        # possibly a shorter last batch, so probing the first and last suffices).
+        features = tiling.prepare_features(y_static, precision=precision)
+        for _, prepared_weights, hyp_offset in (hyp_batches[0], hyp_batches[-1]):
+            probe = tiling.run(
+                None,
+                None,
+                n_freq,
+                prepared_weights=prepared_weights,
+                prepared_features=features,
+                precision=precision,
+            )
+            assert hyp_offset is not None
+            if not pixel_stats.inkernel_supported(probe, n_psi, hyp_offset):
+                return None
+        del features, probe
+
+        def body() -> None:
+            pixel_stats.clear()
+            feats = tiling.prepare_features(y_static, precision=precision)
+            for _, prepared_weights, hyp_offset in hyp_batches:
+                spectrum = tiling.run(
+                    None,
+                    None,
+                    n_freq,
+                    prepared_weights=prepared_weights,
+                    prepared_features=feats,
+                    precision=precision,
+                )
+                assert hyp_offset is not None
+                pixel_stats.update_graphed(
+                    spectrum, hyp_offset, num_psi=n_psi, reverse_psi_axis=True
+                )
+
+        # Warm up on a private stream (JIT/cuBLAS workspaces, kernel attributes),
+        # then capture on that same stream -- see statistics._bind_capture_stream for
+        # why the stream must be explicit.
+        side = torch.cuda.Stream(device=device)
+        side.wait_stream(torch.cuda.current_stream(device))
+        try:
+            with torch.cuda.stream(side):
+                for _ in range(2):
+                    body()
+            torch.cuda.current_stream(device).wait_stream(side)
+            torch.cuda.synchronize(device)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=side):
+                body()
+        except Exception:
+            torch.cuda.synchronize(device)
+            return None
+        # The warm-up/capture accumulated into pixel_stats; the caller replays
+        # immediately, which starts with the captured clear().
+        n_hypotheses = sum(int(hyp_b.numel()) for hyp_b, _, _ in hyp_batches)
+        return cls(graph, y_static, pixel_stats, n_hypotheses, n_psi)
+
+    @torch.no_grad()
+    def run(self, y_flat: torch.Tensor) -> None:
+        """Reduce ``y_flat`` (``(P, r)``, same ``P`` as captured) into ``pixel_stats``."""
+        self.y_static.copy_(y_flat)
+        self.graph.replay()
+        ps = self.pixel_stats
+        ps.hypothesis_count = self.n_hypotheses * self.n_psi
+        ps._packed_num_psi = self.n_psi
+
+
 @torch.no_grad()
 def _run_stage(
     image: torch.Tensor,
@@ -181,6 +298,8 @@ def _run_stage(
     show_progress: bool = True,
     use_fused_kernel: bool = True,
     stage_bytes: int = DEFAULT_STAGE_BYTES,
+    precision: Precision = "fp32",
+    use_cuda_graph: bool = False,
     **polar_to_cart_kwargs: Any,
 ) -> dict[str, torch.Tensor]:
     r"""Run one tiling end-to-end and reduce it to per-pixel statistics.
@@ -232,6 +351,20 @@ def _run_stage(
         :class:`~panther_em.inference.search.staging.PixelStager` when ``store`` lives
         on a different device than ``compute_device`` (e.g. a CPU-resident store feeding
         a CUDA search).
+    precision : {"fp32", "tf32", "fp16"}, optional
+        Contraction precision (see :meth:`FeatureTiling.run`). ``"fp16"`` runs the
+        contraction as a real GEMM on FP16 tensor cores (~4x the complex64 rate) and
+        hands the fused reduce kernel a complex32 spectrum; relative error in the
+        correlations is ~4e-4. Defaults to ``"fp32"``.
+    use_cuda_graph : bool, optional
+        Capture each pixel batch's entire hypothesis loop (feature conversion,
+        every contraction, every fused reduce + in-kernel accumulate) in one CUDA
+        graph and replay it per pixel batch. Removes all per-batch launch and Python
+        overhead, which dominates once batches are sized to keep the spectrum
+        L2-resident. Requires a CUDA ``compute_device``, contiguous hypothesis
+        indexes and the in-kernel accumulate path
+        (:meth:`FusedPixelStats.inkernel_supported`); silently runs the eager loop
+        otherwise. Defaults to ``False``.
     **polar_to_cart_kwargs
         Forwarded to kernel construction when featurizing cells.
 
@@ -300,11 +433,14 @@ def _run_stage(
     hyp_batches = [
         (
             hypothesis_indexes[h0 : h0 + hyp_batch],
-            tiling.prepare_weights(w_layout[hypothesis_indexes[h0 : h0 + hyp_batch]]),
+            tiling.prepare_weights(
+                w_layout[hypothesis_indexes[h0 : h0 + hyp_batch]], precision=precision
+            ),
             h0 if is_contiguous_hyps else None,
         )
         for h0 in range(0, n_hypotheses, hyp_batch)
     ]
+    del w_layout
 
     # Ensure requested psi bins are sufficient for maximum angular frequency
     n_freq = tiling.k_stop
@@ -331,6 +467,14 @@ def _run_stage(
     # asynchronous H2D copies. If `store_device == compute_device`, then a no-op.
     stager = PixelStager(store, pixel_index, compute_device, stage_bytes=stage_bytes)
 
+    graph_mode = (
+        use_cuda_graph
+        and is_contiguous_hyps
+        and compute_device.type == "cuda"
+        and stats_cls is FusedPixelStats
+    )
+    hyp_graph: _HypLoopGraph | None = None
+
     for stage_start, stage_end, Y_stage in stager.stages():
         stage_size = stage_end - stage_start
         for p0 in range(0, stage_size, pixel_batch):
@@ -341,8 +485,28 @@ def _run_stage(
             # If not the previous batch's shape, create a fresh 'pixel_stats'.
             if Y_flat.shape[0] != pixel_stats.num_pixels:
                 pixel_stats = stats_cls(int(px_b.numel()), device=compute_device)
+                hyp_graph = None  # graphs are specialized to the pixel-batch size
             else:
                 pixel_stats.clear()
+
+            if graph_mode:
+                if hyp_graph is None:
+                    hyp_graph = _HypLoopGraph.try_capture(
+                        tiling,
+                        hyp_batches,
+                        pixel_stats,  # type: ignore[arg-type]
+                        Y_flat,
+                        n_freq=n_freq,
+                        n_psi=n_psi,
+                        precision=precision,
+                    )
+                    if hyp_graph is None:
+                        graph_mode = False  # not capturable here; eager from now on
+                if hyp_graph is not None:
+                    hyp_graph.run(Y_flat)
+                    stage_stats.append(pixel_stats.finalize())
+                    pixel_bar.update(int(px_b.numel()))
+                    continue
 
             # In practice the hypothesis loop below runs at roughly 10k pixels/second,
             # so this bar completes before tqdm's first render.
@@ -355,11 +519,22 @@ def _run_stage(
                 leave=False,
             )
 
+            # Region slices (+ fp16 conversion) of this pixel batch's features, once,
+            # so each hypothesis batch below is exactly one GEMM per region.
+            features = tiling.prepare_features(Y_flat, precision=precision)
+
             if not is_contiguous_hyps:
                 pixel_stats.begin_hypothesis_batches(len(hyp_batches))
             for hyp_b, prepared_weights, hyp_offset in hyp_batches:
                 # Accumulate the angular-frequency spectrum C
-                C = tiling.run(Y_flat, None, n_freq, prepared_weights=prepared_weights)
+                C = tiling.run(
+                    None,
+                    None,
+                    n_freq,
+                    prepared_weights=prepared_weights,
+                    prepared_features=features,
+                    precision=precision,
+                )
 
                 # psi recovery + statistics update, per-pixel
                 if is_contiguous_hyps:
@@ -410,6 +585,8 @@ def compressed_search(
     show_progress: bool = True,
     use_fused_kernel: bool = True,
     stage_bytes: int = DEFAULT_STAGE_BYTES,
+    precision: Precision = "fp32",
+    use_cuda_graph: bool = False,
     **polar_to_cart_kwargs: Any,
 ) -> dict[str, torch.Tensor]:
     r"""Single-stage SVD-2DTM search over one selection of feature rectangles.
@@ -474,6 +651,11 @@ def compressed_search(
         :class:`~panther_em.inference.search.staging.PixelStager`). Only relevant
         when ``feature_store_device`` differs from ``compute_device``; ignored
         otherwise.
+    precision : {"fp32", "tf32", "fp16"}, optional
+        Contraction precision; see :func:`_run_stage`. Defaults to ``"fp32"``.
+    use_cuda_graph : bool, optional
+        Replay each pixel batch's hypothesis loop as one CUDA graph; see
+        :func:`_run_stage`. Defaults to ``False``.
     **polar_to_cart_kwargs
         Forwarded to kernel construction.
 
@@ -541,6 +723,8 @@ def compressed_search(
         show_progress=show_progress,
         use_fused_kernel=use_fused_kernel,
         stage_bytes=stage_bytes,
+        precision=precision,
+        use_cuda_graph=use_cuda_graph,
         **polar_to_cart_kwargs,
     )
 
