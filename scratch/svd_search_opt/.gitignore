@@ -1,8 +1,0 @@
-ncu/
-__pycache__/
-*.csv
-*.h5
-*.log
-torch_ext_dev/
-*.nsys-rep
-*.ncu-rep
