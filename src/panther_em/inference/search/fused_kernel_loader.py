@@ -189,16 +189,17 @@ def _try_compile() -> Any:
 # Public API
 # --------------------------------------------------------------------------- #
 LEAN_NUM_PSI = (128, 256)
-LEAN_MAX_NUM_FREQ = 64
 
 
 def lean_supported(n_psi: int, n_freq: int) -> bool:
     """Whether the register-resident kernel covers ``(n_psi, n_freq)``.
 
-    Any ``n_freq`` in ``[1, 64]`` at ``n_psi`` in ``{128, 256}``; the cuFFTDx block-FFT
-    kernel (:func:`fused_irfft_stats_transposed`) remains the fallback elsewhere.
+    Any ``n_freq`` in ``[1, n_psi // 2 + 1]`` at ``n_psi`` in ``{128, 256}`` (bins above
+    64 fold exactly onto the kernel's 64-point transform; the Nyquist bin is handled).
+    The cuFFTDx block-FFT kernel (:func:`fused_irfft_stats_transposed`) remains the
+    fallback for ``n_psi = 64``.
     """
-    return int(n_psi) in LEAN_NUM_PSI and 1 <= int(n_freq) <= LEAN_MAX_NUM_FREQ
+    return int(n_psi) in LEAN_NUM_PSI and 1 <= int(n_freq) <= int(n_psi) // 2 + 1
 
 
 @overload
@@ -231,7 +232,7 @@ def lean_irfft_stats_transposed(
     c : torch.Tensor
         Contiguous ``(NumFreq, P, Q)`` spectrum, complex64 **or complex32**; a float16
         ``(NumFreq, P, 2Q)`` tensor of interleaved ``(re, im)`` pairs is also accepted.
-        ``NumFreq`` may be anything in ``[1, 64]``.
+        ``NumFreq`` may be anything in ``[1, n_psi // 2 + 1]``.
     n_psi : int
         Full in-plane-angle length, 128 or 256.
     decode : bool, optional
@@ -279,6 +280,17 @@ def lean_irfft_stats_transposed(
         return s1, s2, argmax_packed
     vmax, amax = decode_argmax_packed(argmax_packed)
     return s1, s2, vmax, amax
+
+
+def lean_debug_ifft(x: torch.Tensor) -> torch.Tensor | None:
+    """Unnormalized inverse DFT of complex64 ``(B, N)`` rows, ``N`` in ``{64, 128}``.
+
+    Runs the generated register-resident transforms (``csrc/lean_fft_gen.cuh``) on the
+    device; equals ``torch.fft.ifft(x, norm="forward")``. Test entry point only;
+    ``None`` when the extension is unavailable.
+    """
+    module = _try_compile()
+    return module.lean_debug_ifft(x) if module is not None else None
 
 
 def lean_sentinel_packed() -> int | None:

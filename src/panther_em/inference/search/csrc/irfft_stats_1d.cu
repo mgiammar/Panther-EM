@@ -527,7 +527,8 @@ std::vector<torch::Tensor> fused_irfft_stats_transposed(torch::Tensor c,
  *     (chalf) tensor of shape (NumFreq, P, Q), or an equivalent float16 tensor of
  *     shape (NumFreq, P, 2Q) holding interleaved (re, im) pairs -- the layout the
  *     fp16 real-valued "4M" contraction in FeatureTiling.run produces directly;
- *   - any NumFreq in [1, 64] (runtime), num_psi in {128, 256};
+ *   - any NumFreq in [1, num_psi/2 + 1] (runtime; bins above 64 fold onto the
+ *     64-point transform exactly, the Nyquist bin is handled), num_psi in {128, 256};
  *   - can accumulate straight into a caller-owned running state: pass `outs` =
  *     [corr_sum (P,) f32, corr_sum2 (P,) f32, best_packed (P,) i64] and the batch's
  *     global starting hypothesis index `hyp_offset`. s1/s2 are atomically added to
@@ -562,9 +563,9 @@ lean_irfft_stats_transposed(torch::Tensor c, int64_t num_psi, int64_t hyp_offset
   const auto p_total = static_cast<unsigned int>(c.size(1));
   const auto q_total =
       static_cast<unsigned int>(is_f16 ? c.size(2) / 2 : c.size(2));
-  TORCH_CHECK(num_freq >= 1 && num_freq <= 64,
-              "lean_irfft_stats_transposed supports NumFreq in [1, 64], got ",
-              num_freq);
+  TORCH_CHECK(num_freq >= 1 && num_freq <= static_cast<unsigned int>(num_psi / 2 + 1),
+              "lean_irfft_stats_transposed supports NumFreq in [1, num_psi/2 + 1], got ",
+              num_freq, " at num_psi=", num_psi);
   TORCH_CHECK(hyp_offset >= 0 &&
                   (hyp_offset + static_cast<int64_t>(q_total)) * num_psi <
                       (int64_t(1) << 32),
@@ -626,6 +627,33 @@ lean_irfft_stats_transposed(torch::Tensor c, int64_t num_psi, int64_t hyp_offset
 
 int64_t lean_sentinel_packed() { return sentinel_packed_i64(); }
 
+/**
+ * On-device check of the generated unnormalized inverse DFTs (lean_fft_gen.cuh):
+ * x complex64 (B, N), N in {64, 128} -> IDFT_N(x) * N per row (matches
+ * torch.fft.ifft(x, norm="forward")). Test/validation entry point only.
+ */
+torch::Tensor lean_debug_ifft(torch::Tensor x) {
+  TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kComplexFloat && x.dim() == 2,
+              "x must be complex64 (B, N)");
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  x = x.contiguous();
+  const auto batch = static_cast<unsigned int>(x.size(0));
+  const auto n = x.size(1);
+  TORCH_CHECK(n == 64 || n == 128, "N must be 64 or 128");
+  torch::Tensor out = torch::empty_like(x);
+  const float2 *in_ptr = reinterpret_cast<const float2 *>(x.data_ptr<c10::complex<float>>());
+  float2 *out_ptr = reinterpret_cast<float2 *>(out.data_ptr<c10::complex<float>>());
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const unsigned int blocks = (batch + 127) / 128;
+  if (n == 64)
+    lean::lean_debug_ifft_kernel<64><<<blocks, 128, 0, stream>>>(in_ptr, out_ptr, batch);
+  else
+    lean::lean_debug_ifft_kernel<128><<<blocks, 128, 0, stream>>>(in_ptr, out_ptr, batch);
+  auto err = cudaGetLastError();
+  TORCH_CHECK(err == cudaSuccess, "lean_debug_ifft launch failed: ", cudaGetErrorString(err));
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() =
       "Fused frequency-padded inverse real FFT + Parseval moments + max/argmax "
@@ -644,6 +672,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "caller-owned [corr_sum, corr_sum2, best_packed] with a global hyp_offset",
         pybind11::arg("c"), pybind11::arg("num_psi"), pybind11::arg("hyp_offset") = 0,
         pybind11::arg("outs") = std::vector<torch::Tensor>{});
+  m.def("lean_debug_ifft", &lean_debug_ifft,
+        "Test entry: unnormalized inverse DFT (N=64 or 128) of complex64 (B, N) rows via "
+        "the generated register-resident transforms",
+        pybind11::arg("x"));
   m.def("lean_sentinel_packed", &lean_sentinel_packed,
         "int64 bit pattern of the packed (-inf, 0) sentinel best_packed is pre-filled "
         "with");
