@@ -64,44 +64,65 @@ def main(num_particles, num_hyps, n_psis, pixel_batch, hyp_batch, repeats, svd_c
     store=FeaturizedImageStore(n_px, device=dev)
     gc.collect(); torch.cuda.empty_cache()
     configs=[("fp32 baseline (lean kernel)", dict(precision="fp32", use_cuda_graph=False)),
+             ("pure torch (irfft + compiled reduce)", dict(precision="fp32", use_fused_kernel=False)),
+             ("fp32, cuFFTDx kernel (retuned EPT)", dict(precision="fp32", _cufftdx=True)),
              ("fp32 + cuda graph",            dict(precision="fp32", use_cuda_graph=True)),
              ("fp16",                         dict(precision="fp16", use_cuda_graph=False)),
-             ("fp16 + cuda graph",            dict(precision="fp16", use_cuda_graph=True))]
+             ("fp16 + cuda graph",            dict(precision="fp16", use_cuda_graph=True)),
+             ("fp16 + cuda graph (2 streams)", dict(precision="fp16", use_cuda_graph=2))]
     def timed(fn, reps):
         fn(); torch.cuda.synchronize(); ts=[]
         for _ in range(reps):
             t0=time.perf_counter(); out=fn(); torch.cuda.synchronize(); ts.append(time.perf_counter()-t0)
         return statistics.median(ts), out
+    from panther_em.inference.search.utils import build_layout_weights
+    from panther_em.inference.search.tiling import FeatureTiling
+    tiling=FeatureTiling.from_extents(rects, device=dev)
+    tw,_=timed(lambda: build_layout_weights(recon, tiling), 3)
+    print(f"per-call fixed cost: build_layout_weights (U*S for all {int(hyp_all.numel())} hypotheses) = {tw*1e3:.1f} ms")
+    n_img_px=n_px//imgs.shape[0]
+    small_px=torch.arange(min(pixel_batch, n_img_px), device=dev)   # one pixel batch per image
+    n_small=int(small_px.numel())*imgs.shape[0]
     for n_psi in [int(v) for v in n_psis.split(",")]:
         print(f"\n===== n_psi={n_psi} pixel_batch={pixel_batch} hyp_batch={hyp_batch} =====")
-        def run(pb=pixel_batch, hb=hyp_batch, **kw):
-            return compressed_search(imgs, recon, rects, pixel_batch=pb, hyp_batch=hb, n_psi=n_psi,
-                                     feature_chunk=32, hypothesis_indexes=hyps, store=store, show_progress=False, **kw)
+        from panther_em.inference.search import fused_kernel_loader as _fkl
+        _lean_supported=_fkl.lean_supported
+        def run(pb=pixel_batch, hb=hyp_batch, px=None, _cufftdx=False, **kw):
+            # _cufftdx: force the cuFFTDx block-FFT kernel path (pre-lean fused kernel, retuned EPT)
+            _fkl.lean_supported=(lambda *a, **k: False) if _cufftdx else _lean_supported
+            try:
+                return compressed_search(imgs, recon, rects, pixel_batch=pb, hyp_batch=hb, n_psi=n_psi,
+                                         feature_chunk=32, hypothesis_indexes=hyps, pixel_index=px, store=store,
+                                         show_progress=False, **kw)
+            finally:
+                _fkl.lean_supported=_lean_supported
         run(precision="fp32")  # featurize the persistent store once (excluded from timing)
         torch.cuda.synchronize()
-        ref=None; corr=n_px*int(hyps.numel())*n_psi
+        ref=None; corr=n_px*int(hyps.numel())*n_psi; corr_small=n_small*int(hyps.numel())*n_psi
+        def report(label, kw, pb=pixel_batch, hb=hyp_batch):
+            """End-to-end time on all pixels, and the marginal (steady-state) rate from a
+            second run on one pixel batch per image: (T_all - T_small) / (corr_all - corr_small)."""
+            t_all,maps=timed(lambda: run(pb=pb, hb=hb, **kw), repeats)
+            t_small,_=timed(lambda: run(pb=pb, hb=hb, px=small_px, **kw), repeats)
+            marg=(corr-corr_small)/max(t_all-t_small,1e-9)/1e9
+            return maps, f"{label:34s} total {t_all*1e3:8.1f} ms ({corr/t_all/1e9:6.1f} Gcorr/s e2e) | fixed ~{t_small*1e3:6.1f} ms | steady-state {marg:7.1f} Gcorr/s"
         if sweep:
-            print("--- batch-shape sweep, fp16 + cuda graph (2 streams) ---")
+            print("--- batch-shape sweep, fp16 + cuda graph ---")
             for shape in sweep.split(","):
                 pb,hb=(int(v) for v in shape.lower().split("x"))
-                for streams,label in ((1,"1-stream"),(True,"2-stream")):
+                for streams,label in ((1,"1-stream"),(2,"2-stream")):
                     try:
-                        t,_=timed(lambda: run(pb=pb, hb=hb, precision="fp16", use_cuda_graph=streams), repeats)
-                        print(f"  pixel_batch={pb:5d} hyp_batch={hb:5d} {label}: {t*1e3:9.1f} ms  {corr/t/1e9:7.1f} Gcorr/s", flush=True)
+                        _,line=report(f"  {pb:5d}x{hb:<5d} {label}", dict(precision="fp16", use_cuda_graph=streams), pb, hb)
+                        print(line, flush=True)
                     except Exception as e:
-                        print(f"  pixel_batch={pb:5d} hyp_batch={hb:5d} {label}: FAILED {str(e)[:100]}", flush=True)
+                        print(f"  {pb:5d}x{hb:<5d} {label}: FAILED {str(e)[:100]}", flush=True)
                 gc.collect(); torch.cuda.empty_cache()
             if skip_compare: continue
         for name,kw in configs:
-            maps=run(**kw); torch.cuda.synchronize()
-            ts=[]
-            for _ in range(repeats):
-                t0=time.perf_counter(); maps=run(**kw); torch.cuda.synchronize(); ts.append(time.perf_counter()-t0)
-            t=statistics.median(ts)
-            line=f"{name:30s} {t*1e3:9.1f} ms  {corr/t/1e9:7.1f} Gcorr/s"
+            maps,line=report(name, kw)
             if ref is None:
                 ref=maps
-                line+=f"   |mip| max {ref['mip'].abs().max().item():.3g}, zscore max {ref['zscore'].max().item():.2f}"
+                line+=f"\n{'':34s} |mip| max {ref['mip'].abs().max().item():.3g}, zscore max {ref['zscore'].max().item():.2f}"
             else:
                 mip=((maps["mip"]-ref["mip"]).abs().max()/ref["mip"].abs().max()).item()
                 z=(maps["zscore"]-ref["zscore"]).abs().max().item()
@@ -110,7 +131,7 @@ def main(num_particles, num_hyps, n_psis, pixel_batch, hyp_batch, repeats, svd_c
                 # do mismatched pixels have (near-)tied alternatives? look at their mip difference
                 mism=maps["best_index"]!=ref["best_index"]
                 worst=(maps["mip"][mism]-ref["mip"][mism]).abs().max().item() if mism.any() else 0.0
-                line+=f" | vs baseline: mip rel {mip:.1e}, zscore abs {z:.2e} (rel {zrel:.1e}), best_index agree {bi*100:.3f}%, best_psi agree {bp*100:.3f}%, max |dmip| at mismatches {worst:.2e}"
+                line+=f"\n{'':34s} vs baseline: mip rel {mip:.1e}, zscore abs {z:.2e} (rel {zrel:.1e}), best_index agree {bi*100:.3f}%, best_psi agree {bp*100:.3f}%, max |dmip| at mismatches {worst:.2e}"
             print(line, flush=True)
 if __name__=="__main__":
     main()

@@ -72,7 +72,59 @@ compiled SASS contains zero FP64 instructions.
 Isolated inner step (GEMM + reduce only) at L2-resident shapes with graphs:
 ~500 Gcorr/s (`n_psi=256`), ~340 (`n_psi=128`).
 
-REAL_DATA_PLACEHOLDER
+### 2.5 Real data (60S ribosome, K_MAX=160 / EIG_MAX=128 decomposition, rectangle `(0,0,64,64)`)
+
+`scratch/svd_search_opt/validate_real.py`, xenon particle images `640×640` → `129×129`
+valid-correlation pixels each, first 2048 of 6602 hypotheses, `pixel_batch=512`,
+`hyp_batch=512`. `|mip| ≤ 32`, z-scores up to 11.9 — comfortably inside fp16 range.
+
+| config | vs fp32 baseline (`mip` rel / z-score abs / `best_index` / `best_psi` agreement) |
+|---|---|
+| fp32, lean kernel | **bit-identical** (0 / 9.5e-7 / 100 % / 100 %) |
+| fp32 + CUDA graph | bit-identical |
+| fp16 | 1.5e-4 / 1.9e-3 (rel 1.6e-4) / 99.92 % / 99.93 %; at every disagreeing pixel the two candidates differ in `mip` by ≤ 1.4e-3 (near-ties) |
+| fp16 + CUDA graph | same as fp16 |
+
+(`n_psi=128` behaves identically: 1.5e-4 / 1.6e-3 / 99.92 % / 99.94 %.)
+
+#### Steady-state throughput on real data
+
+4 particle images → `n_px = 66 564`, 2048 hypotheses, `NumFreq = 64`, `r = 4096`.
+"Steady-state" = marginal rate `(T_all − T_one_batch_per_image) / Δcorrelations`, which
+cancels the per-call fixed cost. That fixed cost is **~215 ms per `compressed_search`
+call**, almost all of it `build_layout_weights` (gathering `U·S` for all 6602 hypotheses
+from the decomposition result) — irrelevant for a full micrograph, dominant for small
+calls, and the reason the tiny first validation run showed ~35 Gcorr/s for everything.
+
+| config (`pixel_batch × hyp_batch = 512×512`) | n_psi=256 | n_psi=128 |
+|---|---|---|
+| pure torch (cgemm + `irfft` + compiled reduce) | 21 Gcorr/s | (~19 synthetic) |
+| fp32 cgemm + cuFFTDx fused kernel, retuned EPT (the pre-existing design) | 96 | |
+| _(same with the original EPT=8 kernel, estimated from the 2.4× kernel ratio)_ | _~70_ | |
+| fp32 cgemm + lean kernel (**exact**, default now) | 121 | 64 |
+| fp16 tensor-core GEMM + lean kernel, eager loop | **313–329** | **175** |
+| fp16 + CUDA graph, 1 stream | 312–319 (≈ eager) | 175 |
+| fp16 + CUDA graph, 2 streams | 310–312 | 157 |
+
+fp16 batch-shape sensitivity on real data (`n_psi=256`): `512×512` ≈ `1024×256` ≈
+`1024×512` ≈ 300–320 Gcorr/s, `256×1024` / `512×1024` / `512×2048` 5–15 % lower. Two
+streams were never better and cost 10 % at `n_psi=128`.
+
+On this workload the eager fp16 loop is already GPU-bound (≈0.2 ms of GPU work per
+hypothesis batch against ≈40 µs of Python), so the graph's only remaining gain is the
+few-µs gaps between kernels — an ~10 % effect in isolation (0.71 vs 0.79 ms per pixel
+batch) that is inside run-to-run noise on real data. `use_cuda_graph` is therefore
+optional here; it matters when batches are made small (many tiny launches).
+
+Kernel-level profile of one `512 × (4 × 512)` pixel batch (torch profiler, identical on
+torch 2.11 and 2.13): GEMM `ampere_fp16_s1688gemm_fp16_128x128` 0.080 ms and
+`lean_irfft_stats_transposed<64,4,half2>` 0.074 ms per hypothesis batch; everything
+else (feature conversion, fills, the 16 MB input copy) < 0.05 ms per pixel batch.
+Eager 0.79 ms vs graph 0.71 ms per pixel batch (339 vs 381 Gcorr/s). With two streams
+both kernels slow down (0.42 / 0.45 ms) — concurrent execution costs more than the
+overlap gains, so `use_cuda_graph=True` now means one stream. The lower graph numbers
+in the first real-data pass came from a second graph capture for the trailing partial
+pixel batch; partial batches now run eagerly.
 
 ## 3. Things that did not pan out / were ruled out
 * fp16 *input* to the cuFFTDx kernel: no gain (it was compute/MIO-bound, not DRAM-bound).
@@ -100,4 +152,32 @@ REAL_DATA_PLACEHOLDER
   the original buffers.
 
 ## 5. Future directions
-FUTURE_PLACEHOLDER
+Ordered by expected payoff / effort:
+
+1. **Batch-shape policy in `_run_stage`.** Throughput now depends mostly on keeping the
+   per-batch spectrum L2-resident (`pixel_batch * hyp_batch * NumFreq * 4 B ≲ 64 MB`) while
+   keeping the GEMM wide enough. Auto-pick `hyp_batch` from `NumFreq`/L2 size instead of
+   leaving both knobs to the caller; the real-data sweep below is the starting table.
+2. **Lean kernel, 4 threads per pair at `n_psi=256`** (two 32-point Hermitian-packed
+   IDFTs per thread, 64 registers): occupancy 2×, likely 1.3–1.5× on the L2-resident
+   reduce where the kernel is compute-bound (from L2 it already does ~1 Tcorr/s).
+3. **fp16 spectrum from the multi-region path with TF32-style accuracy**: currently
+   multi-region fp16 also writes complex32 slabs; if 4e-4 turns out too coarse for the
+   multi-precision error bounds, the `tf32` precision is a 1.9× drop-in with 3e-4 error,
+   or keep fp16 GEMMs but with `out_dtype=float32` slabs (2× reduce bytes).
+4. **Overlap featurization / H2D staging with the search loop** on a second stream for
+   CPU-resident feature stores — outside this scope but now the next-largest gap once
+   the inner loop is fast.
+5. **Deterministic accumulation**: the in-kernel path uses fp32 atomics for `corr_sum`
+   / `corr_sum2` (order nondeterministic at the 1e-7 level). A per-block partial-sum
+   buffer + tree reduce would make results bit-reproducible at small cost.
+6. **Larger `NumFreq` (65–128) in the lean kernel**: needs a 128-point register FFT per
+   pair (256 registers → 2 threads per residue pair); the cuFFTDx fallback covers it
+   today at the retuned EPT.
+7. **Fusion is not the next step.** Holding `C` on-chip forces small tiles and 3–6×
+   operand re-streaming; the L2-resident write-once/read-once round trip is cheaper on
+   this GPU. Revisit only on parts with much larger shared memory (Hopper's 228 KB +
+   TMA) where a `64×64`-pair tile of complex32 `C` (1 MB) still does not fit — i.e.
+   probably never for this problem shape.
+8. **FP8 contraction**: 2× the fp16 rate on Ada, but 3-bit mantissa; would need
+   per-row scaling and an accuracy study against the reconstruction error bounds.

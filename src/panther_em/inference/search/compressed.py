@@ -211,18 +211,19 @@ class _HypLoopGraph:
         n_freq: int,
         n_psi: int,
         precision: Precision,
-        num_streams: int = 2,
+        num_streams: int = 1,
     ) -> _HypLoopGraph | None:
         """Capture, or return ``None`` if the loop is not capturable here.
 
         Parameters
         ----------
         num_streams : int, optional
-            ``2`` alternates consecutive hypothesis batches between two streams inside
-            the graph so one batch's tensor-core GEMM overlaps the previous batch's
-            reduce (the in-kernel accumulate is atomic, so order does not matter).
-            Helps most when batches are small enough for the spectrum to stay
-            L2-resident. ``1`` keeps everything serial.
+            ``1`` (default) keeps everything serial. ``2`` alternates consecutive
+            hypothesis batches between two streams inside the graph so one batch's
+            tensor-core GEMM overlaps the previous batch's reduce (the in-kernel
+            accumulate is atomic, so order does not matter) -- measured slower on an
+            RTX 6000 Ada, where the concurrent kernels slow each other down more than
+            the overlap gains.
         """
         device = y_example.device
         y_static = y_example.detach().clone().contiguous()
@@ -385,9 +386,10 @@ def _run_stage(
         L2-resident. Requires a CUDA ``compute_device``, contiguous hypothesis
         indexes and the in-kernel accumulate path
         (:meth:`FusedPixelStats.inkernel_supported`); silently runs the eager loop
-        otherwise. ``True`` alternates consecutive hypothesis batches over two
-        streams inside the graph (GEMM of one batch overlapping the reduce of the
-        previous); pass ``1`` for a single serial stream. Defaults to ``False``.
+        otherwise. ``True`` (or ``1``) replays on one stream; ``2`` alternates
+        consecutive hypothesis batches over two streams inside the graph, which
+        measured slower on Ada (the GEMM and the reduce contend for the same SMs).
+        Defaults to ``False``.
     **polar_to_cart_kwargs
         Forwarded to kernel construction when featurizing cells.
 
@@ -496,7 +498,10 @@ def _run_stage(
         and compute_device.type == "cuda"
         and stats_cls is FusedPixelStats
     )
-    graph_streams = 1 if use_cuda_graph == 1 and use_cuda_graph is not True else 2
+    # True -> one stream. Two streams (use_cuda_graph=2) run a batch's GEMM
+    # concurrently with the previous batch's reduce; measured on an RTX 6000 Ada that
+    # slows *both* kernels (they contend for the same SMs and L2) for a net loss.
+    graph_streams = 2 if use_cuda_graph == 2 and use_cuda_graph is not True else 1
     hyp_graph: _HypLoopGraph | None = None
 
     for stage_start, stage_end, Y_stage in stager.stages():
@@ -513,7 +518,10 @@ def _run_stage(
             else:
                 pixel_stats.clear()
 
-            if graph_mode:
+            # Only full-size pixel batches go through the graph: a trailing partial
+            # batch would need its own capture (warm-ups + instantiate), which costs
+            # more than running that one batch eagerly.
+            if graph_mode and n == pixel_batch:
                 if hyp_graph is None:
                     hyp_graph = _HypLoopGraph.try_capture(
                         tiling,
@@ -679,9 +687,9 @@ def compressed_search(
     precision : {"fp32", "tf32", "fp16"}, optional
         Contraction precision; see :func:`_run_stage`. Defaults to ``"fp32"``.
     use_cuda_graph : bool or int, optional
-        Replay each pixel batch's hypothesis loop as one CUDA graph (``True``: two
-        interleaved streams, ``1``: one stream); see :func:`_run_stage`. Defaults to
-        ``False``.
+        Replay each pixel batch's hypothesis loop as one CUDA graph (``True``/``1``:
+        one stream, ``2``: two interleaved streams); see :func:`_run_stage`. Defaults
+        to ``False``.
     **polar_to_cart_kwargs
         Forwarded to kernel construction.
 
