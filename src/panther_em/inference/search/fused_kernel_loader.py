@@ -159,6 +159,8 @@ def _try_compile() -> Any:
             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
             "-U__CUDA_NO_HALF2_OPERATORS__",
             "--expt-relaxed-constexpr",
+            "-Xptxas",
+            "-v",  # register/spill report in the (PANTHER_EM_FUSED_KERNEL_VERBOSE) build log
             *defines,
             *gencode,
         ]
@@ -186,6 +188,105 @@ def _try_compile() -> Any:
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
+LEAN_NUM_PSI = (128, 256)
+LEAN_MAX_NUM_FREQ = 64
+
+
+def lean_supported(n_psi: int, n_freq: int) -> bool:
+    """Whether the register-resident kernel covers ``(n_psi, n_freq)``.
+
+    Any ``n_freq`` in ``[1, 64]`` at ``n_psi`` in ``{128, 256}``; the cuFFTDx block-FFT
+    kernel (:func:`fused_irfft_stats_transposed`) remains the fallback elsewhere.
+    """
+    return int(n_psi) in LEAN_NUM_PSI and 1 <= int(n_freq) <= LEAN_MAX_NUM_FREQ
+
+
+@overload
+def lean_irfft_stats_transposed(
+    c: torch.Tensor, n_psi: int, decode: Literal[True] = True
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None: ...
+@overload
+def lean_irfft_stats_transposed(
+    c: torch.Tensor, n_psi: int, decode: Literal[False]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None: ...
+def lean_irfft_stats_transposed(
+    c: torch.Tensor,
+    n_psi: int,
+    decode: bool = True,
+    hyp_offset: int = 0,
+    outs: list[torch.Tensor] | None = None,
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | None
+):
+    """Register-resident fused psi-recovery + statistics (see lean_irfft_stats.cuh).
+
+    Same contract as :func:`fused_irfft_stats_transposed` -- ``(s1, s2, vmax, amax)``
+    or the raw ``(s1, s2, argmax_packed)`` -- but ~6x faster at ``n_psi=256`` and
+    accepting the fp16 contraction output directly.
+
+    Parameters
+    ----------
+    c : torch.Tensor
+        Contiguous ``(NumFreq, P, Q)`` spectrum, complex64 **or complex32**; a float16
+        ``(NumFreq, P, 2Q)`` tensor of interleaved ``(re, im)`` pairs is also accepted.
+        ``NumFreq`` may be anything in ``[1, 64]``.
+    n_psi : int
+        Full in-plane-angle length, 128 or 256.
+    decode : bool, optional
+        See :func:`fused_irfft_stats`.
+    hyp_offset : int, optional
+        Global index of this batch's first hypothesis. Baked into the packed argmax
+        as ``(hyp_offset + q) * n_psi + psi`` so results accumulated across batches
+        (see ``outs``) decode straight to global hypothesis ids. Defaults to ``0``.
+    outs : list[torch.Tensor], optional
+        ``[corr_sum, corr_sum2, best_packed]`` running state (``float32``,
+        ``float32``, ``int64``; each ``(P,)``) to accumulate into in place instead of
+        returning fresh outputs. ``best_packed`` must start at
+        :func:`lean_sentinel_packed`. With this the whole hypothesis loop needs no
+        per-batch accumulate kernels at all.
+
+    Returns
+    -------
+    tuple | None
+        ``None`` when the extension is unavailable, the config is unsupported, or the
+        kernel raised (a warning is issued once) -- callers fall back.
+    """
+    global _warned_runtime_failure
+
+    module = _try_compile()
+    if module is None:
+        return None
+    n_freq = int(c.shape[0])
+    if not lean_supported(n_psi, n_freq):
+        return None
+    try:
+        s1, s2, argmax_packed = module.lean_irfft_stats_transposed(
+            c, int(n_psi), int(hyp_offset), list(outs) if outs is not None else []
+        )
+    except Exception as exc:
+        if not _warned_runtime_failure:
+            warnings.warn(
+                "Lean iRFFT+stats CUDA kernel raised at runtime, falling back to the "
+                f"next path for this call: {exc}",
+                UserWarning,
+                stacklevel=3,
+            )
+            _warned_runtime_failure = True
+        return None
+    if not decode:
+        return s1, s2, argmax_packed
+    vmax, amax = decode_argmax_packed(argmax_packed)
+    return s1, s2, vmax, amax
+
+
+def lean_sentinel_packed() -> int | None:
+    """int64 bit pattern of the packed ``(-inf, 0)`` sentinel, or ``None`` if unavailable."""
+    module = _try_compile()
+    return int(module.lean_sentinel_packed()) if module is not None else None
+
+
 def get_supported_configs() -> list[tuple[int, int, int, int]] | None:
     """List of supported ``(n_psi, num_freq, fpb, ept)`` tuples.
 

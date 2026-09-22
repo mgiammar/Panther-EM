@@ -80,6 +80,8 @@ def incremental_search(
         Callable[[dict[str, torch.Tensor], torch.Tensor], torch.Tensor | None] | None
     ) = None,
     use_fused_kernel: bool = True,
+    precision: str = "fp32",
+    use_cuda_graph: bool | int = False,
     stage_bytes: int = DEFAULT_STAGE_BYTES,
     **polar_to_cart_kwargs: Any,
 ) -> Iterator[dict[str, torch.Tensor]]:
@@ -134,6 +136,12 @@ def incremental_search(
         statistics and the pixels it ran on to the follow-up pixel mask for the next
         stage. Returning ``None`` (the default behaviour when omitted) keeps the same
         pixel set.
+    precision : {"fp32", "tf32", "fp16"}, optional
+        Contraction precision forwarded to every stage; see
+        :func:`~panther_em.inference.search.compressed._run_stage`.
+    use_cuda_graph : bool, optional
+        Replay each pixel batch's hypothesis loop as one CUDA graph; see
+        :func:`~panther_em.inference.search.compressed._run_stage`.
     use_fused_kernel : bool, optional
         Attempt the fused CUDA iRFFT+stats kernel (see
         :class:`~panther_em.inference.search.fused_statistics.FusedPixelStats`),
@@ -190,6 +198,8 @@ def incremental_search(
             compute_device=compute_device,
             use_fused_kernel=use_fused_kernel,
             stage_bytes=stage_bytes,
+            precision=precision,  # type: ignore[arg-type]
+            use_cuda_graph=use_cuda_graph,
             **polar_to_cart_kwargs,
         )
 
