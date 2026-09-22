@@ -184,19 +184,25 @@ class FusedPixelStats(PixelStats):
             )
             if result is not None:
                 return result
-            # 2. cuFFTDx block-FFT kernel (complex64 only).
-            if spectrum.dtype == torch.complex64:
-                result = (
-                    fused_kernel_loader.fused_irfft_stats_transposed(
-                        transposed, num_psi, decode=True
-                    )
-                    if decode
-                    else fused_kernel_loader.fused_irfft_stats_transposed(
-                        transposed, num_psi, decode=False
-                    )
+            # 2. cuFFTDx block-FFT kernel (complex64 only): a complex32 spectrum
+            #    (fp16 contraction, NumFreq > 64) is converted once, in place of
+            #    layout, rather than converted and then copied again below.
+            transposed64 = (
+                transposed
+                if spectrum.dtype == torch.complex64
+                else transposed.to(torch.complex64)
+            )
+            result = (
+                fused_kernel_loader.fused_irfft_stats_transposed(
+                    transposed64, num_psi, decode=True
                 )
-                if result is not None:
-                    return result
+                if decode
+                else fused_kernel_loader.fused_irfft_stats_transposed(
+                    transposed64, num_psi, decode=False
+                )
+            )
+            if result is not None:
+                return result
 
         # 3. Non-native layout: cuFFTDx kernel with an explicit .contiguous() copy.
         if spectrum.dtype != torch.complex64:
