@@ -94,6 +94,41 @@ the algorithm as:
 3.  Repeat though pre-processing stage with the updated image mask and a selected
     ``r_{i+1} > r_{i}``. NOTE: Can leverage pre-calculated data, like previous kernels,
     if stored appropriately.
+
+
+Performance Backends
+--------------------
+The inner-product search stage (step 3 above) is where all the time goes, and it has
+three switchable backends layered on the same algorithm:
+
+*   **Contraction** (:meth:`FeatureTiling.run`, ``precision=``): ``"fp32"`` cuBLAS
+    cgemm (default), ``"tf32"`` the same on TF32 tensor cores, or ``"fp16"`` -- a
+    real-valued "4M" GEMM on FP16 tensor cores whose interleaved ``(re, im)`` output
+    columns make the fp16 result bit-identical in memory to a ``(k, P, N)`` complex
+    tensor. About 4x the cgemm rate, ~4e-4 relative error in the correlations. Any
+    multi-rectangle tiling is planned as one GEMM per run of ``k`` with a constant
+    covering-region set (:attr:`FeatureTiling.k_intervals`), written straight into its
+    ``k``-slab of the spectrum.
+*   **psi recovery + statistics** (:class:`FusedPixelStats`): a register-resident CUDA
+    kernel (``csrc/lean_irfft_stats.cuh``) does the zero-padded iRFFT, the Parseval
+    moments and the max/argmax with no shared-memory traffic, reading complex64 or
+    complex32 spectra in the GEMM's native layout; it is exact w.r.t. the torch path
+    and DRAM-bandwidth bound. It can also accumulate straight into the running
+    per-pixel state across all hypothesis batches (a global hypothesis offset is
+    baked into the packed argmax), so a stage needs no per-batch accumulate kernels.
+    A cuFFTDx block-FFT kernel remains the fallback for ``NumFreq > 64`` /
+    ``n_psi == 64``, and the pure-torch reduction behind that.
+*   **Loop execution** (``use_cuda_graph=``): each pixel batch's whole hypothesis loop
+    is captured once as a CUDA graph (two interleaved streams by default) and
+    replayed, removing per-batch launch and Python overhead.
+
+Throughput is best when the per-batch spectrum ``P * N * NumFreq`` (x4 bytes in fp16)
+stays L2-resident, e.g. ``pixel_batch * hyp_batch ~ 2.5e5`` at ``NumFreq = 64`` on a
+96 MB L2. Measured on an RTX 6000 Ada with ``NumFreq = 64``, 64 eigenvectors per
+frequency and ``n_psi = 256``, the inner loop went from ~23 G correlations/s (pure
+torch) to ~145 (fp32, exact) and ~350-500 (fp16 + graph), where one correlation is
+one ``(pixel, hypothesis, psi)`` evaluation. See ``scratch/svd_search_opt/`` for the
+benchmarks behind these numbers.
 """
 
 from __future__ import annotations

@@ -78,6 +78,9 @@ for rects in ([(0,0,64,64)], [(0,0,64,32),(0,32,32,32)]):
         for precision in ("fp32","fp16"):
             te=t(lambda: run_eager(tiling,Y,W,n_psi,hyp_batch,precision,FusedPixelStats))
             hb=[(torch.arange(h0,min(h0+hyp_batch,NH),device=dev), tiling.prepare_weights(W[h0:h0+hyp_batch],precision=precision), h0) for h0 in range(0,NH,hyp_batch)]
-            st=FusedPixelStats(P,device=dev); gr=_HypLoopGraph.try_capture(tiling,hb,st,Y,n_freq=tiling.k_stop,n_psi=n_psi,precision=precision)
+            st=FusedPixelStats(P,device=dev); gr=_HypLoopGraph.try_capture(tiling,hb,st,Y,n_freq=tiling.k_stop,n_psi=n_psi,precision=precision,num_streams=1)
             tg=t(lambda: gr.run(Y)) if gr else float('nan')
-            print(f"  timing: {precision} eager(incl. weight prep) {te*1e3:8.2f} ms {corr/te/1e9:7.1f} Gcorr/s | graph replay {tg*1e3:8.2f} ms {corr/tg/1e9:7.1f} Gcorr/s")
+            st2=FusedPixelStats(P,device=dev); gr2=_HypLoopGraph.try_capture(tiling,hb,st2,Y,n_freq=tiling.k_stop,n_psi=n_psi,precision=precision,num_streams=2)
+            tg2=t(lambda: gr2.run(Y)) if gr2 else float('nan')
+            gr2.run(Y); o2=st2.finalize(); compare(o2,ref,f"CUDA graph {precision} 2-stream")
+            print(f"  timing: {precision} eager(incl. weight prep) {te*1e3:8.2f} ms {corr/te/1e9:7.1f} Gcorr/s | graph 1-stream {tg*1e3:8.2f} ms {corr/tg/1e9:7.1f} Gcorr/s | graph 2-stream {tg2*1e3:8.2f} ms {corr/tg2/1e9:7.1f} Gcorr/s")

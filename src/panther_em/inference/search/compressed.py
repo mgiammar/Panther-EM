@@ -211,7 +211,19 @@ class _HypLoopGraph:
         n_freq: int,
         n_psi: int,
         precision: Precision,
+        num_streams: int = 2,
     ) -> _HypLoopGraph | None:
+        """Capture, or return ``None`` if the loop is not capturable here.
+
+        Parameters
+        ----------
+        num_streams : int, optional
+            ``2`` alternates consecutive hypothesis batches between two streams inside
+            the graph so one batch's tensor-core GEMM overlaps the previous batch's
+            reduce (the in-kernel accumulate is atomic, so order does not matter).
+            Helps most when batches are small enough for the spectrum to stay
+            L2-resident. ``1`` keeps everything serial.
+        """
         device = y_example.device
         y_static = y_example.detach().clone().contiguous()
 
@@ -232,22 +244,31 @@ class _HypLoopGraph:
                 return None
         del features, probe
 
+        second = torch.cuda.Stream(device=device) if num_streams > 1 else None
+
         def body() -> None:
+            main = torch.cuda.current_stream(device)
             pixel_stats.clear()
             feats = tiling.prepare_features(y_static, precision=precision)
-            for _, prepared_weights, hyp_offset in hyp_batches:
-                spectrum = tiling.run(
-                    None,
-                    None,
-                    n_freq,
-                    prepared_weights=prepared_weights,
-                    prepared_features=feats,
-                    precision=precision,
-                )
-                assert hyp_offset is not None
-                pixel_stats.update_graphed(
-                    spectrum, hyp_offset, num_psi=n_psi, reverse_psi_axis=True
-                )
+            if second is not None:
+                second.wait_stream(main)
+            for i, (_, prepared_weights, hyp_offset) in enumerate(hyp_batches):
+                stream = second if (second is not None and i % 2 == 1) else main
+                with torch.cuda.stream(stream):
+                    spectrum = tiling.run(
+                        None,
+                        None,
+                        n_freq,
+                        prepared_weights=prepared_weights,
+                        prepared_features=feats,
+                        precision=precision,
+                    )
+                    assert hyp_offset is not None
+                    pixel_stats.update_graphed(
+                        spectrum, hyp_offset, num_psi=n_psi, reverse_psi_axis=True
+                    )
+            if second is not None:
+                main.wait_stream(second)
 
         # Warm up on a private stream (JIT/cuBLAS workspaces, kernel attributes),
         # then capture on that same stream -- see statistics._bind_capture_stream for
@@ -299,7 +320,7 @@ def _run_stage(
     use_fused_kernel: bool = True,
     stage_bytes: int = DEFAULT_STAGE_BYTES,
     precision: Precision = "fp32",
-    use_cuda_graph: bool = False,
+    use_cuda_graph: bool | int = False,
     **polar_to_cart_kwargs: Any,
 ) -> dict[str, torch.Tensor]:
     r"""Run one tiling end-to-end and reduce it to per-pixel statistics.
@@ -356,7 +377,7 @@ def _run_stage(
         contraction as a real GEMM on FP16 tensor cores (~4x the complex64 rate) and
         hands the fused reduce kernel a complex32 spectrum; relative error in the
         correlations is ~4e-4. Defaults to ``"fp32"``.
-    use_cuda_graph : bool, optional
+    use_cuda_graph : bool or int, optional
         Capture each pixel batch's entire hypothesis loop (feature conversion,
         every contraction, every fused reduce + in-kernel accumulate) in one CUDA
         graph and replay it per pixel batch. Removes all per-batch launch and Python
@@ -364,7 +385,9 @@ def _run_stage(
         L2-resident. Requires a CUDA ``compute_device``, contiguous hypothesis
         indexes and the in-kernel accumulate path
         (:meth:`FusedPixelStats.inkernel_supported`); silently runs the eager loop
-        otherwise. Defaults to ``False``.
+        otherwise. ``True`` alternates consecutive hypothesis batches over two
+        streams inside the graph (GEMM of one batch overlapping the reduce of the
+        previous); pass ``1`` for a single serial stream. Defaults to ``False``.
     **polar_to_cart_kwargs
         Forwarded to kernel construction when featurizing cells.
 
@@ -467,12 +490,13 @@ def _run_stage(
     # asynchronous H2D copies. If `store_device == compute_device`, then a no-op.
     stager = PixelStager(store, pixel_index, compute_device, stage_bytes=stage_bytes)
 
-    graph_mode = (
+    graph_mode = bool(
         use_cuda_graph
         and is_contiguous_hyps
         and compute_device.type == "cuda"
         and stats_cls is FusedPixelStats
     )
+    graph_streams = 1 if use_cuda_graph == 1 and use_cuda_graph is not True else 2
     hyp_graph: _HypLoopGraph | None = None
 
     for stage_start, stage_end, Y_stage in stager.stages():
@@ -499,6 +523,7 @@ def _run_stage(
                         n_freq=n_freq,
                         n_psi=n_psi,
                         precision=precision,
+                        num_streams=graph_streams,
                     )
                     if hyp_graph is None:
                         graph_mode = False  # not capturable here; eager from now on
@@ -586,7 +611,7 @@ def compressed_search(
     use_fused_kernel: bool = True,
     stage_bytes: int = DEFAULT_STAGE_BYTES,
     precision: Precision = "fp32",
-    use_cuda_graph: bool = False,
+    use_cuda_graph: bool | int = False,
     **polar_to_cart_kwargs: Any,
 ) -> dict[str, torch.Tensor]:
     r"""Single-stage SVD-2DTM search over one selection of feature rectangles.
@@ -653,9 +678,10 @@ def compressed_search(
         otherwise.
     precision : {"fp32", "tf32", "fp16"}, optional
         Contraction precision; see :func:`_run_stage`. Defaults to ``"fp32"``.
-    use_cuda_graph : bool, optional
-        Replay each pixel batch's hypothesis loop as one CUDA graph; see
-        :func:`_run_stage`. Defaults to ``False``.
+    use_cuda_graph : bool or int, optional
+        Replay each pixel batch's hypothesis loop as one CUDA graph (``True``: two
+        interleaved streams, ``1``: one stream); see :func:`_run_stage`. Defaults to
+        ``False``.
     **polar_to_cart_kwargs
         Forwarded to kernel construction.
 

@@ -33,14 +33,17 @@ __device__ __forceinline__ unsigned long long pack(float v, unsigned idx) {
 }
 
 // Block = 128 threads; PAIRS = 128 / T hypotheses per block; grid = P * ceil(Q / PAIRS).
-template <unsigned R, typename InT>
+// FMAX: compile-time upper bound on NumFreq (a multiple of 8); F <= FMAX is the runtime
+// value. Only the last 8 frequencies carry a runtime predicate -- predicating all 64 on a
+// runtime F costs enough registers to spill the 128-float working set to local memory.
+template <unsigned FMAX, unsigned R, typename InT>
 __global__ void __launch_bounds__(128, 3)
 lean_irfft_stats_transposed(const InT* __restrict__ c, float* __restrict__ s1,
                             float* __restrict__ s2, unsigned long long* __restrict__ argmax_packed,
                             unsigned F, unsigned P, unsigned Q, unsigned q_tiles,
                             unsigned hyp_offset) {
   static_assert(R == 2 || R == 4, "R in {2,4}");
-  // F (NumFreq, 1..64) is a runtime argument: the unrolled loops below predicate on it.
+  static_assert(FMAX % 8 == 0 && FMAX >= 8 && FMAX <= 64, "FMAX in {8,...,64}");
   constexpr unsigned T = R / 2;
   constexpr unsigned NPSI = 64 * R;
   constexpr unsigned PAIRS = 128 / T;
@@ -60,7 +63,7 @@ lean_irfft_stats_transposed(const InT* __restrict__ c, float* __restrict__ s1,
   // ---- 1. load C_k (natural order). Inactive lanes load zeros.
 #pragma unroll
   for (unsigned k = 0; k < 64; ++k) {
-    if (k < F) {
+    if (k < FMAX && (k + 8 < FMAX || k < F)) {  // runtime predicate on the tail group only
       const float2 v = to_f2(c[k * PQ + base]);
       re[k] = active ? v.x : 0.f;
       im[k] = active ? v.y : 0.f;
@@ -76,8 +79,8 @@ lean_irfft_stats_transposed(const InT* __restrict__ c, float* __restrict__ s1,
     // Constant trip count + predicate (NOT `k < F` as the bound): a runtime trip count
     // would stop the full unroll and push re[]/im[] out of registers into local memory.
 #pragma unroll
-    for (unsigned k = 1; k < 64; ++k) {
-      if (k < F) { pw = fmaf(2.f * re[k], re[k], pw); pw = fmaf(2.f * im[k], im[k], pw); }
+    for (unsigned k = 1; k < FMAX; ++k) {  // re/im are already zero for k >= F
+      pw = fmaf(2.f * re[k], re[k], pw); pw = fmaf(2.f * im[k], im[k], pw);
     }
   }
   // ---- 3. D scaling (2x for k>=1), residue twiddle t^{k h}, Hermitian pack.
@@ -131,14 +134,31 @@ lean_irfft_stats_transposed(const InT* __restrict__ c, float* __restrict__ s1,
   }
 }
 
+template <unsigned FMAX, unsigned R, typename InT>
+inline void launch_lean_transposed_fmax(const InT* c, float* s1, float* s2, unsigned long long* pk,
+                                        unsigned F, unsigned P, unsigned Q, unsigned hyp_offset,
+                                        cudaStream_t stream) {
+  constexpr unsigned PAIRS = 128 / (R / 2);
+  const unsigned q_tiles = (Q + PAIRS - 1) / PAIRS;
+  lean_irfft_stats_transposed<FMAX, R, InT><<<P * q_tiles, 128, 0, stream>>>(
+      c, s1, s2, pk, F, P, Q, q_tiles, hyp_offset);
+}
+
+// Runtime NumFreq F in [1, 64] -> the smallest FMAX (multiple of 8) instantiation.
 template <unsigned R, typename InT>
 inline void launch_lean_transposed(const InT* c, float* s1, float* s2, unsigned long long* pk,
                                    unsigned F, unsigned P, unsigned Q, unsigned hyp_offset,
                                    cudaStream_t stream) {
-  constexpr unsigned PAIRS = 128 / (R / 2);
-  const unsigned q_tiles = (Q + PAIRS - 1) / PAIRS;
-  lean_irfft_stats_transposed<R, InT><<<P * q_tiles, 128, 0, stream>>>(c, s1, s2, pk, F, P, Q, q_tiles,
-                                                                        hyp_offset);
+  switch ((F + 7) / 8) {
+    case 1: launch_lean_transposed_fmax<8, R, InT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream); break;
+    case 2: launch_lean_transposed_fmax<16, R, InT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream); break;
+    case 3: launch_lean_transposed_fmax<24, R, InT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream); break;
+    case 4: launch_lean_transposed_fmax<32, R, InT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream); break;
+    case 5: launch_lean_transposed_fmax<40, R, InT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream); break;
+    case 6: launch_lean_transposed_fmax<48, R, InT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream); break;
+    case 7: launch_lean_transposed_fmax<56, R, InT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream); break;
+    default: launch_lean_transposed_fmax<64, R, InT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream); break;
+  }
 }
 
 }  // namespace lean

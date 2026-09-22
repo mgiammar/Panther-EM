@@ -81,7 +81,7 @@ def incremental_search(
     ) = None,
     use_fused_kernel: bool = True,
     precision: str = "fp32",
-    use_cuda_graph: bool = False,
+    use_cuda_graph: bool | int = False,
     stage_bytes: int = DEFAULT_STAGE_BYTES,
     **polar_to_cart_kwargs: Any,
 ) -> Iterator[dict[str, torch.Tensor]]:

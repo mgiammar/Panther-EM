@@ -159,6 +159,8 @@ def _try_compile() -> Any:
             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
             "-U__CUDA_NO_HALF2_OPERATORS__",
             "--expt-relaxed-constexpr",
+            "-Xptxas",
+            "-v",  # register/spill report in the (PANTHER_EM_FUSED_KERNEL_VERBOSE) build log
             *defines,
             *gencode,
         ]
