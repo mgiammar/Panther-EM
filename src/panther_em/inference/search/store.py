@@ -8,13 +8,13 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 import torch
 
 from panther_em.inference.search.contraction import ContractionEngine, make_engine
+from panther_em.inference.search.types import Precision
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
 
     from panther_em.inference.search.types import (
         PixelSelection,
-        Precision,
         Rectangle,
         SearchGeometry,
     )
@@ -284,19 +284,26 @@ class FeatureStore:
 
     # -- groups ---------------------------------------------------------------
 
-    def group_for(self, rect: Rectangle) -> ColumnGroup | None:
-        """The group holding exactly ``rect``, if any."""
+    def group_for(
+        self, rect: Rectangle, precision: Precision | str | None = None
+    ) -> ColumnGroup | None:
+        """The group holding exactly ``rect`` (at ``precision`` when given), if any."""
         rect = tuple(int(v) for v in rect)  # type: ignore[assignment]
+        wanted = None if precision is None else Precision.coerce(precision)
         for g in self.groups:
-            if g.rect == rect:
+            if g.rect == rect and (wanted is None or g.precision is wanted):
                 return g
         return None
 
     def add_group(self, rect: Rectangle, precision: Precision | str) -> ColumnGroup:
-        """Allocate zeroed blocks for a new rectangle (no featurization here)."""
+        """Allocate zeroed blocks for a new rectangle (no featurization here).
+
+        The same rectangle may be held once per precision (a later stage at a higher
+        precision gets its own group).
+        """
         rect = tuple(int(v) for v in rect)  # type: ignore[assignment]
-        if self.group_for(rect) is not None:
-            raise ValueError(f"rectangle {rect} already has a group")
+        if self.group_for(rect, precision) is not None:
+            raise ValueError(f"rectangle {rect} already has a {precision} group")
         engine = make_engine(precision)
         group = ColumnGroup(
             id=len(self.groups),

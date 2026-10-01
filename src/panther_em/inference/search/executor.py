@@ -154,13 +154,10 @@ def plan_stage(
     layout = spec.layout()
     groups = []
     for rect in layout.rectangles:
-        group = store.group_for(rect)
+        group = store.group_for(rect, spec.precision)
         if group is None:
-            raise ValueError(f"store has no group for rectangle {rect}")
-        if group.precision is not spec.precision:
             raise ValueError(
-                f"group {rect} is stored at {group.precision.value}, stage wants "
-                f"{spec.precision.value}"
+                f"store has no {spec.precision.value} group for rectangle {rect}"
             )
         groups.append(group)
     if memory.block_pixels != store.block_pixels:
@@ -296,6 +293,9 @@ class StageExecutor:
             else contextlib.nullcontext()
         )
         with stream:
+            if ctx.compute is not None:
+                # Inputs (store blocks, prepared weights) came from other streams.
+                ctx.compute.wait_stream(torch.cuda.current_stream(ctx.device))
             for block in store.blocks(plan.groups):
                 if loop is None:
                     loop = ctx.loop_for(
@@ -312,4 +312,7 @@ class StageExecutor:
                 block.release(None)
                 if progress is not None:
                     progress(block.n_valid)
+        if ctx.compute is not None:
+            # Hand the maps back to the caller's stream.
+            torch.cuda.current_stream(ctx.device).wait_stream(ctx.compute)
         return maps

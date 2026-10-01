@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
+import warnings
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
 import torch
 
 from panther_em.inference.search.ledger import PixelLabel
 
 if TYPE_CHECKING:
+    from panther_em.inference.search.ledger import PixelLedger
     from panther_em.inference.search.schedule import StageSpec
 
 
@@ -115,7 +117,7 @@ class Decision(Protocol):
 
     def __call__(
         self,
-        ledger: object,
+        ledger: PixelLedger,
         pixel_index: torch.Tensor,
         stage: StageSpec,
         stage_index: int,
@@ -131,7 +133,7 @@ class NoDecision:
 
     def __call__(
         self,
-        ledger: object,
+        ledger: PixelLedger,
         pixel_index: torch.Tensor,
         stage: StageSpec,
         stage_index: int,
@@ -142,3 +144,262 @@ class NoDecision:
     def __repr__(self) -> str:
         """Stable repr."""
         return "NoDecision()"
+
+
+def _resolve_error(decision_error: float | None, stage: StageSpec) -> float:
+    if decision_error is not None:
+        return float(decision_error)
+    if stage.error is None:
+        raise ValueError(
+            f"stage {stage.name or stage.rectangles} carries no reconstruction error; "
+            "supply StageSpec.error, an ErrorModel, or the classifier's `error`"
+        )
+    return float(stage.error)
+
+
+class ZScoreIntervalClassifier:
+    """Accept / reject by the worst-case z-score interval; otherwise stay uncertain.
+
+    Parameters
+    ----------
+    threshold : float
+        z-score detection threshold.
+    error : float, optional
+        Reconstruction error to use for every stage (overrides ``StageSpec.error``).
+    units : {"relative", "absolute"}, optional
+        ``"relative"`` (default) evaluates the bound in normalized coordinates
+        (``corr = z, mu = 0, sigma = 1``) with the stage's *relative* error ``rho``.
+    """
+
+    pointwise: ClassVar[bool] = True
+    requires_error: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        threshold: float,
+        *,
+        error: float | None = None,
+        units: Literal["relative", "absolute"] = "relative",
+    ) -> None:
+        if units not in ("relative", "absolute"):
+            raise ValueError("units must be 'relative' or 'absolute'")
+        self.threshold = float(threshold)
+        self.error = error
+        self.units = units
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        ledger: PixelLedger,
+        pixel_index: torch.Tensor,
+        stage: StageSpec,
+        stage_index: int,
+    ) -> None:
+        """Classify the stage's pixels."""
+        error = _resolve_error(self.error, stage)
+        idx = pixel_index.to(ledger.device, torch.long)
+        if self.units == "relative":
+            if zscore_bound_is_vacuous(error):
+                warnings.warn(
+                    f"stage {stage_index}: relative error {error:.3f} makes the "
+                    "z-score "
+                    "bound vacuous (>= ~0.431); every pixel stays UNCERTAIN",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                ledger.set_labels(
+                    idx,
+                    torch.full_like(idx, int(PixelLabel.UNCERTAIN), dtype=torch.int8),
+                )
+                return
+            z = ledger.zscore[idx]
+            interval = zscore_error_intervals(
+                error, z, torch.zeros_like(z), torch.ones_like(z)
+            )
+        else:
+            interval = zscore_error_intervals(
+                error, ledger.mip[idx], ledger.mean[idx], ledger.std()[idx]
+            )
+        ledger.set_labels(idx, classify_zscore_interval(interval, self.threshold))
+
+    def __repr__(self) -> str:
+        """Stable repr."""
+        return (
+            f"ZScoreIntervalClassifier({self.threshold}, error={self.error}, "
+            f"units={self.units!r})"
+        )
+
+
+class ThresholdClassifier:
+    """Final decision: ``ACCEPTED`` where ``zscore > threshold``, else ``REJECTED``."""
+
+    pointwise: ClassVar[bool] = True
+    requires_error: ClassVar[bool] = False
+
+    def __init__(self, threshold: float) -> None:
+        self.threshold = float(threshold)
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        ledger: PixelLedger,
+        pixel_index: torch.Tensor,
+        stage: StageSpec,
+        stage_index: int,
+    ) -> None:
+        """Threshold the stage's pixels."""
+        idx = pixel_index.to(ledger.device, torch.long)
+        accepted = ledger.zscore[idx] > self.threshold
+        labels = torch.where(
+            accepted,
+            torch.tensor(
+                int(PixelLabel.ACCEPTED), dtype=torch.int8, device=ledger.device
+            ),
+            torch.tensor(
+                int(PixelLabel.REJECTED), dtype=torch.int8, device=ledger.device
+            ),
+        )
+        ledger.set_labels(idx, labels)
+
+    def __repr__(self) -> str:
+        """Stable repr."""
+        return f"ThresholdClassifier({self.threshold})"
+
+
+class TopFractionSelector:
+    """Keep the best ``fraction`` (or ``top_k``) pixels ``UNCERTAIN``, reject the rest.
+
+    Parameters
+    ----------
+    fraction : float, optional
+        Fraction of the stage's pixels to keep (``0 < fraction <= 1``).
+    top_k : int, optional
+        Absolute number to keep (mutually exclusive with ``fraction``).
+    key : {"zscore", "mip"}, optional
+        Ranking statistic. Defaults to ``"zscore"``.
+    per_image : bool, optional
+        Rank within each image plane instead of globally.
+    """
+
+    pointwise: ClassVar[bool] = False
+    requires_error: ClassVar[bool] = False
+
+    def __init__(
+        self,
+        fraction: float | None = None,
+        *,
+        top_k: int | None = None,
+        key: Literal["zscore", "mip"] = "zscore",
+        per_image: bool = False,
+    ) -> None:
+        if (fraction is None) == (top_k is None):
+            raise ValueError("give exactly one of fraction or top_k")
+        if fraction is not None and not (0.0 < fraction <= 1.0):
+            raise ValueError("fraction must lie in (0, 1]")
+        if top_k is not None and top_k < 1:
+            raise ValueError("top_k must be >= 1")
+        if key not in ("zscore", "mip"):
+            raise ValueError("key must be 'zscore' or 'mip'")
+        self.fraction = fraction
+        self.top_k = top_k
+        self.key = key
+        self.per_image = per_image
+
+    def _keep_count(self, n: int) -> int:
+        if self.top_k is not None:
+            return min(self.top_k, n)
+        assert self.fraction is not None
+        return max(1, round(self.fraction * n)) if n else 0
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        ledger: PixelLedger,
+        pixel_index: torch.Tensor,
+        stage: StageSpec,
+        stage_index: int,
+    ) -> None:
+        """Rank the stage's pixels and reject all but the top ones."""
+        idx = pixel_index.to(ledger.device, torch.long)
+        values = getattr(ledger, self.key)[idx]
+        labels = torch.full_like(idx, int(PixelLabel.REJECTED), dtype=torch.int8)
+        if self.per_image:
+            image_of = idx // ledger.geometry.n_pixels_per_image
+            for b in torch.unique(image_of).tolist():
+                members = torch.nonzero(image_of == b, as_tuple=False).squeeze(-1)
+                k = self._keep_count(int(members.numel()))
+                if k:
+                    top = torch.topk(values[members], k).indices
+                    labels[members[top]] = int(PixelLabel.UNCERTAIN)
+        else:
+            k = self._keep_count(int(idx.numel()))
+            if k:
+                labels[torch.topk(values, k).indices] = int(PixelLabel.UNCERTAIN)
+        ledger.set_labels(idx, labels)
+
+    def __repr__(self) -> str:
+        """Stable repr."""
+        return (
+            f"TopFractionSelector(fraction={self.fraction}, top_k={self.top_k}, "
+            f"key={self.key!r}, per_image={self.per_image})"
+        )
+
+
+class DilationAbsorb:
+    """Post-step: ``UNCERTAIN`` pixels near an ``ACCEPTED`` one become ``ABSORBED``."""
+
+    pointwise: ClassVar[bool] = False
+    requires_error: ClassVar[bool] = False
+
+    def __init__(self, radius: int) -> None:
+        if radius < 0:
+            raise ValueError("radius must be >= 0")
+        self.radius = int(radius)
+
+    def __call__(
+        self,
+        ledger: PixelLedger,
+        pixel_index: torch.Tensor,
+        stage: StageSpec,
+        stage_index: int,
+    ) -> None:
+        """Absorb on the dense label map."""
+        ledger.absorb_near_accepted(self.radius)
+
+    def __repr__(self) -> str:
+        """Stable repr."""
+        return f"DilationAbsorb({self.radius})"
+
+
+class DecisionChain:
+    """Apply decisions in order; later ones only see labels left by earlier ones."""
+
+    def __init__(self, *decisions: Decision) -> None:
+        if not decisions:
+            raise ValueError("DecisionChain needs at least one decision")
+        self.decisions = tuple(decisions)
+
+    @property
+    def pointwise(self) -> bool:
+        """True when every member is pointwise."""
+        return all(d.pointwise for d in self.decisions)
+
+    @property
+    def requires_error(self) -> bool:
+        """True when any member needs the stage error."""
+        return any(d.requires_error for d in self.decisions)
+
+    def __call__(
+        self,
+        ledger: PixelLedger,
+        pixel_index: torch.Tensor,
+        stage: StageSpec,
+        stage_index: int,
+    ) -> None:
+        """Run every member in order."""
+        for decision in self.decisions:
+            decision(ledger, pixel_index, stage, stage_index)
+
+    def __repr__(self) -> str:
+        """Stable repr."""
+        return f"DecisionChain({', '.join(repr(d) for d in self.decisions)})"

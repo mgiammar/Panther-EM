@@ -1,0 +1,372 @@
+"""The developer-facing search API: ``Searcher`` and ``SearchSession``.
+
+::
+
+    template = Template.from_hdf5("decomp.h5", device="cuda:0")
+    schedule = nested_schedule(
+        [(32, 16), (128, 48)],
+        precision=["fp16", "fp32"],
+        decision=[ZScoreIntervalClassifier(7.8), ThresholdClassifier(7.8)],
+        error_model=ErrorModel.from_result(template.result),
+    )
+    searcher = Searcher(template, schedule)
+    result = searcher.run(ImageSet.single(micrograph))
+
+A :class:`Searcher` is bound to one template and one schedule and owns the execution
+resources that amortize across images (prepared weights, captured hypothesis loops).
+A :class:`SearchSession` runs the schedule over one :class:`ImageSet`, yielding a
+:class:`~panther_em.inference.search.results.StageResult` per stage.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import torch
+
+from panther_em.inference.search.context import Planner, SearchContext
+from panther_em.inference.search.executor import StageExecutor, plan_memory, plan_stage
+from panther_em.inference.search.featurize import make_featurizer
+from panther_em.inference.search.hypotheses import HypothesisSpace
+from panther_em.inference.search.ledger import PixelLedger
+from panther_em.inference.search.results import SearchResult, StageResult
+from panther_em.inference.search.schedule import ErrorModel
+from panther_em.inference.search.store import FeatureStore
+from panther_em.inference.search.types import (
+    ImageSet,
+    PixelSelection,
+    Precision,
+    SearchGeometry,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator, Sequence
+
+    from panther_em.inference.search.basis import Template
+    from panther_em.inference.search.featurize import Featurizer, LoopOrder
+    from panther_em.inference.search.schedule import SearchSchedule
+    from panther_em.inference.search.types import BatchShape, Rectangle
+
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    """Knobs of the execution layer (everything the planner does not decide itself).
+
+    Attributes
+    ----------
+    batch : BatchShape, optional
+        Explicit ``(pixels, hypotheses)`` per contraction; ``None`` lets the planner
+        pick from the L2-residency rule.
+    block_pixels : int, optional
+        Explicit store block size (a multiple of the GEMM pixel batch).
+    use_cuda_graph, use_fused_kernel : bool
+        Allow the graphed hypothesis loop / the fused statistics kernel.
+    tile : int
+        Featurizer output tile side (grid mode).
+    cell_chunk : int
+        Kernels per featurization chunk.
+    image_batch : int
+        Boxes per inner-product GEMM (center mode).
+    loop_order : {"pixel_major", "cell_major"}
+        Featurizer loop order.
+    ledger_device : device, optional
+        Where the dense per-pixel state lives; defaults to the compute device.
+    prepared_budget : int, optional
+        Byte budget of the prepared-weight cache.
+    show_progress : bool
+        Print per-stage progress bars.
+    """
+
+    batch: BatchShape | None = None
+    block_pixels: int | None = None
+    use_cuda_graph: bool = True
+    use_fused_kernel: bool = True
+    tile: int = 1024
+    cell_chunk: int = 64
+    image_batch: int = 1024
+    loop_order: LoopOrder = "pixel_major"
+    ledger_device: torch.device | str | None = None
+    prepared_budget: int | None = None
+    show_progress: bool = False
+
+
+class Searcher:
+    """A template plus a schedule, ready to search image sets.
+
+    Parameters
+    ----------
+    template : Template
+    schedule : SearchSchedule
+        Stage errors missing where a decision needs them are filled from
+        ``error_model`` (default: the spectral model of the template).
+    execution : ExecutionConfig, optional
+    n_defocus : int, optional
+        Defocus planes every image set must carry (``ImageSet.filters``). Defaults to 1.
+    defocus_values : torch.Tensor, optional
+        ``(n_defocus,)`` labels for the planes, reported by ``SearchResult.decode()``.
+    error_model : ErrorModel, optional
+    featurizer : Featurizer, optional
+        Override the featurizer (tests inject a stub); otherwise chosen per geometry.
+    planner : Planner, optional
+    """
+
+    def __init__(
+        self,
+        template: Template,
+        schedule: SearchSchedule,
+        *,
+        execution: ExecutionConfig | None = None,
+        n_defocus: int = 1,
+        defocus_values: torch.Tensor | None = None,
+        error_model: ErrorModel | None = None,
+        featurizer: Featurizer | None = None,
+        planner: Planner | None = None,
+    ) -> None:
+        self.template = template
+        self.execution = execution or ExecutionConfig()
+        self.space = HypothesisSpace.from_result(
+            template.result, n_defocus=n_defocus, defocus_values=defocus_values
+        )
+        if schedule.requires_errors():
+            model = error_model or ErrorModel.from_result(template.result)
+            schedule = schedule.with_errors(model)
+        self.schedule = schedule
+        self._featurizer = featurizer
+        self.ctx = SearchContext(
+            template.device,
+            template.weights,
+            prepared_budget=self.execution.prepared_budget,
+            planner=planner,
+        )
+        self._validate()
+
+    def _validate(self) -> None:
+        k_max, eig_max = self.template.k_max, self.template.eig_max
+        for i, spec in enumerate(self.schedule.stages):
+            for k0, m0, ke, me in spec.rectangles:
+                if k0 + ke > k_max or m0 + me > eig_max:
+                    raise ValueError(
+                        f"stage {i}: rectangle {(k0, m0, ke, me)} exceeds the stored "
+                        f"(k_max={k_max}, eig_max={eig_max}) feature space"
+                    )
+            if spec.precision is Precision.FP16 and not self.ctx.caps.is_cuda:
+                raise ValueError(f"stage {i}: fp16 needs a CUDA device")
+            if spec.hypotheses is not None:
+                spec.hypotheses.resolve(self.space)
+
+    @property
+    def device(self) -> torch.device:
+        """Compute device."""
+        return self.template.device
+
+    def session(self, images: ImageSet) -> SearchSession:
+        """A session over one image set (iterate it for per-stage results)."""
+        return SearchSession(self, images)
+
+    def run(self, images: ImageSet) -> SearchResult:
+        """Run every stage over ``images``."""
+        return self.session(images).run_all()
+
+    def run_many(self, image_sets: Iterable[ImageSet]) -> Iterator[SearchResult]:
+        """Run the schedule over each image set in turn, reusing cached resources."""
+        for images in image_sets:
+            yield self.run(images)
+
+    def release(self) -> None:
+        """Drop cached loops and prepared weights (kernels stay with the template)."""
+        self.ctx.release()
+
+
+class SearchSession:
+    """One image set's walk through the schedule."""
+
+    def __init__(self, searcher: Searcher, images: ImageSet) -> None:
+        if images.n_defocus != searcher.space.n_defocus:
+            raise ValueError(
+                f"image set carries {images.n_defocus} defocus plane(s); the searcher "
+                f"expects {searcher.space.n_defocus}"
+            )
+        self.searcher = searcher
+        self.images = images
+        self.geometry = SearchGeometry.from_images(
+            images, searcher.template.template_shape
+        )
+        exe = searcher.execution
+        self.featurizer: Featurizer = searcher._featurizer or make_featurizer(
+            self.geometry,
+            searcher.template.kernels,
+            tile=exe.tile,
+            image_batch=exe.image_batch,
+        )
+        initial = PixelSelection.from_mask(self.geometry, images.mask)
+        self.ledger = PixelLedger(
+            self.geometry, exe.ledger_device or searcher.device, initial=initial
+        )
+        self.pixels: PixelSelection = initial
+        self.store: FeatureStore | None = None
+        self.stage_index = 0
+        self.stage_results: list[StageResult] = []
+        self.elapsed_s = 0.0
+        self._finished = False
+
+    # -- stage machinery ---------------------------------------------------------
+
+    def _prepare_store(
+        self, block_pixels: int, precision: Precision, spec_rects: Sequence[Rectangle]
+    ) -> FeatureStore:
+        """Re-block / compact the store to the current pixels and add missing groups."""
+        exe = self.searcher.execution
+        pixels = self.pixels
+        store = self.store
+        if store is None:
+            schedule = self.featurizer.schedule(self.geometry, pixels)
+            store = FeatureStore(
+                self.geometry,
+                pixels,
+                schedule.column_index,
+                block_pixels=block_pixels,
+                n_defocus=self.images.n_defocus,
+                device=self.searcher.device,
+            )
+        else:
+            keep = torch.isin(
+                store.column_index, pixels.index.to(store.column_index.device)
+            )
+            if not bool(keep.all()) or store.block_pixels != block_pixels:
+                store = store.subset(keep, block_pixels=block_pixels)
+            schedule = self.featurizer.schedule(self.geometry, pixels)
+            if not torch.equal(
+                schedule.column_index,
+                store.column_index.to(schedule.column_index.device),
+            ):
+                raise RuntimeError("featurizer column order diverged from the store's")
+        ctx = self.searcher.ctx
+        missing = [
+            rect for rect in spec_rects if store.group_for(rect, precision) is None
+        ]
+        if missing and ctx.featurize is not None:
+            # Blocks were zero-allocated on the current stream: featurize after it.
+            ctx.featurize.wait_stream(torch.cuda.current_stream(ctx.device))
+        for rect in missing:
+            group = store.add_group(rect, precision)
+            self.featurizer.produce(
+                self.images,
+                group,
+                store.writer(group),
+                schedule,
+                chunk=exe.cell_chunk,
+                order=exe.loop_order,
+                stream=ctx.featurize,
+            )
+        if missing and ctx.featurize is not None:
+            # Everything downstream (compute stream, compaction) sees complete blocks.
+            torch.cuda.current_stream(ctx.device).wait_stream(ctx.featurize)
+        self.store = store
+        return store
+
+    def _run_stage(self, index: int) -> StageResult:
+        searcher = self.searcher
+        exe = searcher.execution
+        spec = searcher.schedule.stages[index]
+        t0 = time.perf_counter()
+        memory, backend, engine, hyp_plan = plan_memory(
+            searcher.ctx,
+            spec,
+            n_pixels=len(self.pixels),
+            n_defocus=self.images.n_defocus,
+            space=searcher.space,
+            subset=spec.hypotheses,
+            batch=exe.batch,
+            block_pixels=exe.block_pixels,
+            use_cuda_graph=exe.use_cuda_graph,
+            use_fused_kernel=exe.use_fused_kernel,
+        )
+        store = self._prepare_store(
+            memory.block_pixels, spec.precision, spec.rectangles
+        )
+        plan = plan_stage(
+            searcher.ctx, index, spec, store, memory, backend, engine, hyp_plan
+        )
+        progress = None
+        if exe.show_progress:
+            from tqdm import tqdm  # type: ignore[import-untyped]
+
+            bar = tqdm(
+                total=store.n_pixels, desc=f"stage {index}", unit="px", unit_scale=True
+            )
+            progress = bar.update
+        maps = StageExecutor(searcher.ctx).run(store, plan, progress=progress)
+        if exe.show_progress:
+            bar.close()
+        column_index = store.column_index
+        self.ledger.write(maps, column_index, index, hyp_plan)
+        searcher.schedule.decisions[index](self.ledger, column_index, spec, index)
+        self.pixels = self.ledger.uncertain()
+        labels_after = self.ledger.label[column_index.to(self.ledger.device)].clone()
+        elapsed = time.perf_counter() - t0
+        self.elapsed_s += elapsed
+        return StageResult(
+            stage_index=index,
+            spec=spec,
+            pixel_index=column_index.clone(),
+            maps=maps,
+            best_index=hyp_plan.decode(maps.best_virtual),
+            labels_after=labels_after,
+            n_uncertain_after=len(self.pixels),
+            elapsed_s=elapsed,
+        )
+
+    # -- public ------------------------------------------------------------------
+
+    def __iter__(self) -> Iterator[StageResult]:
+        """Run the remaining stages one at a time."""
+        schedule = self.searcher.schedule
+        while self.stage_index < len(schedule.stages) and not self._finished:
+            if len(self.pixels) == 0:
+                self._finished = True
+                break
+            result = self._run_stage(self.stage_index)
+            self.stage_index += 1
+            if schedule.keep_stage_results:
+                self.stage_results.append(result)
+            yield result
+            if schedule.stop_when_empty and result.n_uncertain_after == 0:
+                self._finished = True
+        self._finished = True
+
+    def run_all(self) -> SearchResult:
+        """Run every remaining stage and return the final result."""
+        for _ in self:
+            pass
+        return self.snapshot()
+
+    def snapshot(self) -> SearchResult:
+        """The current ledger as a :class:`SearchResult`."""
+        return SearchResult.from_ledger(
+            self.ledger,
+            self.searcher.space,
+            self.searcher.schedule,
+            stages=self.stage_results,
+            elapsed_s=self.elapsed_s,
+        )
+
+    def featurize(self, stage_index: int | None = None) -> None:
+        """Eagerly featurize for a stage (profiling warm-up); no search runs."""
+        index = self.stage_index if stage_index is None else stage_index
+        spec = self.searcher.schedule.stages[index]
+        exe = self.searcher.execution
+        memory, _, _, _ = plan_memory(
+            self.searcher.ctx,
+            spec,
+            n_pixels=len(self.pixels),
+            n_defocus=self.images.n_defocus,
+            space=self.searcher.space,
+            subset=spec.hypotheses,
+            batch=exe.batch,
+            block_pixels=exe.block_pixels,
+            use_cuda_graph=exe.use_cuda_graph,
+            use_fused_kernel=exe.use_fused_kernel,
+        )
+        self._prepare_store(memory.block_pixels, spec.precision, spec.rectangles)
