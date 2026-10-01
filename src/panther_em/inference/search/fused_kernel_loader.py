@@ -188,17 +188,11 @@ def _try_compile() -> Any:
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
-LEAN_NUM_PSI = (128, 256)
+LEAN_NUM_PSI = (128, 256, 512)
 
 
 def lean_supported(n_psi: int, n_freq: int) -> bool:
-    """Whether the register-resident kernel covers ``(n_psi, n_freq)``.
-
-    Any ``n_freq`` in ``[1, n_psi // 2 + 1]`` at ``n_psi`` in ``{128, 256}`` (bins above
-    64 fold exactly onto the kernel's 64-point transform; the Nyquist bin is handled).
-    The cuFFTDx block-FFT kernel (:func:`fused_irfft_stats_transposed`) remains the
-    fallback for ``n_psi = 64``.
-    """
+    """Whether the register-resident kernel covers ``(n_psi, n_freq)``."""
     return int(n_psi) in LEAN_NUM_PSI and 1 <= int(n_freq) <= int(n_psi) // 2 + 1
 
 
@@ -230,11 +224,11 @@ def lean_irfft_stats_transposed(
     Parameters
     ----------
     c : torch.Tensor
-        Contiguous ``(NumFreq, P, Q)`` spectrum, complex64 **or complex32**; a float16
+        Contiguous ``(NumFreq, P, Q)`` spectrum, as complex64 or complex32. For float16
         ``(NumFreq, P, 2Q)`` tensor of interleaved ``(re, im)`` pairs is also accepted.
         ``NumFreq`` may be anything in ``[1, n_psi // 2 + 1]``.
     n_psi : int
-        Full in-plane-angle length, 128 or 256.
+        Full in-plane-angle length, 128, 256 or 512.
     decode : bool, optional
         See :func:`fused_irfft_stats`.
     hyp_offset : int, optional
@@ -283,7 +277,7 @@ def lean_irfft_stats_transposed(
 
 
 def lean_debug_ifft(x: torch.Tensor) -> torch.Tensor | None:
-    """Unnormalized inverse DFT of complex64 ``(B, N)`` rows, ``N`` in ``{64, 128}``.
+    """Unnormalized inverse DFT of complex64 ``(B, N)`` rows, ``N`` in ``{64, 128, 256}``.
 
     Runs the generated register-resident transforms (``csrc/lean_fft_gen.cuh``) on the
     device; equals ``torch.fft.ifft(x, norm="forward")``. Test entry point only;

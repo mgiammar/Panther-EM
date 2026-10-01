@@ -14,15 +14,20 @@ What is emitted (all ``__device__ __forceinline__``, operating on ``float re[N],
     Unnormalized inverse DFT, ``X[j] = sum_k x[k] e^{+2 pi i k j / N}``, mixed-radix
     decimation-in-time (radix-4 stages plus one radix-2 stage when ``N = 2 * 4^p``).
     Input must be loaded in the digit-reversed order ``IFFTN_PERM``; output is natural.
-``twiddle_residue_<n_psi>(re, im)``
-    Multiplies slot ``k`` by ``e^{+2 pi i k / n_psi}`` -- the shift that turns the
-    residue-0 spectrum into the residue-1 spectrum (see below).
+``twiddle_residue_<n_psi>_<h>(re, im)`` and ``twiddle_residue<NPSI>(re, im, h)``
+    Multiplies slot ``k`` by ``e^{+2 pi i k h / n_psi}`` -- the shift that turns the
+    residue-0 spectrum into the residue-``h`` spectrum (see below). The template
+    dispatches on the runtime ``h`` (warp-uniform in the kernel) for ``h < R/2``.
 ``hermitian_pack_inplace(re, im)``
     Packs two real residue transforms into one complex 64-point IDFT (see below).
+``lean_root<NPSI>(k)``, ``lean_u128(k)``
+    Constant lookups ``e^{+2 pi i k / NPSI}`` (full period) and ``e^{+2 pi i k / 128}``;
+    called with compile-time ``k`` they fold to immediates (the fold pass needs them).
 
 The maths, for one (pixel, hypothesis) pair with spectrum ``C_k``, ``k < F``:
 
     corr[psi] = Re(C_0) + 2 sum_{k>=1} Re(C_k e^{2 pi i k psi / n_psi}),  psi < n_psi = 64 R
+    (R in {2, 4, 8}: n_psi in {128, 256, 512}; a thread handles residues h and h + R/2)
     D_k       = a_k C_k,  a_0 = 1, a_k = 2, a_{n_psi/2} = 1 with Im dropped (Nyquist)
     corr[R j + r] = Re IDFT_64( X_r )[j],  X_r[k'] = sum_m D_{k' + 64 m} t^{(k' + 64 m) r}
 
@@ -35,10 +40,12 @@ imaginary output residue ``r + R/2``. Since ``t^{k' R/2} = e^{2 pi i k'/128}``, 
 second residue's spectrum is the first's times ``u_{k'} = e^{2 pi i k'/128}`` (applied
 to the alternately-signed fold, which the kernel forms while loading).
 
-A 128-point transform is also emitted. It is NOT used by the reduce kernel: a
-128-point complex working set is 256 fp32 registers, over the 255-register limit, and
-folding makes it unnecessary. It exists for the on-device generator test
-(``lean_debug_ifft``) and for future kernels with a different thread mapping.
+Larger transforms (128, 256 points) are also emitted. They are NOT used by the reduce
+kernel: a 128-point complex working set is already 256 fp32 registers, over the
+255-register limit, and the residue decomposition makes them unnecessary -- n_psi = 512
+is 8 residues of the same 64-point transform (4 threads per pair), not a 256-point one.
+They exist for the on-device generator test (``lean_debug_ifft``) and for future
+kernels with a different thread mapping.
 """
 
 from __future__ import annotations
@@ -222,17 +229,40 @@ def emit_ifft(plan: Plan) -> str:
     return "\n".join(out)
 
 
-def emit_residue_twiddle(n_psi: int, slots: int = 64) -> str:
-    """Multiply slot ``k`` by ``e^{+2 pi i k / n_psi}`` (residue shift by one)."""
+def emit_residue_twiddle(n_psi: int, h: int, slots: int = 64) -> str:
+    """Multiply slot ``k`` by ``e^{+2 pi i k h / n_psi}`` (residue shift by ``h``)."""
     out = [
-        f"// X[k] *= e^(+2 pi i k / {n_psi}), k = 1..{slots - 1}: residue-0 -> residue-1 spectrum.",
-        f"__device__ __forceinline__ void twiddle_residue_{n_psi}(float* __restrict__ re,"
+        f"// X[k] *= e^(+2 pi i k {h} / {n_psi}), k = 1..{slots - 1}: residue-0 -> residue-{h} spectrum.",
+        f"__device__ __forceinline__ void twiddle_residue_{n_psi}_{h}(float* __restrict__ re,"
         f" float* __restrict__ im) {{",
     ]
     for k in range(1, slots):
-        w = cmath.exp(2j * math.pi * k / n_psi)
+        w = cmath.exp(2j * math.pi * k * h / n_psi)
         out.append("  { " + " ".join(emit_cmul("xr", "xi", f"re[{k}]", f"im[{k}]", w)) +
                    f" re[{k}]=xr; im[{k}]=xi; }}")
+    out.append("}")
+    return "\n".join(out)
+
+
+def emit_residue_twiddle_dispatch(n_psi: int) -> str:
+    """``twiddle_residue<n_psi>(re, im, h)``: residue shift by a runtime ``h < R/2``.
+
+    ``h`` is warp-uniform in the kernel (one residue per warp), so the switch costs
+    one uniform branch and no divergence; ``h = 0`` is the identity.
+    """
+    t_threads = n_psi // 128
+    out = [
+        f"// Residue shift by runtime h in [0, {t_threads}) at n_psi = {n_psi} (h = 0: identity).",
+        "template <> __device__ __forceinline__ void"
+        f" twiddle_residue<{n_psi}>(float* __restrict__ re, float* __restrict__ im, unsigned h) {{",
+    ]
+    if t_threads > 1:
+        out.append("  switch (h) {")
+        for h in range(1, t_threads):
+            out.append(f"    case {h}: twiddle_residue_{n_psi}_{h}(re, im); break;")
+        out += ["    default: break;", "  }"]
+    else:
+        out.append("  (void)re; (void)im; (void)h;")
     out.append("}")
     return "\n".join(out)
 
@@ -284,21 +314,29 @@ def emit_hermitian_pack(slots: int = 64) -> str:
     return "\n".join(out)
 
 
-def emit_constant_lookup(name: str, values: list[complex], comment: str) -> str:
+def emit_constant_lookup(
+    name: str, values: list[complex], comment: str, template: bool = False
+) -> str:
     """``float2 name(unsigned k)`` returning literal constants via a switch.
 
     Called with a compile-time ``k`` (every caller is fully unrolled) it folds to an
     immediate, which is what lets the F > 64 fold path in the kernel apply per-slot
-    twiddles without holding a second 128-register array.
+    twiddles without holding a second 128-register array. ``template=True`` emits an
+    explicit specialization of a declared function template (``name`` carries the
+    ``<...>`` arguments).
     """
-    out = [f"// {comment}", f"__device__ __forceinline__ float2 {name}(unsigned k) {{", "  switch (k) {"]
+    head = "template <> " if template else ""
+    out = [f"// {comment}", f"{head}__device__ __forceinline__ float2 {name}(unsigned k) {{", "  switch (k) {"]
     for k, w in enumerate(values):
         out.append(f"    case {k}: return make_float2({flit(w.real)}, {flit(w.imag)});")
     out += ["    default: return make_float2(1.f, 0.f);", "  }", "}"]
     return "\n".join(out)
 
 
-def emit_header(sizes: tuple[int, ...]) -> str:
+N_PSI_SUPPORTED = (128, 256, 512)  # R = n_psi / 64 in {2, 4, 8}
+
+
+def emit_header(sizes: tuple[int, ...], n_psis: tuple[int, ...] = N_PSI_SUPPORTED) -> str:
     """The whole generated header."""
     parts = [
         "// AUTO-GENERATED by gen_lean_fft.py -- do not edit by hand. Regenerate with",
@@ -306,15 +344,27 @@ def emit_header(sizes: tuple[int, ...]) -> str:
         "// See that script's docstring for the maths and the conventions.",
         "#pragma once",
         "",
+        "template <unsigned NPSI> __device__ __forceinline__ void"
+        " twiddle_residue(float* __restrict__ re, float* __restrict__ im, unsigned h);",
+        "template <unsigned NPSI> __device__ __forceinline__ float2 lean_root(unsigned k);",
+        "",
     ]
     for n in sizes:
         parts += [emit_ifft(make_plan(n)), ""]
-    parts += [emit_residue_twiddle(256), "", emit_hermitian_pack(64), ""]
+    for n_psi in n_psis:
+        for h in range(1, n_psi // 128):
+            parts += [emit_residue_twiddle(n_psi, h), ""]
+        parts += [emit_residue_twiddle_dispatch(n_psi), ""]
+    parts += [emit_hermitian_pack(64), ""]
+    for n_psi in n_psis:
+        parts += [
+            emit_constant_lookup(
+                f"lean_root<{n_psi}>", [cmath.exp(2j * math.pi * k / n_psi) for k in range(n_psi)],
+                f"e^(+2 pi i k / {n_psi}), k < {n_psi}: residue twiddles for the fold pass.",
+                template=True),
+            "",
+        ]
     parts += [
-        emit_constant_lookup(
-            "lean_tw256", [cmath.exp(2j * math.pi * k / 256) for k in range(64)],
-            "e^(+2 pi i k / 256), k < 64: the residue-1 twiddle at n_psi = 256."),
-        "",
         emit_constant_lookup(
             "lean_u128", [cmath.exp(2j * math.pi * k / 128) for k in range(64)],
             "e^(+2 pi i k / 128), k < 64: shifts a residue spectrum by R/2 residues."),
@@ -384,7 +434,12 @@ def _check_lean_math() -> None:
     import numpy as np
 
     rng = np.random.default_rng(1)
-    for n_psi, fs in ((128, (16, 37, 64, 65)), (256, (16, 64, 65, 80, 100, 128, 129))):
+    cases = (
+        (128, (16, 37, 64, 65)),
+        (256, (16, 64, 65, 80, 100, 128, 129)),
+        (512, (16, 64, 65, 100, 128, 129, 200, 256, 257)),
+    )
+    for n_psi, fs in cases:
         for f in fs:
             c = rng.standard_normal(f) + 1j * rng.standard_normal(f)
             c[0] = c[0].real
@@ -400,7 +455,7 @@ def _check_lean_math() -> None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--out", help="header to write (default: print nothing, just check)")
-    ap.add_argument("--sizes", type=int, nargs="+", default=[64, 128])
+    ap.add_argument("--sizes", type=int, nargs="+", default=[64, 128, 256])
     ap.add_argument("--check", action="store_true", help="run the numpy self-tests")
     args = ap.parse_args(argv)
     sizes = tuple(args.sizes)

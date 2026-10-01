@@ -16,9 +16,9 @@ class FusedPixelStats(PixelStats):
     Two fast paths, tried in order:
 
     1. **In-kernel accumulation** (:meth:`update_graphed`): for the register-resident
-       kernel's domain (``n_psi`` in ``{128, 256}``, ``NumFreq <= n_psi/2 + 1``, spectrum in
-       the GEMM's native ``(NumFreq, P, N)`` layout, complex64 or complex32) the
-       kernel adds the batch's moments straight into :attr:`corr_sum` /
+       kernel's domain (``n_psi`` in ``{128, 256, 512}``, ``NumFreq <= n_psi/2 + 1``,
+       spectrum in the GEMM's native ``(NumFreq, P, N)`` layout, complex64 or complex32)
+       the kernel adds the batch's moments straight into :attr:`corr_sum` /
        :attr:`corr_sum2` and merges a packed ``(value, global (hyp, psi) index)``
        maximum into :attr:`best_packed` -- the whole hypothesis loop is then two or
        three kernel launches per batch and no per-batch accumulate step. The packed
@@ -171,8 +171,9 @@ class FusedPixelStats(PixelStats):
         # so each call below keeps its `Literal[True]`/`Literal[False]` overload.
         transposed = spectrum.permute(2, 0, 1)
         if transposed.is_contiguous():
-            # 1. Register-resident kernel: n_psi in {128, 256}, NumFreq <= n_psi/2+1, both
-            #    complex dtypes. ~6x faster than the cuFFTDx kernel at n_psi=256.
+            # 1. Register-resident kernel: n_psi in {128, 256, 512}
+            #    NumFreq <= n_psi/2+1, both complex dtypes.
+            #    ~6x faster than the cuFFTDx kernel at n_psi=256.
             result = (
                 fused_kernel_loader.lean_irfft_stats_transposed(
                     transposed, num_psi, decode=True
