@@ -8,12 +8,15 @@ search never has to materialize the full ``(pixels, hypotheses, psi)`` correlogr
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
+
+    from panther_em.inference.search.hypotheses import HypBatch
 
 
 def _bind_capture_stream(
@@ -708,3 +711,174 @@ class PixelStats:
 # accepted / rejected / follow-up sets. This is implemented as a pluggable
 # `follow_up_fn` rather than as part of `PixelStats` -- see
 # panther_em.inference.search.tracking.MultiPrecisionPixelTracker.
+
+
+# --------------------------------------------------------------------------- #
+# Block-level accumulation (the redesigned executor's view of the statistics)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class SpectrumSpec:
+    """What a stage's spectra look like; decides which statistics backend applies.
+
+    Attributes
+    ----------
+    dtype : torch.dtype
+        complex64 or complex32 spectrum.
+    n_freq : int
+        ``F = k_stop`` angular frequencies.
+    n_psi : int
+        In-plane samples recovered by the inverse FFT.
+    gemm_pixels : int
+        Pixels per contraction (``P_g``).
+    n_sub : int
+        GEMM sub-batches per block (``block_pixels / gemm_pixels``).
+    hyp_batch : int
+        Hypotheses per contraction.
+    n_virtual : int
+        Hypotheses enumerated per pixel (all defocus planes x selected templates).
+    device : torch.device
+        Compute device.
+    """
+
+    dtype: torch.dtype
+    n_freq: int
+    n_psi: int
+    gemm_pixels: int
+    n_sub: int
+    hyp_batch: int
+    n_virtual: int
+    device: torch.device
+
+
+class BlockStats:
+    """Per-pixel statistics of one block: one :class:`PixelStats` per GEMM sub-batch.
+
+    Parameters
+    ----------
+    stats_cls : type
+        :class:`PixelStats` or a subclass (the fused specialization).
+    n_sub : int
+        Sub-batches per block.
+    gemm_pixels : int
+        Pixels per sub-batch.
+    device : torch.device
+        Where the state lives.
+    n_psi : int
+        In-plane samples.
+    inkernel : bool
+        ``True`` when every batch takes the fused in-kernel accumulate path. Batches
+        are then fed the kernel-relative ``HypBatch.kernel_offset`` and epochs are
+        merged with their base (:meth:`FusedPixelStats.merge_packed`); otherwise the
+        full ``virtual_offset`` is used directly (int64, no epoch bookkeeping).
+    """
+
+    def __init__(
+        self,
+        stats_cls: type[PixelStats],
+        *,
+        n_sub: int,
+        gemm_pixels: int,
+        device: torch.device,
+        n_psi: int,
+        inkernel: bool,
+    ) -> None:
+        self.stats = [stats_cls(gemm_pixels, device=device) for _ in range(n_sub)]
+        self.n_sub = int(n_sub)
+        self.gemm_pixels = int(gemm_pixels)
+        self.n_psi = int(n_psi)
+        self.inkernel = bool(inkernel)
+        self.device = device
+
+    @torch.no_grad()
+    def clear(self) -> None:
+        """Reset every sub-batch's state."""
+        for st in self.stats:
+            st.clear()
+
+    @torch.no_grad()
+    def consume(self, spectrum_pnf: torch.Tensor, batch: HypBatch, sub: int) -> None:
+        """Accumulate one batch's spectrum ``(P_g, N_b, F)`` into sub-batch ``sub``."""
+        offset = batch.kernel_offset if self.inkernel else batch.virtual_offset
+        self.stats[sub].update_graphed(
+            spectrum_pnf, offset, num_psi=self.n_psi, reverse_psi_axis=True
+        )
+
+    @torch.no_grad()
+    def end_epoch(self, base: int, sub: int) -> None:
+        """Fold an epoch's in-kernel packed best into the running best (fused only)."""
+        if self.inkernel:
+            merge = getattr(self.stats[sub], "merge_packed", None)
+            if merge is not None:
+                merge(hyp_base=base)
+
+    def note_replayed(self, n_evaluated: int) -> None:
+        """Set the per-pixel evaluation count after a CUDA-graph replay.
+
+        A captured hypothesis loop does not execute the Python-side bookkeeping, so the
+        caller states how many ``(hypothesis, psi)`` pairs each pixel saw.
+        """
+        for st in self.stats:
+            st.hypothesis_count = int(n_evaluated)
+            if hasattr(st, "_packed_num_psi"):
+                st._packed_num_psi = self.n_psi
+
+    @torch.no_grad()
+    def finalize_into(
+        self, outs: Mapping[str, torch.Tensor], start: int, n_valid: int
+    ) -> None:
+        """Write the finalized maps into rows ``[start, start + n_valid)`` of ``outs``.
+
+        Keys: ``mip``, ``mean``, ``variance``, ``zscore``, ``best_index``, ``best_psi``.
+        """
+        for sub, st in enumerate(self.stats):
+            row0 = sub * self.gemm_pixels
+            if row0 >= n_valid:
+                break
+            n = min(self.gemm_pixels, n_valid - row0)
+            result = st.finalize()
+            for key, value in result.items():
+                target = outs[key]
+                target[start + row0 : start + row0 + n] = value[:n].to(
+                    target.device, target.dtype
+                )
+
+
+@runtime_checkable
+class StatsBackend(Protocol):
+    """Chooses and builds the block accumulator for a stage."""
+
+    name: str
+
+    @staticmethod
+    def supports(spec: SpectrumSpec) -> bool:
+        """Whether this backend can reduce spectra of ``spec``."""
+
+    @staticmethod
+    def make(spec: SpectrumSpec) -> BlockStats:
+        """A fresh block accumulator for ``spec``."""
+
+
+class TorchStatsBackend:
+    """Pure-torch reduction (``irfft`` + compiled moments); works on any device."""
+
+    name = "torch"
+
+    @staticmethod
+    def supports(spec: SpectrumSpec) -> bool:
+        """Always."""
+        return True
+
+    @staticmethod
+    def make(spec: SpectrumSpec) -> BlockStats:
+        """Block accumulator backed by plain :class:`PixelStats`."""
+        return BlockStats(
+            PixelStats,
+            n_sub=spec.n_sub,
+            gemm_pixels=spec.gemm_pixels,
+            device=spec.device,
+            n_psi=spec.n_psi,
+            inkernel=False,
+        )
+
