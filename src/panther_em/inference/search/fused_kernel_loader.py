@@ -415,8 +415,7 @@ def fused_irfft_stats(
         ``(vmax, amax)`` before returning. Pass ``False`` to skip that decode and get
         the raw packed value back instead -- useful when a caller wants to batch
         several calls' raw outputs together and decode the whole batch once (see
-        :func:`panther_em.inference.search.statistics.decode_argmax_packed` and
-        :meth:`~panther_em.inference.search.statistics.PixelStats.accumulate_batch`).
+        :func:`panther_em.inference.search.statistics.decode_argmax_packed`).
 
     Returns
     -------

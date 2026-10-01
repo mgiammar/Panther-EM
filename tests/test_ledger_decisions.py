@@ -60,10 +60,9 @@ def test_ledger_write_masks_and_overwrite():
     mask[:, :3, :] = True
     initial = PixelSelection.from_mask(geo, mask)
     ledger = PixelLedger(geo, "cpu", initial=initial)
-    counts = ledger.counts()
-    assert counts["MASKED"] == geo.n_pixels - len(initial) and counts["PENDING"] == len(
-        initial
-    )
+    masked = int((ledger.label == int(PixelLabel.MASKED)).sum())
+    pending = int((ledger.label == int(PixelLabel.PENDING)).sum())
+    assert masked == geo.n_pixels - len(initial) and pending == len(initial)
 
     idx = initial.index
     ledger.write(_maps(len(idx)), idx, 0, _plan())

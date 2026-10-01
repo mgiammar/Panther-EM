@@ -1,18 +1,18 @@
-"""Contraction engines vs the dense einsum reference and legacy FeatureTiling.run."""
+"""Contraction engines vs the dense einsum reference."""
 
 from __future__ import annotations
 
 import pytest
 import torch
+from conftest import read_engine_block, reference_spectrum
 
 from panther_em.inference.search.contraction import (
     ComplexGemmEngine,
     Fp16GemmEngine,
     Spectrum,
     make_engine,
-    reference_spectrum,
 )
-from panther_em.inference.search.tiling import FeatureLayout, FeatureTiling
+from panther_em.inference.search.tiling import FeatureLayout
 
 CUDA = torch.cuda.is_available()
 
@@ -120,7 +120,9 @@ def test_complex_engine_matches_reference_cpu(rects):
         torch.testing.assert_close(outs[d].pnf(), ref, rtol=1e-5, atol=1e-5)
         # read_block round-trips what write_block stored
         for i in range(len(rects)):
-            torch.testing.assert_close(engine.read_block(blocks[i], d), per_rect[i][d])
+            torch.testing.assert_close(
+                read_engine_block(engine, blocks[i], d), per_rect[i][d]
+            )
 
 
 def test_complex_engine_pixel_sub_batch_is_a_view():
@@ -134,20 +136,6 @@ def test_complex_engine_pixel_sub_batch_is_a_view():
     )
     ref = _dense(rects, per_rect, w_per_rect, 0)[4:9]
     torch.testing.assert_close(outs[0].pnf(), ref, rtol=1e-5, atol=1e-5)
-
-
-def test_engine_matches_legacy_feature_tiling_run():
-    rects = [(0, 0, 4, 2), (0, 2, 4, 3), (4, 0, 2, 5)]
-    n_p, n_hyp = 6, 4
-    per_rect = _random_features(1, n_p, rects)
-    w_per_rect = _random_weights(n_hyp, rects)
-    tiling = FeatureTiling.from_extents(rects, device="cpu")
-    y_flat = torch.cat([y[0].reshape(n_p, -1) for y in per_rect], dim=1)
-    w_flat = torch.cat([w.reshape(n_hyp, -1) for w in w_per_rect], dim=1)
-    legacy = tiling.run(y_flat, w_flat, tiling.k_stop)
-    engine = ComplexGemmEngine()
-    _, outs = _run_engine(engine, rects, per_rect, w_per_rect, 1, n_p, n_hyp, "cpu")
-    torch.testing.assert_close(outs[0].pnf(), legacy, rtol=1e-5, atol=1e-5)
 
 
 def test_make_engine_and_spectrum_validation():
@@ -186,38 +174,8 @@ def test_fp16_engine_matches_reference_cuda(rects):
         torch.testing.assert_close(got, ref, rtol=2e-2, atol=5e-2)
         for i in range(len(rects)):
             torch.testing.assert_close(
-                engine.read_block(blocks[i], d).cpu(),
+                read_engine_block(engine, blocks[i], d).cpu(),
                 per_rect[i][d],
                 rtol=2e-3,
                 atol=2e-3,
             )
-
-
-@pytest.mark.skipif(not CUDA, reason="needs CUDA")
-@pytest.mark.filterwarnings("ignore:ComplexHalf support is experimental")
-def test_fp16_engine_matches_legacy_fp16_path():
-    rects = [(0, 0, 4, 2), (0, 2, 4, 3), (4, 0, 2, 5)]
-    device = torch.device("cuda")
-    n_p, n_hyp = 6, 4
-    per_rect = _random_features(1, n_p, rects)
-    w_per_rect = _random_weights(n_hyp, rects)
-    tiling = FeatureTiling.from_extents(rects, device=device)
-    y_flat = torch.cat([y[0].reshape(n_p, -1) for y in per_rect], dim=1).to(device)
-    w_flat = torch.cat([w.reshape(n_hyp, -1) for w in w_per_rect], dim=1).to(device)
-    prepared_w = tiling.prepare_weights(w_flat, precision="fp16")
-    legacy = tiling.run(
-        None,
-        None,
-        tiling.k_stop,
-        prepared_weights=prepared_w,
-        prepared_features=tiling.prepare_features(y_flat, precision="fp16"),
-        precision="fp16",
-    )
-    engine = Fp16GemmEngine()
-    _, outs = _run_engine(engine, rects, per_rect, w_per_rect, 1, n_p, n_hyp, device)
-    torch.testing.assert_close(
-        outs[0].pnf().to(torch.complex64),
-        legacy.to(torch.complex64),
-        rtol=1e-3,
-        atol=1e-3,
-    )

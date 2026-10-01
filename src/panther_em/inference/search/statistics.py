@@ -300,21 +300,6 @@ class PixelStats:
             corr.to(self.best_corr.dtype), torch.view_as_real(spectrum)
         )
 
-    def _reduce_raw(
-        self, spectrum: torch.Tensor, num_psi: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reduce one hypothesis batch to ``(s1, s2, packed)`` without decoding argmax.
-
-        Returns
-        -------
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-            ``(s1, s2, packed)``, each shape ``(num_pixels,)``, dtypes
-            ``(accumulate_dtype, accumulate_dtype, int64)``.
-        """
-        s1, s2, vmax, amax = self._reduce(spectrum, num_psi)
-        packed = encode_argmax_packed(vmax.to(torch.float32), amax)
-        return s1.to(self.corr_sum.dtype), s2.to(self.corr_sum.dtype), packed
-
     @torch.no_grad()
     def update(
         self,
@@ -413,8 +398,7 @@ class PixelStats:
 
         Notes
         -----
-        Only supports the contiguous-arange ``hyp_offset`` fast path (see
-        :meth:`accumulate_batch`'s ``hyp_offset`` parameter).
+        Only supports the contiguous-arange ``hyp_offset`` fast path.
         """
         device = self.corr_sum.device
         self._graph_s1 = torch.zeros(
@@ -521,9 +505,8 @@ class PixelStats:
         """Like :meth:`update`, but the accumulate step replays a captured CUDA graph.
 
         Requires the caller to already know ``hyp_global_idx`` for this batch is a
-        contiguous arange starting at ``hyp_offset`` (see :meth:`accumulate_batch`'s
-        ``hyp_offset`` parameter) -- callers without that guarantee should use
-        :meth:`update` instead. Transparently falls back to :meth:`update` when CUDA
+        contiguous arange starting at ``hyp_offset`` -- callers without that guarantee
+        should use :meth:`update` instead. Transparently falls back to :meth:`update` when CUDA
         graph capture isn't supported on this device (checked once per device via
         :func:`_cuda_graph_capture_supported`), so this is always safe to call.
         """
@@ -541,139 +524,6 @@ class PixelStats:
         )
         self.hypothesis_count += spectrum.shape[1] * num_psi
         return None
-
-    @torch.no_grad()
-    def begin_hypothesis_batches(self, n_batches: int) -> None:
-        """Preallocate staging buffers for the batch-then-reduce accumulation path."""
-        device = self.corr_sum.device
-        self._batch_capacity = n_batches
-        self._batch_cursor = 0
-        self._total_hypotheses_batched = 0
-        self._s1_stack = torch.empty(
-            (n_batches, self.num_pixels), device=device, dtype=self.corr_sum.dtype
-        )
-        self._s2_stack = torch.empty_like(self._s1_stack)
-        self._packed_stack = torch.empty(
-            (n_batches, self.num_pixels), device=device, dtype=torch.int64
-        )
-        self._hyp_offset_stack: list[int | None] = [None] * n_batches
-        self._hyp_idx_stack: torch.Tensor | None = None
-
-    @torch.no_grad()
-    def accumulate_batch(
-        self,
-        spectrum: torch.Tensor,
-        hyp_global_idx: torch.Tensor,
-        num_psi: int,
-        hyp_offset: int | None = None,
-    ) -> None:
-        """Stage one hypothesis batch's reduced result for deferred reduction.
-
-        Must be called after :meth:`begin_hypothesis_batches` and before
-        :meth:`reduce_hypothesis_batches`, once per hypothesis batch (in place of
-        :meth:`update`).
-
-        Parameters
-        ----------
-        spectrum : torch.Tensor
-            Same as :meth:`update`'s ``spectrum``.
-        hyp_global_idx : torch.Tensor
-            Same as :meth:`update`'s ``hyp_global_idx``.
-        num_psi : int
-            Same as :meth:`update`'s ``num_psi``.
-        hyp_offset : int, optional
-            Pass this batch's starting global hypothesis index when
-            ``hyp_global_idx`` is known to equal
-            ``arange(hyp_offset, hyp_offset + hyp_global_idx.numel())`` -- true
-            whenever the caller sliced this batch off a plain, unshuffled ``arange``
-            (the common case in
-            :func:`~panther_em.inference.search.compressed._run_stage`).
-            When every staged batch provides this, :meth:`reduce_hypothesis_batches`
-            recovers the winning global hypothesis id with a plain addition instead of
-            a gather. If any staged batch omits it, all batches fall back to a gather
-            against a stored copy of each batch's ``hyp_global_idx``.
-        """
-        i = self._batch_cursor
-        s1, s2, packed = self._reduce_raw(spectrum, num_psi)
-        self._s1_stack[i] = s1
-        self._s2_stack[i] = s2
-        self._packed_stack[i] = packed
-        self._hyp_offset_stack[i] = hyp_offset
-
-        if hyp_offset is None:
-            m = hyp_global_idx.numel()
-            if self._hyp_idx_stack is None:
-                self._hyp_idx_stack = torch.zeros(
-                    (self._batch_capacity, m),
-                    device=hyp_global_idx.device,
-                    dtype=torch.long,
-                )
-            self._hyp_idx_stack[i, :m] = hyp_global_idx
-
-        self._total_hypotheses_batched += hyp_global_idx.numel() * num_psi
-        self._batch_cursor += 1
-
-    @torch.no_grad()
-    def reduce_hypothesis_batches(
-        self, num_psi: int, reverse_psi_axis: bool = True
-    ) -> None:
-        """Decode and reduce all staged hypothesis batches, updating running stats once.
-
-        Equivalent to calling :meth:`update` once per staged batch, but the argmax
-        decode, best-of compare, and running-sum update each run once over the whole
-        ``(n_batches, num_pixels)`` stack instead of once per batch. No-op if no
-        batches were staged since the last :meth:`begin_hypothesis_batches` call.
-
-        Parameters
-        ----------
-        num_psi : int
-            Same ``num_psi`` used for every staged :meth:`accumulate_batch` call.
-        reverse_psi_axis : bool, optional
-            Same as :meth:`update`'s ``reverse_psi_axis``.
-        """
-        n = self._batch_cursor
-        if n == 0:
-            return
-
-        s1_total = self._s1_stack[:n].sum(dim=0)
-        s2_total = self._s2_stack[:n].sum(dim=0)
-
-        # Decode the WHOLE stack in one shot -- and only ever compare/reduce the
-        # DECODED float vmax, never the raw packed int64 (see decode_argmax_packed's
-        # docstring: the packed encoding assumes unsigned comparison, which a plain
-        # torch.max on this signed-int64-typed tensor would get backwards).
-        vmax_stack, amax_local_stack = decode_argmax_packed(self._packed_stack[:n])
-
-        best_vmax, best_batch = vmax_stack.max(dim=0)
-        best_amax_local = amax_local_stack.gather(0, best_batch.unsqueeze(0)).squeeze(0)
-        n_local = torch.div(best_amax_local, num_psi, rounding_mode="floor")
-
-        offsets = self._hyp_offset_stack[:n]
-        if all(offset is not None for offset in offsets):
-            offset_stack = torch.tensor(
-                offsets, device=best_batch.device, dtype=torch.long
-            )
-            global_hyp = offset_stack[best_batch] + n_local
-        else:
-            assert self._hyp_idx_stack is not None
-            global_hyp = self._hyp_idx_stack[best_batch, n_local]
-
-        if reverse_psi_axis:
-            psi = (num_psi - best_amax_local % num_psi) % num_psi
-        else:
-            psi = best_amax_local % num_psi
-
-        vmax_cast = best_vmax.to(self.best_corr.dtype)
-        self.corr_sum += s1_total.to(self.best_corr.dtype)
-        self.corr_sum2 += s2_total.to(self.best_corr.dtype)
-        self.hypothesis_count += self._total_hypotheses_batched
-
-        improved = vmax_cast > self.best_corr
-        self.best_corr = torch.where(improved, vmax_cast, self.best_corr)
-        self.best_hypothesis = torch.where(improved, global_hyp, self.best_hypothesis)
-        self.best_psi_angle = torch.where(improved, psi, self.best_psi_angle)
-
-        self._batch_cursor = 0
 
     @torch.no_grad()
     def finalize(self) -> dict[str, torch.Tensor]:
@@ -700,17 +550,6 @@ class PixelStats:
             "best_index": self.best_hypothesis.clone(),
             "best_psi": self.best_psi_angle.clone(),
         }
-
-
-# ---------------------------------------------------------------------------
-# Error-aware partitioning (multi-precision follow-up)
-# ---------------------------------------------------------------------------
-#
-# Between incremental stages the reconstructed correlations are partitioned, using
-# the reconstruction-accuracy bounds implied by the retained singular values, into
-# accepted / rejected / follow-up sets. This is implemented as a pluggable
-# `follow_up_fn` rather than as part of `PixelStats` -- see
-# panther_em.inference.search.tracking.MultiPrecisionPixelTracker.
 
 
 # --------------------------------------------------------------------------- #

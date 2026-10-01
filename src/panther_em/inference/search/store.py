@@ -333,14 +333,6 @@ class FeatureStore:
                 raise ValueError(f"group {g.id} is not complete")
         return _DirectBlockSource(self, groups)
 
-    def read(self, group: ColumnGroup, plane: int = 0) -> torch.Tensor:
-        """``(P, num_k, num_m)`` complex64 features of one plane (tests/compaction)."""
-        parts = []
-        for i, block in enumerate(group.blocks):
-            start, stop = self.block_range(i)
-            parts.append(group.engine.read_block(block, plane, slice(0, stop - start)))
-        return torch.cat(parts, dim=0)
-
     def nbytes(self) -> int:
         """Bytes across all groups."""
         return sum(g.nbytes for g in self.groups)

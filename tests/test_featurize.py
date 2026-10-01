@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from conftest import read_group
 
 from panther_em.inference.correlation import compute_feature_stack
 from panther_em.inference.projection_reconstruction import ProjectionReconstructor
@@ -99,7 +100,9 @@ def test_single_tile_matches_reference_all_pixels(bank):
     assert torch.equal(sched.column_index, pixels.index)
     ref = _reference(bank, images.images, RECT)
     expected = _expected_columns(ref, geo, sched.column_index).reshape(-1, 2, 3)
-    torch.testing.assert_close(store.read(group, 0), expected, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(
+        read_group(store, group, 0), expected, rtol=1e-4, atol=1e-5
+    )
 
 
 @pytest.mark.parametrize("order", ["pixel_major", "cell_major"])
@@ -121,7 +124,9 @@ def test_tiled_masked_selection_matches_reference(bank, order):
         assert isinstance(item, Tile) and item.row0 <= geo.grid[0] - 5
     ref = _reference(bank, images.images, RECT)
     expected = _expected_columns(ref, geo, sched.column_index).reshape(-1, 2, 3)
-    torch.testing.assert_close(store.read(group, 0), expected, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(
+        read_group(store, group, 0), expected, rtol=1e-4, atol=1e-5
+    )
 
 
 def test_filter_planes_match_prefiltered_reference(bank):
@@ -136,7 +141,9 @@ def test_filter_planes_match_prefiltered_reference(bank):
         pre = torch.fft.irfft2(torch.fft.rfft2(raw) * filters[d], s=(30, 28))
         ref = _reference(bank, pre, RECT)
         expected = _expected_columns(ref, geo, sched.column_index).reshape(-1, 2, 3)
-        torch.testing.assert_close(store.read(group, d), expected, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(
+            read_group(store, group, d), expected, rtol=1e-4, atol=1e-5
+        )
 
     per_image = ImageSet.from_stack(raw, filters=torch.rand(2, 2, 30, 15))
     sched, store, group = _run(feat, per_image, geo, pixels, RECT)
@@ -151,7 +158,9 @@ def test_filter_planes_match_prefiltered_reference(bank):
         )
         ref = _reference(bank, pre, RECT)
         expected = _expected_columns(ref, geo, sched.column_index).reshape(-1, 2, 3)
-        torch.testing.assert_close(store.read(group, d), expected, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(
+            read_group(store, group, d), expected, rtol=1e-4, atol=1e-5
+        )
 
 
 def test_inner_product_matches_grid_center_pixel(bank):
@@ -166,7 +175,9 @@ def test_inner_product_matches_grid_center_pixel(bank):
     assert len(sched.items) == 3 and all(isinstance(i, ImageBatch) for i in sched.items)
     ref = _reference(bank, boxes, RECT)  # (B, cells, 1, 1)
     expected = ref[:, :, 0, 0].reshape(5, 2, 3)
-    torch.testing.assert_close(store.read(group, 0), expected, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(
+        read_group(store, group, 0), expected, rtol=1e-4, atol=1e-5
+    )
 
     # a larger box with center_only=True equals the grid path's center pixel
     big = _images(b=3, h=25, w=24)
@@ -177,7 +188,9 @@ def test_inner_product_matches_grid_center_pixel(bank):
     )
     ref = _reference(bank, big, RECT)  # (B, cells, 6, 5)
     expected = ref[:, :, (6 - 1) // 2, (5 - 1) // 2].reshape(3, 2, 3)
-    torch.testing.assert_close(store.read(group, 0), expected, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(
+        read_group(store, group, 0), expected, rtol=1e-4, atol=1e-5
+    )
 
     # with a filter plane
     filt = torch.rand(1, 20, 11)
@@ -185,7 +198,9 @@ def test_inner_product_matches_grid_center_pixel(bank):
     sched, store, group = _run(make_featurizer(geo, bank), filtered, geo, pixels, RECT)
     pre = torch.fft.irfft2(torch.fft.rfft2(boxes) * filt[0], s=(20, 20))
     expected = _reference(bank, pre, RECT)[:, :, 0, 0].reshape(5, 2, 3)
-    torch.testing.assert_close(store.read(group, 0), expected, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(
+        read_group(store, group, 0), expected, rtol=1e-4, atol=1e-5
+    )
 
 
 def test_featurizer_mode_mismatch_raises(bank):

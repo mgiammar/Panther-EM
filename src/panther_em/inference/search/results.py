@@ -11,7 +11,6 @@ import numpy as np
 import torch
 
 from panther_em.inference.search.hypotheses import HypothesisSpace
-from panther_em.inference.search.ledger import PixelLabel
 from panther_em.inference.search.schedule import SearchSchedule, StageSpec
 from panther_em.inference.search.types import SearchGeometry
 
@@ -160,12 +159,6 @@ class SearchResult:
     def searched(self) -> torch.Tensor:
         """Bool map of pixels some stage evaluated."""
         return self.last_stage >= 0
-
-    def accepted(self) -> torch.Tensor:
-        """Bool map of ``ACCEPTED`` or ``ABSORBED`` pixels."""
-        return (self.label == int(PixelLabel.ACCEPTED)) | (
-            self.label == int(PixelLabel.ABSORBED)
-        )
 
     def psi_degrees(self) -> torch.Tensor:
         """Best in-plane angle in degrees (NaN where unsearched)."""

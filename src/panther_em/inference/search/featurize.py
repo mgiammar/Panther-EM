@@ -160,11 +160,6 @@ class TileSchedule:
     grid: TileGrid | None
 
     @property
-    def n_columns(self) -> int:
-        """``P``."""
-        return int(self.column_index.numel())
-
-    @property
     def tile(self) -> int:
         """Output tile side (``0`` in center mode)."""
         return 0 if self.grid is None else self.grid.tile_side

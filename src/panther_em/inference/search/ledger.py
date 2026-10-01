@@ -145,10 +145,6 @@ class PixelLedger:
         """A field as a dense ``(B, *grid)`` map."""
         return self.geometry.unflatten(getattr(self, name))
 
-    def counts(self) -> dict[str, int]:
-        """Number of pixels per label name."""
-        return {lab.name: int((self.label == int(lab)).sum()) for lab in PixelLabel}
-
     # -- neighbourhood ----------------------------------------------------------
 
     @torch.no_grad()

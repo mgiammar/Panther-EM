@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from conftest import read_group
 
 from panther_em.inference.search.store import FeatureStore, ReadyBlock
 from panther_em.inference.search.types import ImageSet, PixelSelection, SearchGeometry
@@ -72,7 +73,7 @@ def test_writer_splits_across_blocks_and_requires_completeness():
     w.close()
     assert g.complete
     for d in range(2):
-        got = store.read(g, d)  # (P, num_k, num_m)
+        got = read_group(store, g, d)  # (P, num_k, num_m)
         expected = data[d].T.reshape(10, 2, 3)
         torch.testing.assert_close(got, expected)
     with pytest.raises(ValueError):
@@ -114,7 +115,7 @@ def test_subset_compacts_columns_block_wise():
         assert g_new.rect == g_old.rect
         for plane in range(2):
             torch.testing.assert_close(
-                sub.read(g_new, plane), store.read(g_old, plane)[keep]
+                read_group(sub, g_new, plane), read_group(store, g_old, plane)[keep]
             )
     with pytest.raises(ValueError):
         store.subset(keep[:3])
@@ -130,7 +131,7 @@ def test_fp16_group_round_trip_cuda():
     w.write(slice(0, 6), (0, 10), data)
     w.close()
     torch.testing.assert_close(
-        store.read(g, 1).cpu(), data[1].T.reshape(10, 2, 3), rtol=2e-3, atol=2e-3
+        read_group(store, g, 1).cpu(), data[1].T.reshape(10, 2, 3), rtol=2e-3, atol=2e-3
     )
     assert store.nbytes() == 3 * 2 * 2 * 4 * 6 * 2
 

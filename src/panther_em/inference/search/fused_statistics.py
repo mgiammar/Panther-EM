@@ -29,7 +29,7 @@ class FusedPixelStats(PixelStats):
        three kernel launches per batch and no per-batch accumulate step. The packed
        best is decoded into ``best_corr`` / ``best_hypothesis`` / ``best_psi_angle``
        once, in :meth:`finalize`.
-    2. **Fused reduce** (:meth:`_reduce` / :meth:`_reduce_raw`): the lean kernel or,
+    2. **Fused reduce** (:meth:`_reduce`): the lean kernel or,
        failing that, the cuFFTDx block-FFT kernel, feeding the parent's accumulate.
     """
 
@@ -133,8 +133,8 @@ class FusedPixelStats(PixelStats):
         psi = (num_psi - flat % num_psi) % num_psi
         vmax_cast = vmax.to(self.best_corr.dtype)
         improved = vmax_cast > self.best_corr
-        # In place (`out=`), never rebinding the attributes: a CUDA graph captured by
-        # compressed._HypLoopGraph holds these exact buffers, and its captured clear()
+        # In place (`out=`), never rebinding the attributes: a captured CUDA graph
+        # (context.GraphedHypLoop) holds these exact buffers, and its captured clear()
         # must keep resetting the tensors finalize() reads.
         torch.where(improved, vmax_cast, self.best_corr, out=self.best_corr)
         torch.where(improved, global_hyp, self.best_hypothesis, out=self.best_hypothesis)
@@ -162,7 +162,7 @@ class FusedPixelStats(PixelStats):
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         | None
     ):
-        """Shared fast-path selection for :meth:`_reduce` and :meth:`_reduce_raw`.
+        """Fast-path selection for :meth:`_reduce`.
 
         Returns ``None`` (rather than raising) whenever the fused kernel can't handle
         this call -- spectrum isn't CUDA complex64, the kernel failed to compile, or
@@ -229,15 +229,6 @@ class FusedPixelStats(PixelStats):
         if result is not None:
             return result
         return super()._reduce(spectrum, num_psi)  # Parent torch fallback
-
-    def _reduce_raw(
-        self, spectrum: torch.Tensor, num_psi: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Same fast-path selection as :meth:`_reduce`, but skips the argmax decode."""
-        result = self._try_fused_reduce(spectrum, num_psi, decode=False)
-        if result is not None:
-            return result
-        return super()._reduce_raw(spectrum, num_psi)  # Parent torch fallback
 
 
 class FusedStatsBackend:

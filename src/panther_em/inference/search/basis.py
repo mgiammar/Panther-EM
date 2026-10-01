@@ -56,8 +56,6 @@ class _ByteLRU:
         self._items: OrderedDict[Hashable, torch.Tensor] = OrderedDict()
         self._pins: dict[Hashable, set[Hashable]] = {}
         self.nbytes = 0
-        self.hits = 0
-        self.misses = 0
 
     def __contains__(self, key: Hashable) -> bool:
         return key in self._items
@@ -68,10 +66,8 @@ class _ByteLRU:
     def get(self, key: Hashable) -> torch.Tensor | None:
         t = self._items.get(key)
         if t is None:
-            self.misses += 1
             return None
         self._items.move_to_end(key)
-        self.hits += 1
         return t
 
     def _pinned(self, key: Hashable) -> bool:
@@ -177,7 +173,6 @@ class KernelBank:
         self._spectral_cache = _ByteLRU(spectral_budget)
         self._spectral_enabled = spectral_budget is None or spectral_budget > 0
         self._planar_cache: dict[tuple[Cell, torch.dtype], torch.Tensor] = {}
-        self.built = 0  # kernels constructed so far (for tests/instrumentation)
 
     # -- construction --------------------------------------------------------
 
@@ -198,7 +193,6 @@ class KernelBank:
             cval=cfg.cval,
         )
         out = torch.as_tensor(cart, device=self.device).to(torch.complex64)
-        self.built += len(ms)
         return out
 
     def _build(self, missing: Sequence[Cell]) -> dict[Cell, torch.Tensor]:
@@ -523,11 +517,6 @@ class PreparedWeightCache:
     def nbytes(self) -> int:
         """Cached bytes."""
         return self._cache.nbytes
-
-    @property
-    def stats(self) -> tuple[int, int]:
-        """``(hits, misses)``."""
-        return self._cache.hits, self._cache.misses
 
     def clear(self) -> None:
         """Drop every entry (including pinned ones; only call with no live graphs)."""

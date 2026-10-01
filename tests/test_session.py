@@ -1,4 +1,4 @@
-"""Searcher / SearchSession end to end, incl. the A/B gate against the legacy API."""
+"""Searcher / SearchSession end to end against a dense reference."""
 
 from __future__ import annotations
 
@@ -7,11 +7,9 @@ import warnings
 import pytest
 import torch
 
-from panther_em.inference.search import compressed_search, incremental_search
+from panther_em.inference.correlation import compute_feature_stack
 from panther_em.inference.search.basis import Template
 from panther_em.inference.search.decisions import (
-    DecisionChain,
-    DilationAbsorb,
     NoDecision,
     ThresholdClassifier,
     TopFractionSelector,
@@ -28,7 +26,6 @@ from panther_em.inference.search.schedule import (
     nested_schedule,
 )
 from panther_em.inference.search.searcher import ExecutionConfig, Searcher
-from panther_em.inference.search.tracking import MultiPrecisionPixelTracker
 from panther_em.inference.search.types import BatchShape, ImageSet
 
 pytestmark = pytest.mark.filterwarnings(
@@ -62,7 +59,7 @@ class StubFeaturizer:
         stream=None,
     ):
         self.calls += 1
-        n = schedule.n_columns
+        n = int(schedule.column_index.numel())
         k0, m0, ke, me = group.rect
         for c, (k, m) in enumerate((k0 + i // me, m0 + i % me) for i in range(ke * me)):
             gen = torch.Generator().manual_seed(self.seed * 100003 + k * 1009 + m)
@@ -84,105 +81,110 @@ def _image(h=30, w=30, seed=0):
     return torch.randn(h, w, generator=torch.Generator().manual_seed(seed))
 
 
-def test_single_stage_matches_legacy_compressed_search(template):
+def _dense_reference(template, image, rects, n_psi):
+    """Per-pixel statistics from the dense correlogram (kernels, FFT, einsum, irfft)."""
+    recon = template.reconstructor
+    us = torch.as_tensor(recon.result.U) * torch.as_tensor(recon.result.S)[None, None]
+    us = us.reshape(-1, *us.shape[2:]).to(torch.complex64)  # (N, K, E)
+    k_stop = max(k0 + ke for k0, _, ke, _ in rects)
+    C = None
+    for k0, m0, ke, me in rects:
+        cells = torch.stack(
+            torch.meshgrid(
+                torch.arange(k0, k0 + ke), torch.arange(m0, m0 + me), indexing="ij"
+            ),
+            dim=-1,
+        ).reshape(-1, 2)
+        kernels = template.kernels.spatial(cells)
+        feats = compute_feature_stack(image[None], kernels)[0]  # (cells, oh, ow)
+        oh, ow = feats.shape[-2:]
+        y = feats.reshape(ke, me, oh * ow).permute(2, 0, 1)  # (P, ke, me)
+        w = us[:, k0 : k0 + ke, m0 : m0 + me]
+        if C is None:
+            C = torch.zeros(oh * ow, us.shape[0], k_stop, dtype=torch.complex64)
+        C[:, :, k0 : k0 + ke] += torch.einsum("pkm,nkm->pnk", y, w.conj())
+    corr = torch.fft.irfft(C, n=n_psi, dim=-1, norm="forward")
+    flat = corr.reshape(corr.shape[0], -1)
+    mip, amax = flat.max(dim=1)
+    mean = flat.mean(dim=1)
+    var = (flat**2).mean(dim=1) - mean**2
+    best = amax // n_psi
+    psi = (n_psi - amax % n_psi) % n_psi
+    unique = (flat == mip[:, None]).sum(dim=1) == 1
+    return (
+        mip.reshape(oh, ow),
+        mean.reshape(oh, ow),
+        var.reshape(oh, ow),
+        best.reshape(oh, ow),
+        psi.reshape(oh, ow),
+        unique.reshape(oh, ow),
+    )
+
+
+def test_single_stage_matches_dense_reference(template):
     image = _image()
     rects = [(0, 0, 4, 3), (0, 3, 2, 2)]
-    legacy = compressed_search(
-        image,
-        template.reconstructor,
-        rects,
-        pixel_batch=8,
-        hyp_batch=5,
-        n_psi=16,
-        feature_chunk=4,
-        show_progress=False,
-        use_fused_kernel=False,
-    )
+    mip, mean, var, best, psi, unique = _dense_reference(template, image, rects, 16)
     searcher = Searcher(
         template, SearchSchedule.single(StageSpec(rects, n_psi=16)), execution=EXEC
     )
     res = searcher.run(ImageSet.single(image))
     assert res.mip.shape == (1, 11, 11)
-    for key in ("mip", "mean", "variance", "zscore"):
-        torch.testing.assert_close(
-            getattr(res, key)[0], legacy[key], rtol=1e-4, atol=1e-4
-        )
-    unique = (res.zscore[0] - legacy["zscore"]).abs() < 1e-3
-    assert torch.equal(res.best_index[0][unique], legacy["best_index"][unique])
-    assert torch.equal(res.best_psi[0][unique], legacy["best_psi"][unique])
+    torch.testing.assert_close(res.mip[0], mip, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(res.mean[0], mean, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(res.variance[0], var, rtol=1e-4, atol=1e-4)
+    assert torch.equal(res.best_index[0][unique], best[unique])
+    assert torch.equal(res.best_psi[0][unique], psi[unique])
     assert torch.all(res.label == int(PixelLabel.UNCERTAIN)) and torch.all(
         res.last_stage == 0
     )
 
 
-def test_multi_stage_matches_legacy_incremental_search_with_tracker(template):
+def test_multi_stage_reuses_features_and_matches_single_stage_runs(template):
+    """Each stage of a nested schedule equals a single-stage search of its rects."""
     image = _image(seed=3)
-    stage_rects = [[(0, 0, 2, 2)], [(0, 0, 4, 3)], [(0, 0, 4, 5)]]
-    errors = [0.3, 0.1, 0.02]
-    threshold = 1.5
-    recon = template.reconstructor
-    tracker = MultiPrecisionPixelTracker(
-        stage_errors=errors,
-        zscore_threshold=threshold,
-        dilation_radius=1,
-        reconstructor=recon,
-        image=image,
-        device="cpu",
-    )
-    follow_ups: list[torch.Tensor] = []
-
-    def follow(maps, px):
-        nxt = tracker.step(maps, px)
-        follow_ups.append(nxt)
-        return nxt
-
-    legacy_stages = list(
-        incremental_search(
-            image,
-            recon,
-            stage_rects,
-            pixel_batch=8,
-            hyp_batch=5,
-            n_psi=16,
-            feature_chunk=4,
-            follow_up_fn=follow,
-            use_fused_kernel=False,
-        )
-    )
-    legacy_pixels = [torch.arange(121), *follow_ups[: len(legacy_stages) - 1]]
-    legacy_final = tracker.finalize(reshape=True)
-
+    stage_rects = [[(0, 0, 2, 2)], [(0, 0, 2, 2), (0, 2, 4, 3)], [(0, 0, 4, 5)]]
     schedule = SearchSchedule(
-        tuple(
-            StageSpec(r, n_psi=16, error=e)
-            for r, e in zip(stage_rects, errors, strict=True)
-        ),
-        tuple(
-            DecisionChain(
-                ZScoreIntervalClassifier(threshold, units="absolute"), DilationAbsorb(1)
-            )
-            for _ in errors
+        tuple(StageSpec(r, n_psi=16) for r in stage_rects),
+        (
+            TopFractionSelector(fraction=0.5),
+            TopFractionSelector(fraction=0.5),
+            ThresholdClassifier(1.5),
         ),
         keep_stage_results=True,
     )
     searcher = Searcher(template, schedule, execution=EXEC)
     results = list(searcher.session(ImageSet.single(image)))
-    assert len(results) == len(legacy_stages)
-    for new, old, old_px in zip(results, legacy_stages, legacy_pixels, strict=True):
-        order = torch.argsort(new.pixel_index)
-        assert torch.equal(new.pixel_index[order], old_px)
-        for key in ("mip", "mean", "variance"):
-            torch.testing.assert_close(
-                getattr(new.maps, key)[order], old[key], rtol=1e-4, atol=1e-4
-            )
-    final = searcher.session(ImageSet.single(image)).run_all()
-    assert torch.equal(final.label[0], legacy_final["status"][0])
-    torch.testing.assert_close(
-        final.mip[0], legacy_final["mip"][0], rtol=1e-4, atol=1e-4, equal_nan=True
-    )
-    assert torch.equal(
-        final.last_stage[0].to(torch.int64), legacy_final["last_stage"][0]
-    )
+    assert len(results) == 3
+    n_pixels = [r.n_pixels for r in results]
+    assert n_pixels[0] == 121 and n_pixels[0] > n_pixels[1] > n_pixels[2] > 0
+    for stage in results:
+        mip, mean, var, best, _psi, unique = _dense_reference(
+            template, image, list(stage.spec.rectangles), 16
+        )
+        rows, cols = stage.pixel_index // 11, stage.pixel_index % 11
+        torch.testing.assert_close(
+            stage.maps.mip, mip[rows, cols], rtol=1e-4, atol=1e-4
+        )
+        torch.testing.assert_close(
+            stage.maps.mean, mean[rows, cols], rtol=1e-4, atol=1e-4
+        )
+        torch.testing.assert_close(
+            stage.maps.variance, var[rows, cols], rtol=1e-4, atol=1e-4
+        )
+        u = unique[rows, cols]
+        assert torch.equal(stage.best_index[u], best[rows, cols][u])
+    # stage 0's (0,0,2,2) group was carried into stage 1 rather than re-featurized
+    store = searcher.session(ImageSet.single(image))
+    list(store)
+    assert [g.rect for g in store.store.groups] == [
+        (0, 0, 2, 2),
+        (0, 2, 4, 3),
+        (0, 0, 4, 5),
+    ]
+    final = searcher.run(ImageSet.single(image))
+    assert set(torch.unique(final.label).tolist()) <= {int(lab) for lab in PixelLabel}
+    assert (final.last_stage[0] >= 0).sum() == 121
 
 
 def test_session_narrows_stops_and_keeps_stage_results(template):

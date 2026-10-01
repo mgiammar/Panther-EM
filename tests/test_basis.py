@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from conftest import count_kernel_builds
 
 from panther_em.inference.projection_reconstruction import ProjectionReconstructor
 from panther_em.inference.search.basis import (
@@ -14,14 +15,38 @@ from panther_em.inference.search.basis import (
 )
 from panther_em.inference.search.contraction import ComplexGemmEngine
 from panther_em.inference.search.hypotheses import HypBatch
-from panther_em.inference.search.tiling import FeatureLayout, FeatureTiling
+from panther_em.inference.search.tiling import FeatureLayout
 from panther_em.inference.search.types import KernelConfig
-from panther_em.inference.search.utils import build_block_kernels, build_layout_weights
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",
     "ignore:.*__array__ implementation doesn't accept.*:DeprecationWarning",
 )
+
+
+def build_block_kernels(recon, cells, **kwargs):
+    """Reference: one ``construct_cartesian_feature`` call per cell."""
+    return torch.stack(
+        [
+            torch.as_tensor(
+                recon.construct_cartesian_feature(
+                    int(k), int(m), return_torch=True, **kwargs
+                )
+            ).to(torch.complex64)
+            for k, m in cells.tolist()
+        ]
+    )
+
+
+def reference_layout_weights(result, layout):
+    """Reference ``U * S`` in a layout's slot order, straight from the result arrays."""
+    us = torch.as_tensor(result.U) * torch.as_tensor(result.S)[None, None]
+    ff, o = us.shape[:2]
+    blocks = [
+        us[:, :, k0 : k0 + ke, m0 : m0 + me].reshape(ff * o, ke * me)
+        for k0, m0, ke, me in layout.rectangles
+    ]
+    return torch.cat(blocks, dim=1).to(torch.complex64)
 
 
 @pytest.fixture
@@ -33,20 +58,21 @@ def _cells(*pairs):
     return torch.tensor(pairs, dtype=torch.long)
 
 
-def test_kernel_bank_matches_legacy_build_block_kernels(recon):
+def test_kernel_bank_matches_per_cell_construction(recon):
     cells = _cells((0, 0), (2, 3), (1, 1), (3, 4), (2, 0))
     bank = KernelBank(recon, KernelConfig())
+    built = count_kernel_builds(bank)
     got = bank.spatial(cells)
     expected = build_block_kernels(recon, cells)
     assert got.shape == (5, 20, 20) and got.dtype == torch.complex64
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
     # order preserved and duplicates handled; nothing rebuilt on a repeat request
-    built = bank.built
+    assert built[0] == 5
     again = bank.spatial(_cells((3, 4), (0, 0), (0, 0)))
     torch.testing.assert_close(again[0], expected[3])
     torch.testing.assert_close(again[1], expected[0])
     torch.testing.assert_close(again[2], expected[0])
-    assert bank.built == built == 5
+    assert built[0] == 5
 
 
 def test_kernel_bank_respects_kernel_config(recon):
@@ -66,17 +92,19 @@ def test_kernel_bank_budget_eviction_and_host_tier(recon):
     ref = build_block_kernels(recon, cells)
 
     bank = KernelBank(recon, device_budget=2 * one, host_budget=10 * one)
+    built = count_kernel_builds(bank)
     torch.testing.assert_close(bank.spatial(cells), ref)
     dev, host = bank.bytes()
-    assert dev <= 2 * one and host == 2 * one and bank.built == 4
+    assert dev <= 2 * one and host == 2 * one and built[0] == 4
     torch.testing.assert_close(bank.spatial(cells), ref)  # served from the two tiers
-    assert bank.built == 4
+    assert built[0] == 4
 
     no_host = KernelBank(recon, device_budget=2 * one)
+    rebuilt = count_kernel_builds(no_host)
     no_host.spatial(cells)
     assert no_host.bytes() == (2 * one, 0)
     no_host.spatial(cells)
-    assert no_host.built > 4  # evicted kernels had to be rebuilt
+    assert rebuilt[0] > 4  # evicted kernels had to be rebuilt
 
 
 def test_kernel_bank_spectral_and_planar(recon):
@@ -103,14 +131,12 @@ def test_kernel_bank_spectral_and_planar(recon):
     )
 
 
-def test_weight_source_matches_legacy_layout_weights(recon):
+def test_weight_source_matches_reference_layout_weights(recon):
     rects = [(0, 0, 2, 3), (2, 0, 2, 2), (0, 3, 2, 2)]
     layout = FeatureLayout(rects)
     src = WeightSource(recon.result, "cpu")
     got = src.layout_weights(layout)
-    legacy = build_layout_weights(
-        recon, FeatureTiling.from_extents(rects, device="cpu")
-    )
+    legacy = reference_layout_weights(recon.result, layout)
     torch.testing.assert_close(got, legacy)
     assert src.n_templates == 6 and src.nbytes == 6 * 4 * 5 * 8
 
@@ -155,7 +181,7 @@ def test_prepared_weight_cache_hits_evicts_and_pins(recon):
     )
     torch.testing.assert_close(got, manual)
     assert got.shape == (3, 5, 4)
-    assert cache.get(layout, run, batch, engine) is got and cache.stats == (1, 1)
+    assert cache.get(layout, run, batch, engine) is got
 
     rows = torch.tensor([0, 2, 4, 5])
     sub = cache.get(layout, run, HypBatch(0, 0, 2, 0, 0, 0), engine, rows, rows_key="r")

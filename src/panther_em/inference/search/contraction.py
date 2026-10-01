@@ -21,11 +21,49 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
 
-from panther_em.inference.search.tiling import KRun, _weights_fp16_4m
 from panther_em.inference.search.types import Precision
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from panther_em.inference.search.tiling import KRun
+
+
+def _weights_fp16_4m(w_conj: torch.Tensor) -> torch.Tensor:
+    r"""Interleave a pre-conjugated ``(N, num_k, num_m)`` block for the fp16 4M GEMM.
+
+    The complex product ``C = Y @ w`` (``w`` already conjugated) is computed as ONE
+    real GEMM per ``k``: ``[Yr | Yi] (P, 2 num_m) @ B (2 num_m, 2N)`` with the columns
+    of ``B`` interleaved so that ``out[:, 2n] = Cr[:, n]`` and
+    ``out[:, 2n+1] = Ci[:, n]``::
+
+        Cr = Yr wr - Yi wi  ->  B[:num_m, 2n]   = wr[:, n], B[num_m:, 2n]   = -wi[:, n]
+        Ci = Yr wi + Yi wr  ->  B[:num_m, 2n+1] = wi[:, n], B[num_m:, 2n+1] =  wr[:, n]
+
+    The real ``(num_k, P, 2N)`` output is therefore bit-identical in memory to a
+    ``(num_k, P, N)`` complex tensor -- exactly the layout the fused reduce kernels
+    consume, with no transposes or copies.
+
+    Parameters
+    ----------
+    w_conj : torch.Tensor
+        Pre-conjugated complex weights ``(N, num_k, num_m)``.
+
+    Returns
+    -------
+    torch.Tensor
+        float16 ``(num_k, 2 num_m, 2N)``, contiguous.
+    """
+    n, num_k, num_m = w_conj.shape
+    wk = w_conj.permute(1, 2, 0)  # (num_k, num_m, N)
+    b = torch.empty(
+        (num_k, 2 * num_m, 2 * n), dtype=torch.float16, device=w_conj.device
+    )
+    b[:, :num_m, 0::2] = wk.real
+    b[:, num_m:, 0::2] = -wk.imag
+    b[:, :num_m, 1::2] = wk.imag
+    b[:, num_m:, 1::2] = wk.real
+    return b
 
 
 @dataclass(frozen=True, eq=False)
@@ -134,11 +172,6 @@ class ContractionEngine(Protocol):
     ) -> None:
         """Write ``data`` ``(D, n_cells, n_cols)`` complex features into ``block``."""
 
-    def read_block(
-        self, block: torch.Tensor, d: int, cols: slice | None = None
-    ) -> torch.Tensor:
-        """``(P, num_k, num_m)`` complex64 view/copy of one defocus plane."""
-
     def operand(
         self,
         block: torch.Tensor,
@@ -195,13 +228,6 @@ class ComplexGemmEngine:
         for k, m0, m1, i0, i1 in _cells_to_rows(cells, num_m):
             # data (D, n_cells, n_cols) -> block[:, k, cols, m0:m1] (D, n_cols, m1-m0)
             block[:, k, cols, m0:m1] = data[:, i0:i1, :].transpose(1, 2).to(block.dtype)
-
-    def read_block(
-        self, block: torch.Tensor, d: int, cols: slice | None = None
-    ) -> torch.Tensor:
-        """``(P, num_k, num_m)`` complex64 view/copy of one defocus plane."""
-        plane = block[d] if cols is None else block[d][:, cols]
-        return plane.permute(1, 0, 2)  # (P, num_k, num_m)
 
     def operand(
         self,
@@ -269,16 +295,6 @@ class Fp16GemmEngine:
             block[:, k, cols, m0:m1] = chunk.real.to(torch.float16)
             block[:, k, cols, num_m + m0 : num_m + m1] = chunk.imag.to(torch.float16)
 
-    def read_block(
-        self, block: torch.Tensor, d: int, cols: slice | None = None
-    ) -> torch.Tensor:
-        """``(P, num_k, num_m)`` complex64 view/copy of one defocus plane."""
-        num_m = self.block_num_m(block)
-        plane = block[d] if cols is None else block[d][:, cols]  # (num_k, P, 2 num_m)
-        re = plane[..., :num_m].to(torch.float32)
-        im = plane[..., num_m:].to(torch.float32)
-        return torch.complex(re, im).permute(1, 0, 2)  # (P, num_k, num_m)
-
     def operand(
         self,
         block: torch.Tensor,
@@ -322,18 +338,10 @@ def make_engine(precision: Precision | str) -> ContractionEngine:
     return ComplexGemmEngine(precision)
 
 
-def reference_spectrum(y: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """Dense reference ``C[p, n, k] = sum_m Y[p, k, m] conj(W[n, k, m])``."""
-    return torch.einsum(
-        "pkm,nkm->pnk", y.to(torch.complex64), w.conj().to(torch.complex64)
-    )
-
-
 __all__ = [
     "ComplexGemmEngine",
     "ContractionEngine",
     "Fp16GemmEngine",
     "Spectrum",
     "make_engine",
-    "reference_spectrum",
 ]

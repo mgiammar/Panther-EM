@@ -1,188 +1,176 @@
-r"""Symmetry exploiting SVD-2DTM search including in-plane rotations.
+r"""Symmetry-exploiting SVD-2DTM search including in-plane rotations.
 
-This package splits the SVD-2DTM search into composable pieces:
+The search reconstructs, for every image pixel, the cross-correlation with every
+template hypothesis (defocus plane x Fourier filter x orientation x in-plane angle)
+from a low-rank decomposition of the polar-coordinate projections, and reduces it to
+per-pixel statistics (maximum, its hypothesis, mean, variance, z-score) without ever
+materialising the full correlogram.
 
-* :mod:`~panther_em.inference.search.tiling` -- rectangular selections of
-  ``(k, m)`` feature space (:class:`FeatureTiling`) and the persistent featurized
-  image (:class:`FeaturizedImageStore`).
-* :mod:`~panther_em.inference.search.utils` -- reconstructor-facing helpers that
-  build Cartesian kernels, featurize an image, and build contraction weights.
-* :mod:`~panther_em.inference.search.statistics` -- online per-pixel statistics
-  (:class:`PixelStats`).
-* :mod:`~panther_em.inference.search.compressed` -- a single-stage search
-  (:func:`compressed_search`) for producing approximate 2DTM results.
-* :mod:`~panther_em.inference.search.incremental` -- the multi-stage,
-  multi-precision driver (:func:`incremental_search`) to enable initial, low-precision,
-  and low-cost searches followed by sparse, higher-precision searches.
-* :mod:`~panther_em.inference.search.tracking` -- the error-aware accept/reject/
-  follow-up pixel partitioning process (:class:`MultiPrecisionPixelTracker`) plugged
-  into :func:`incremental_search` via its ``follow_up_fn`` hook.
-
-
-Pre-processing Stage
+Objects, by lifetime
 --------------------
-1.  Given a "SVD result" object, select the top-r features each with
-    ``(k_idx, eig_idx)`` plus the associated singular values, ``s``. Then, reorder the
-    indices of the top-r features such that they appear in increasing ``k_idx`` order
-    (for efficiency in a downstream grouped sum reduction stage).
-2.  Using the associated "reconstruction" object, produce the complex-valued Cartesian
-    template feature kernels for the top-r selected features (from
-    :func:`build_block_kernels`).
-3.  If appropriate (decomposition- and image-dependent), apply Fourier filters to the
-    the template feature kernels. Assume the image has already been pre-processed.
+* **Per template** (:mod:`.basis`): :class:`Template` bundles a
+  :class:`~panther_em.decomposition.result.DecompositionResult` with a lazily built,
+  byte-budgeted :class:`KernelBank` (Cartesian feature kernels) and a device-resident
+  :class:`WeightSource` (``U * S``).
+* **Per search** (:mod:`.schedule`, :mod:`.searcher`): a :class:`SearchSchedule` of
+  :class:`StageSpec`\ s (feature rectangles, precision, ``n_psi``, relative
+  reconstruction error) each followed by a :class:`~.decisions.Decision`;
+  :func:`nested_schedule` builds the common nested case and :class:`ErrorModel`
+  derives the errors from the singular values. :class:`Searcher` binds a template to a
+  schedule and owns the execution resources that amortise across images (prepared
+  weights, captured CUDA graphs).
+* **Per image set** (:mod:`.types`, :mod:`.searcher`, :mod:`.results`): an
+  :class:`ImageSet` (already preprocessed images, optional defocus filter planes,
+  optional mask) runs through a :class:`SearchSession`, which yields a
+  :class:`StageResult` per stage and a dense :class:`SearchResult` at the end.
 
+Pipeline of one stage
+---------------------
+1. **Plan** (:mod:`.executor`, :mod:`.context`): batch shape, block size, contraction
+   engine (:mod:`.contraction`: fp32 / tf32 complex GEMM or the fp16 "4M" GEMM),
+   statistics backend (:mod:`.statistics`, :mod:`.fused_statistics`: pure torch or
+   the fused CUDA iRFFT+statistics kernel) and the :class:`~.hypotheses.HypothesisPlan`
+   (contiguous *virtual* ids over selected templates and defocus planes).
+2. **Featurize** (:mod:`.featurize`, :mod:`.store`): the pixels that survived the
+   previous stage are cross-correlated with the kernels of every new rectangle, by
+   tiled FFT (grid mode) or one GEMM (center-only particle mode), straight into the
+   block-aligned :class:`FeatureStore` in the engine's operand layout.
+3. **Execute** (:mod:`.executor`): per block, per GEMM sub-batch, per defocus plane and
+   per hypothesis batch: one contraction into a static spectrum, one statistics
+   update (in-kernel accumulation on CUDA), optionally replayed as one CUDA graph.
+4. **Decide** (:mod:`.ledger`, :mod:`.decisions`): the stage's maps are written to the
+   dense :class:`PixelLedger`; the stage's decision labels pixels
+   ``ACCEPTED`` / ``REJECTED`` / ``UNCERTAIN`` (``ABSORBED`` near accepted ones);
+   ``UNCERTAIN`` pixels form the next stage's pixel set.
 
-Image Featurization Stage
--------------------------
-1.  Do a complex-valued cross-correlation of the image (shape ``[H, W]``) with the stack
-    of kernels (shape ``[r, h, w]``) into an output featurized image for the valid
-    cross-correlation region, denoted as variable ``Z``, with shape
-    ``[H - h + 1, W - w + 1, r]``. NOTE: last (feature) dimension is contiguous for
-    efficient per-pixel memory access.
-2.  Based on an optional real-space correlation pixel mask, ``M``, with shape
-    ``[H - h + 1, W - w + 1]``, apply the mask to the featurized image ``Z``.
-3.  Then, flatten the featurized pixel image into a 2D tensor of shape ``[P, r]`` where
-    ``P = (H - h + 1) * (W - w + 1)`` for no mask or ``P = sum(M)`` for a mask. Refer to
-    this flattened featurized 2D tensor as ``Y``.
+Example
+-------
+::
 
-NOTE: Arbitrarily batched images are also supported for shapes ``(..., H, W)``. The
-      featurization stage still collapses the spatial dimension into a single pixel axis
-      but tracking input shape permits reconstruction.
+    template = Template.from_hdf5("decomp_60S.h5", device="cuda:0")
+    schedule = nested_schedule(
+        [(32, 16), (64, 32), (128, 48)],
+        precision=["fp16", "fp16", "fp32"],
+        n_psi=256,
+        decision=[DecisionChain(ZScoreIntervalClassifier(7.8), DilationAbsorb(1))] * 2
+        + [ThresholdClassifier(7.8)],
+        error_model=ErrorModel.from_result(template.result),
+    )
+    searcher = Searcher(template, schedule)
+    result = searcher.run(ImageSet.single(micrograph))        # (1, out_h, out_w) maps
+    result.decode().phi, result.decode().psi, result.label
 
+Particle stacks: ``ImageSet.from_boxes(boxes)`` (box == template -> center-only
+mode, ``result.per_particle()``). Defocus planes: ``Searcher(..., n_defocus=D)`` and
+``ImageSet.single(image, filters=ctf_stack)`` with ``(D, H, W // 2 + 1)`` filters;
+the statistics then run over defocus as a hypothesis axis and
+``result.decode().defocus_index`` reports the best plane.
 
-Inner Product Search Stage
---------------------------
-1.  Construct the per-hypotheses weights from the "SVD result" object (using
-    :func:`build_block_weights`) which represent ``U\Sigma`` for the selected ``r``
-    features. These weights have shape ``(N', r)`` where ``N'`` indexes out-of-plane
-    orientation and possibly defocus hypotheses.
-2.  Choose batch dimensions across flattened pixel space ``PX_BATCH_SIZE`` and the
-    hypothesis space ``HY_BATCH_SIZE``.
-3.  Do a partial sum reduction inner product for a batch combination (across only
-    ``eig_idx`` for each ``k_idx``) in a tiled kernel via:
-    a.  Extract a ``[PX_BLOCK_DIM, FT_BLOCK_DIM]`` tile from the the flattened
-        featurized image as ``y``.
-    b.  Extract a ``[HY_BLOCK_DIM, FT_BLOCK_DIM]`` tile from the reconstruction weights
-        as ``w``.
-    c.  Compute batched element-wise multiplication between ``y`` and ``w`` along the
-        feature dimension reducing (sum-wise) to an output tile ``c`` of shape
-        ``[PX_BLOCK_DIM, HY_BLOCK_DIM, NUM_K]`` based on the associated angular
-        frequency ``k_idx`` of each feature.
-    d.  Accumulate results from each tile into a final output tensor, ``C``, for the
-        batch combination with shape ``[PX_BATCH_SIZE, HY_BATCH_SIZE, NUM_K]``.
-    e.  Apply a inverse real-valued FFT across the angular frequency dimension (-1) to
-        produce a real-valued correlogram for the batch combination with shape
-        ``[PX_BATCH_SIZE, HY_BATCH_SIZE, N_psi]``.
-    f.  Apply statistics tracking and reduction (online mean/variance update, max/argmax
-        tracking across hypothesis and psi dimensions) to the correlogram.
-4.  Repeat step 3 for all combinations across batch sizes to process full images.
-
-
-A Multi-Precision Approach
---------------------------
-Leveraging knowledge of SVD truncation rank (selected top-r features) and reconstruction
-accuracy, can begin with a much lower-precision correlogram reconstruction and
-progressively increase reconstruction rank. Based on current iteration result and the
-reconstruction accuracy (from singular values, plus/minus some bounds), can iterate on
-the algorithm as:
-1.  Partition reconstructed cross-correlogram values into following three categories:
-    a.  Accepted detections (based on reconstruction accuracy, far above expectation)
-    b.  Rejected detections (based on reconstruction accuracy, far below expectation)
-    c.  Image positions for further follow-up.
-2.  Record accepted and rejected image locations plus associated statistics, update
-    image mask to select for only follow-up positions.
-3.  Repeat though pre-processing stage with the updated image mask and a selected
-    ``r_{i+1} > r_{i}``. NOTE: Can leverage pre-calculated data, like previous kernels,
-    if stored appropriately.
-
-
-Performance Backends
---------------------
-The inner-product search stage (step 3 above) is where all the time goes, and it has
-three switchable backends layered on the same algorithm:
-
-*   **Contraction** (:meth:`FeatureTiling.run`, ``precision=``): ``"fp32"`` cuBLAS
-    cgemm (default), ``"tf32"`` the same on TF32 tensor cores, or ``"fp16"`` -- a
-    real-valued "4M" GEMM on FP16 tensor cores whose interleaved ``(re, im)`` output
-    columns make the fp16 result bit-identical in memory to a ``(k, P, N)`` complex
-    tensor. About 4x the cgemm rate, ~4e-4 relative error in the correlations. Any
-    multi-rectangle tiling is planned as one GEMM per run of ``k`` with a constant
-    covering-region set (:attr:`FeatureTiling.k_intervals`), written straight into its
-    ``k``-slab of the spectrum.
-*   **psi recovery + statistics** (:class:`FusedPixelStats`): a register-resident CUDA
-    kernel (``csrc/lean_irfft_stats.cuh``) does the zero-padded iRFFT, the Parseval
-    moments and the max/argmax with no shared-memory traffic, reading complex64 or
-    complex32 spectra in the GEMM's native layout; it is exact w.r.t. the torch path
-    and DRAM-bandwidth bound. It can also accumulate straight into the running
-    per-pixel state across all hypothesis batches (a global hypothesis offset is
-    baked into the packed argmax), so a stage needs no per-batch accumulate kernels.
-    Frequencies above 64 fold exactly onto its 64-point transform, so it covers any
-    ``NumFreq <= n_psi/2 + 1`` at ``n_psi`` in ``{128, 256}``; a cuFFTDx block-FFT
-    kernel remains the fallback for ``n_psi == 64``, and the pure-torch reduction
-    behind that. The transform code is generated by ``csrc/gen_lean_fft.py``.
-*   **Loop execution** (``use_cuda_graph=``): each pixel batch's whole hypothesis loop
-    is captured once as a CUDA graph (two interleaved streams by default) and
-    replayed, removing per-batch launch and Python overhead.
-
-Throughput is best when the per-batch spectrum ``P * N * NumFreq`` (x4 bytes in fp16)
-stays L2-resident, e.g. ``pixel_batch * hyp_batch ~ 2.5e5`` at ``NumFreq = 64`` on a
-96 MB L2. Measured on an RTX 6000 Ada with ``NumFreq = 64``, 64 eigenvectors per
-frequency and ``n_psi = 256``, the inner loop went from ~23 G correlations/s (pure
-torch) to ~145 (fp32, exact) and ~350-500 (fp16 + graph), where one correlation is
-one ``(pixel, hypothesis, psi)`` evaluation. See ``scratch/svd_search_opt/`` for the
-benchmarks behind these numbers.
+Inputs are expected to be preprocessed already (whitened, normalised, contrast
+convention applied); Panther-EM applies no image preprocessing.
 """
 
 from __future__ import annotations
 
-from panther_em.inference.search.compressed import (
-    compressed_search,
-    search_output_shape,
+from panther_em.inference.search.basis import (
+    KernelBank,
+    PreparedWeightCache,
+    Template,
+    WeightSource,
 )
-from panther_em.inference.search.fused_statistics import FusedPixelStats
-from panther_em.inference.search.incremental import incremental_search
-from panther_em.inference.search.staging import PixelStager
-from panther_em.inference.search.statistics import PixelStats
-from panther_em.inference.search.tiling import (
-    FeatureTiling,
-    FeaturizedImageStore,
-    Rectangle,
-    RectangularFeatureRegion,
-)
-from panther_em.inference.search.tracking import (
-    MultiPrecisionPixelTracker,
-    PixelLabel,
+from panther_em.inference.search.context import DeviceCaps, MemoryPlan, Planner
+from panther_em.inference.search.decisions import (
+    Decision,
+    DecisionChain,
+    DilationAbsorb,
+    NoDecision,
+    ThresholdClassifier,
+    TopFractionSelector,
+    ZScoreIntervalClassifier,
     classify_zscore_interval,
+    zscore_error_intervals,
 )
-from panther_em.inference.search.utils import (
-    build_block_feature_stack,
-    build_block_kernels,
-    build_block_weights,
-    build_layout_weights,
-    build_multichannel_correlogram,
-    featurize_cells,
+from panther_em.inference.search.featurize import (
+    Featurizer,
+    FFTCorrelationFeaturizer,
+    InnerProductFeaturizer,
+    make_featurizer,
+)
+from panther_em.inference.search.hypotheses import (
+    HypothesisPlan,
+    HypothesisSpace,
+    HypothesisSubset,
     psi_degrees,
+)
+from panther_em.inference.search.ledger import PixelLabel, PixelLedger
+from panther_em.inference.search.results import DecodedMaps, SearchResult, StageResult
+from panther_em.inference.search.schedule import (
+    ErrorModel,
+    SearchSchedule,
+    StageSpec,
+    nested_schedule,
+)
+from panther_em.inference.search.searcher import (
+    ExecutionConfig,
+    Searcher,
+    SearchSession,
+)
+from panther_em.inference.search.store import FeatureStore
+from panther_em.inference.search.tiling import FeatureLayout
+from panther_em.inference.search.types import (
+    BatchShape,
+    ImageSet,
+    KernelConfig,
+    PixelSelection,
+    Precision,
+    Rectangle,
+    SearchGeometry,
 )
 
 __all__ = [
-    "FeatureTiling",
-    "FeaturizedImageStore",
-    "FusedPixelStats",
-    "MultiPrecisionPixelTracker",
+    "BatchShape",
+    "Decision",
+    "DecisionChain",
+    "DecodedMaps",
+    "DeviceCaps",
+    "DilationAbsorb",
+    "ErrorModel",
+    "ExecutionConfig",
+    "FFTCorrelationFeaturizer",
+    "FeatureLayout",
+    "FeatureStore",
+    "Featurizer",
+    "HypothesisPlan",
+    "HypothesisSpace",
+    "HypothesisSubset",
+    "ImageSet",
+    "InnerProductFeaturizer",
+    "KernelBank",
+    "KernelConfig",
+    "MemoryPlan",
+    "NoDecision",
     "PixelLabel",
-    "PixelStager",
-    "PixelStats",
+    "PixelLedger",
+    "PixelSelection",
+    "Planner",
+    "Precision",
+    "PreparedWeightCache",
     "Rectangle",
-    "RectangularFeatureRegion",
-    "build_block_feature_stack",
-    "build_block_kernels",
-    "build_block_weights",
-    "build_layout_weights",
-    "build_multichannel_correlogram",
+    "SearchGeometry",
+    "SearchResult",
+    "SearchSchedule",
+    "SearchSession",
+    "Searcher",
+    "StageResult",
+    "StageSpec",
+    "Template",
+    "ThresholdClassifier",
+    "TopFractionSelector",
+    "WeightSource",
+    "ZScoreIntervalClassifier",
     "classify_zscore_interval",
-    "compressed_search",
-    "featurize_cells",
-    "incremental_search",
+    "make_featurizer",
+    "nested_schedule",
     "psi_degrees",
-    "search_output_shape",
+    "zscore_error_intervals",
 ]
