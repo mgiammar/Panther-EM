@@ -24,28 +24,9 @@ What is emitted (all ``__device__ __forceinline__``, operating on ``float re[N],
     Constant lookups ``e^{+2 pi i k / NPSI}`` (full period) and ``e^{+2 pi i k / 128}``;
     called with compile-time ``k`` they fold to immediates (the fold pass needs them).
 
-The maths, for one (pixel, hypothesis) pair with spectrum ``C_k``, ``k < F``:
-
-    corr[psi] = Re(C_0) + 2 sum_{k>=1} Re(C_k e^{2 pi i k psi / n_psi}),  psi < n_psi = 64 R
-    (R in {2, 4, 8}: n_psi in {128, 256, 512}; a thread handles residues h and h + R/2)
-    D_k       = a_k C_k,  a_0 = 1, a_k = 2, a_{n_psi/2} = 1 with Im dropped (Nyquist)
-    corr[R j + r] = Re IDFT_64( X_r )[j],  X_r[k'] = sum_m D_{k' + 64 m} t^{(k' + 64 m) r}
-
-with ``t = e^{2 pi i / n_psi}``. The IDFT kernel ``e^{2 pi i k j / 64}`` is periodic in
-``k``, so bins ``k >= 64`` fold onto ``k' = k mod 64`` exactly: any ``F <= n_psi/2 + 1``
-is handled by the same 64-point transform. Two real residues ``r`` and ``r + R/2`` are
-Hermitian-packed into ONE complex IDFT, ``Z = H_r + i H_{r+R/2}`` with
-``H[k'] = (X[k'] + conj X[64-k']) / 2``, so its real output is residue ``r`` and its
-imaginary output residue ``r + R/2``. Since ``t^{k' R/2} = e^{2 pi i k'/128}``, the
-second residue's spectrum is the first's times ``u_{k'} = e^{2 pi i k'/128}`` (applied
-to the alternately-signed fold, which the kernel forms while loading).
-
-Larger transforms (128, 256 points) are also emitted. They are NOT used by the reduce
-kernel: a 128-point complex working set is already 256 fp32 registers, over the
-255-register limit, and the residue decomposition makes them unnecessary -- n_psi = 512
-is 8 residues of the same 64-point transform (4 threads per pair), not a 256-point one.
-They exist for the on-device generator test (``lean_debug_ifft``) and for future
-kernels with a different thread mapping.
+The residue decomposition and Hermitian packing these implement are described in
+``lean_irfft_stats.cuh``. The 128- and 256-point transforms are not used by the reduce
+kernel; they exist for the on-device generator test (``lean_debug_ifft``).
 """
 
 from __future__ import annotations
@@ -94,11 +75,7 @@ def choose_radices(n: int) -> tuple[int, ...]:
 
 
 def _permutation(n: int, radices: tuple[int, ...]) -> list[int]:
-    """Digit-reversed load order for a DIT split by ``radices[0]`` first.
-
-    Splitting ``x`` by its outermost radix ``r`` gives the subsequences ``x[q + r m]``,
-    each transformed recursively and laid out consecutively in the working array.
-    """
+    """Digit-reversed load order for a DIT split by ``radices[0]`` first."""
     if not radices:
         return [0]
     r, inner = radices[0], radices[1:]
@@ -317,14 +294,7 @@ def emit_hermitian_pack(slots: int = 64) -> str:
 def emit_constant_lookup(
     name: str, values: list[complex], comment: str, template: bool = False
 ) -> str:
-    """``float2 name(unsigned k)`` returning literal constants via a switch.
-
-    Called with a compile-time ``k`` (every caller is fully unrolled) it folds to an
-    immediate, which is what lets the F > 64 fold path in the kernel apply per-slot
-    twiddles without holding a second 128-register array. ``template=True`` emits an
-    explicit specialization of a declared function template (``name`` carries the
-    ``<...>`` arguments).
-    """
+    """``float2 name(unsigned k)`` returning literal constants via a switch."""
     head = "template <> " if template else ""
     out = [f"// {comment}", f"{head}__device__ __forceinline__ float2 {name}(unsigned k) {{", "  switch (k) {"]
     for k, w in enumerate(values):

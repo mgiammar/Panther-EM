@@ -174,10 +174,6 @@ class _HypLoopGraph:
     ``pixel_stats``' state tensors. :meth:`run` copies a pixel batch into the static
     buffer and replays; only Python-side bookkeeping (``hypothesis_count``, the
     packed-best marker) is done outside the graph.
-
-    Built through :meth:`try_capture`, which returns ``None`` (leaving the caller to
-    run eagerly) when the in-kernel accumulate path cannot serve every batch --
-    a child-graph replay inside a capture is what the parent's accumulate would need.
     """
 
     def __init__(
@@ -221,9 +217,7 @@ class _HypLoopGraph:
             ``1`` (default) keeps everything serial. ``2`` alternates consecutive
             hypothesis batches between two streams inside the graph so one batch's
             tensor-core GEMM overlaps the previous batch's reduce (the in-kernel
-            accumulate is atomic, so order does not matter) -- measured slower on an
-            RTX 6000 Ada, where the concurrent kernels slow each other down more than
-            the overlap gains.
+            accumulate is atomic, so order does not matter).
         """
         device = y_example.device
         y_static = y_example.detach().clone().contiguous()

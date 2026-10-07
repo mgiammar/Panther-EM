@@ -11,11 +11,6 @@
  * NPSI/2 + 1 folds exactly onto 64 slots. Two real residues r and r + R/2 are
  * Hermitian-packed into ONE complex 64-point IDFT, so a thread handles residues
  * {h, h + R/2}: T = R/2 threads per (pixel, hypothesis) pair.
- *   R=2 (n_psi=128): 1 thread/pair.  R=4 (n_psi=256): 2.  R=8 (n_psi=512): 4.
- * The 64 complex working values live in 128 registers; all twiddles are immediates.
- * (A per-thread 256-point transform for n_psi=512 would need 512 registers; the
- * residue split keeps every n_psi on the same 64-point code.) Each residue group h
- * is a whole warp (or two), so all h-dependent control flow is warp-uniform.
  *
  * Two load paths, chosen at compile time from FMAX = ceil8(NumFreq):
  *   FMAX <= 64  load all bins, then scale / residue-twiddle / Hermitian-pack in place;
@@ -25,9 +20,7 @@
  *               stays one 64-point spectrum plus the chunk.
  *
  * Input layout is the GEMM's native (NumFreq, P, Q), as float2 (complex64) or __half2
- * (a complex32 / float16-pairs tensor). FFT arithmetic is fp32 either way. Measured on an
- * RTX 6000 Ada at (P,Q,F)=(512,2048,64): 0.32 ms for both n_psi (DRAM-bandwidth bound),
- * 6.5x faster than the cuFFTDx block-FFT kernel at n_psi=256.
+ * (a complex32 / float16-pairs tensor). FFT arithmetic is fp32 either way.
  */
 #pragma once
 #include <cfloat>
@@ -93,15 +86,9 @@ __device__ __forceinline__ float2 scale_bin(unsigned k, float2 v) {
 // bins (m = 0) are packed each m adds  Z += H(Y_m) + i s H(u Y_m),  s = (-1)^m.
 // Pairs (k', 64-k') go together: with H(Y)[k'] = a + ib and H(uY)[k'] = c + id,
 //   Z[k'] += (a - s d) + i (b + s c),   Z[64-k'] += (a + s d) + i (s c - b).
-// Loads are issued FOLD_CHUNK pairs at a time ahead of their use: at n_psi = 512 only
-// 8 warps fit per SM, so without this explicit batching the pass is DRAM-latency bound
-// (F = 257: 4.3 ms -> 2.8 ms at (P,Q) = (512, 2048)). The working set stays one
-// 64-point spectrum plus the chunk.
-//
-// h is a runtime value: the per-bin twiddle t^{k h} is chosen from R/2 - 1 immediates
-// with selects (h is warp-uniform, so the predicates are too). One code path per
-// kernel is essential -- a switch over per-h instantiations makes ptxas spill 100+
-// bytes at every FMAX > 64 (the arms' loads get merged above the branch).
+// Loads are issued FOLD_CHUNK pairs at a time ahead of their use to hide DRAM latency.
+// h is a runtime (warp-uniform) value selecting the per-bin twiddle t^{k h}; keep this a
+// single code path, as per-h instantiations make ptxas spill.
 // ---------------------------------------------------------------------------
 constexpr unsigned FOLD_CHUNK = 16;  // pairs (= 32 bins) in flight per thread in the fold pass
 
@@ -199,11 +186,8 @@ __device__ __forceinline__ void fold_high_bins(const InT* __restrict__ c, size_t
 // The kernel. Block = 128 threads; PAIRS = 128 / T hypotheses per block, thread t
 // handles pair t % PAIRS with residue group h = t / PAIRS (so h is constant across each
 // warp: T <= 4); grid = P * ceil(Q / PAIRS). FMAX = ceil8(NumFreq), NumFreq <= NPSI/2 + 1.
-// Register cap (see min_blocks_per_sm): 3 blocks/SM (<= 168 registers) wherever ptxas
-// fits the working set, 2 blocks/SM (<= 255) where it does not -- the fold path, whose
-// correction pass adds in-flight loads, and a few n_psi = 128 instantiations where
-// constant-folding the zero bins through the Hermitian pack inflates register pressure.
-// All of these are bandwidth-bound; 8 warps/SM with 64+ outstanding loads each saturate DRAM.
+// Register cap: 3 blocks/SM (<= 168 registers) where the working set fits, otherwise
+// 2 blocks/SM (<= 255) -- see min_blocks_per_sm.
 // ---------------------------------------------------------------------------
 constexpr unsigned min_blocks_per_sm(unsigned fmax, unsigned r) {
   if (fmax > 64) return 2;

@@ -277,12 +277,7 @@ def lean_irfft_stats_transposed(
 
 
 def lean_debug_ifft(x: torch.Tensor) -> torch.Tensor | None:
-    """Unnormalized inverse DFT of complex64 ``(B, N)`` rows, ``N`` in ``{64, 128, 256}``.
-
-    Runs the generated register-resident transforms (``csrc/lean_fft_gen.cuh``) on the
-    device; equals ``torch.fft.ifft(x, norm="forward")``. Test entry point only;
-    ``None`` when the extension is unavailable.
-    """
+    """Test entry point only: on-device generated IDFT, or ``None`` if unavailable."""
     module = _try_compile()
     return module.lean_debug_ifft(x) if module is not None else None
 
