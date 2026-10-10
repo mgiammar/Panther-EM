@@ -22,7 +22,7 @@ name = "panther-em"
 dynamic = ["version"]
 description = "Pipelined AcceleratioN of Template matcHing via Eigendecomposition of Rotational projections in cryo-EM"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = { text = "BSD-3-Clause" }
 authors = [{ name = "Matthew Giammar", email = "mdgiammar@gmail.com" }]
 # https://pypi.org/classifiers/
@@ -30,8 +30,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -48,7 +46,7 @@ dependencies = [
     "matplotlib",
     "h5py",
     "ttsim3d",
-    "torch-fourier-slice",
+    "torch-fourier-slice>=0.6.0",
     "torch-so3",
     "roma",
     "ipykernel",
