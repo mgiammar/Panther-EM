@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING
 
 import torch
@@ -31,6 +32,8 @@ from panther_em.inference.search.executor import StageExecutor, plan_memory, pla
 from panther_em.inference.search.featurize import make_featurizer
 from panther_em.inference.search.hypotheses import HypothesisSpace
 from panther_em.inference.search.ledger import PixelLedger
+from panther_em.inference.search.orientations import S2Neighborhood
+from panther_em.inference.search.pairs import PairCollector
 from panther_em.inference.search.results import SearchResult, StageResult
 from panther_em.inference.search.schedule import ErrorModel
 from panther_em.inference.search.store import FeatureStore
@@ -46,6 +49,7 @@ if TYPE_CHECKING:
 
     from panther_em.inference.search.basis import Template
     from panther_em.inference.search.featurize import Featurizer, LoopOrder
+    from panther_em.inference.search.pairs import PairList
     from panther_em.inference.search.schedule import SearchSchedule
     from panther_em.inference.search.types import BatchShape, Rectangle
 
@@ -139,8 +143,14 @@ class Searcher:
             template.weights,
             prepared_budget=self.execution.prepared_budget,
             planner=planner,
+            want_pairs=any(s.emit_pairs for s in schedule.stages),
         )
         self._validate()
+
+    @cached_property
+    def s2(self) -> S2Neighborhood | None:
+        """Orientation rings inferred from the template's Euler angles, if HEALPix."""
+        return S2Neighborhood.from_space(self.space)
 
     def _validate(self) -> None:
         k_max, eig_max = self.template.k_max, self.template.eig_max
@@ -155,6 +165,13 @@ class Searcher:
                 raise ValueError(f"stage {i}: fp16 needs a CUDA device")
             if spec.hypotheses is not None:
                 spec.hypotheses.resolve(self.space)
+            if spec.pairs is not None and spec.pairs.orientation_rings > 0:
+                if self.s2 is None:
+                    raise ValueError(
+                        f"stage {i}: orientation_rings > 0 needs a template whose "
+                        "Euler angles are HEALPix pixel centers (see "
+                        "healpix_orientations); orientation_rings=0 dilates pixels only"
+                    )
 
     @property
     def device(self) -> torch.device:
@@ -291,6 +308,7 @@ class SearchSession:
             use_cuda_graph=exe.use_cuda_graph,
             use_fused_kernel=exe.use_fused_kernel,
             store=self.store,
+            pair_dtype=spec.pairs.pair_dtype if spec.pairs is not None else None,
         )
         store = self._prepare_store(
             memory.block_pixels,
@@ -309,11 +327,27 @@ class SearchSession:
                 total=store.n_pixels, desc=f"stage {index}", unit="px", unit_scale=True
             )
             progress = bar.update
-        maps = StageExecutor(searcher.ctx).run(store, plan, progress=progress)
+        collector = None
+        if spec.pairs is not None:
+            collector = PairCollector(
+                spec.pairs,
+                self.ledger,
+                store.column_index,
+                hyp_plan,
+                rank=spec.pairs.rank or spec.num_features,
+                s2=searcher.s2,
+                device=searcher.device,
+            )
+        maps = StageExecutor(searcher.ctx).run(
+            store, plan, progress=progress, collector=collector
+        )
         if exe.show_progress:
             bar.close()
         column_index = store.column_index
         self.ledger.write(maps, column_index, index, hyp_plan)
+        pairs = None
+        if collector is not None:
+            pairs = self.ledger.pairs[index] = collector.finish()
         searcher.schedule.decisions[index](self.ledger, column_index, spec, index)
         self.pixels = self.ledger.uncertain()
         labels_after = self.ledger.label[column_index.to(self.ledger.device)].clone()
@@ -328,7 +362,12 @@ class SearchSession:
             labels_after=labels_after,
             n_uncertain_after=len(self.pixels),
             elapsed_s=elapsed,
+            pairs=pairs,
         )
+
+    def set_pairs(self, stage_index: int, pairs: PairList) -> None:
+        """Inject a pair list as if ``stage_index`` had emitted it."""
+        self.ledger.pairs[stage_index] = pairs
 
     # -- public ------------------------------------------------------------------
 

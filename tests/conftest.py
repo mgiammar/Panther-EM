@@ -21,9 +21,16 @@ def make_synthetic_result(
     box: int = 20,
     seed: int = 0,
     with_angles: bool = True,
+    s2_nside: int | None = None,
 ) -> DecompositionResult:
-    """Random real-valued decomposition on a ``box x box`` template grid."""
+    """Random real-valued decomposition on a ``box x box`` template grid.
+
+    ``s2_nside`` samples the orientations on that HEALPix grid (NESTED order, sets
+    ``n_orientations = 12 * nside**2``); only the Euler angles are recorded.
+    """
     rng = np.random.default_rng(seed)
+    if s2_nside is not None:
+        n_orientations = 12 * s2_nside * s2_nside
     shape_u = (n_filters, n_orientations, k_max, eig_max)
     U = (rng.standard_normal(shape_u) + 1j * rng.standard_normal(shape_u)).astype(
         np.complex64
@@ -36,8 +43,13 @@ def make_synthetic_result(
     transform = OffsetPolarTransform.from_image(
         image_shape=(box, box), num_angle=n_angular, num_radius=n_radial
     )
-    angles = {}
-    if with_angles:
+    angles: dict = {}
+    if s2_nside is not None:
+        from panther_em.inference.search.orientations import healpix_orientations
+
+        phi, theta = healpix_orientations(s2_nside)
+        angles = {"phi_values": phi, "theta_values": theta}
+    elif with_angles:
         angles = {
             "phi_values": np.linspace(0.0, 300.0, n_orientations, dtype=np.float32),
             "theta_values": np.linspace(0.0, 90.0, n_orientations, dtype=np.float32),

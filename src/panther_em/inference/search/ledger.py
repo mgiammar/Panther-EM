@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
     from panther_em.inference.search.executor import StageMaps
     from panther_em.inference.search.hypotheses import HypothesisPlan
+    from panther_em.inference.search.pairs import PairList
     from panther_em.inference.search.types import SearchGeometry
 
 
@@ -100,6 +101,7 @@ class PixelLedger:
         self.best_psi = torch.full((n,), -1, dtype=torch.int64, device=self.device)
         self.last_stage = torch.full((n,), -1, dtype=torch.int16, device=self.device)
         self.n_psi_of_stage: list[int] = []
+        self.pairs: dict[int, PairList] = {}  # stage index -> emitted pairs
         if initial is not None and not initial.is_full:
             self.label.fill_(int(PixelLabel.MASKED))
             self.label[initial.index.to(self.device)] = int(PixelLabel.PENDING)

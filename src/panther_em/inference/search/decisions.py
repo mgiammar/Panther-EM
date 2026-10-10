@@ -550,3 +550,32 @@ class SurpassThresholdDecision:
             f"rank={self.rank}, pass_label={self.pass_label.name}, "
             f"fail_label={self.fail_label.name})"
         )
+
+
+class PairEmissionDecision:
+    """The decision of a pair-emitting stage: only pixels with a pair stay eligible."""
+
+    pointwise: ClassVar[bool] = False
+    requires_error: ClassVar[bool] = False
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        ledger: PixelLedger,
+        pixel_index: torch.Tensor,
+        stage: StageSpec,
+        stage_index: int,
+    ) -> None:
+        """Relabel from the stage's recorded pairs."""
+        if stage_index not in ledger.pairs:
+            raise RuntimeError(
+                f"stage {stage_index} emitted no pairs (StageSpec.pairs)"
+            )
+        idx = pixel_index.to(ledger.device, torch.long)
+        keep = ledger.pairs[stage_index].pixels().to(ledger.device)
+        ledger.label[idx] = int(PixelLabel.REJECTED)
+        ledger.label[keep] = int(PixelLabel.UNCERTAIN)
+
+    def __repr__(self) -> str:
+        """Stable repr."""
+        return "PairEmissionDecision()"

@@ -84,6 +84,7 @@ from panther_em.inference.search.decisions import (
     DecisionChain,
     DilationAbsorb,
     NoDecision,
+    PairEmissionDecision,
     SurpassThresholdDecision,
     ThresholdClassifier,
     TopFractionSelector,
@@ -105,6 +106,11 @@ from panther_em.inference.search.hypotheses import (
     psi_degrees,
 )
 from panther_em.inference.search.ledger import PixelLabel, PixelLedger
+from panther_em.inference.search.orientations import (
+    S2Neighborhood,
+    healpix_orientations,
+)
+from panther_em.inference.search.pairs import PairEmissionSpec, PairList
 from panther_em.inference.search.results import DecodedMaps, SearchResult, StageResult
 from panther_em.inference.search.schedule import (
     ErrorModel,
@@ -151,6 +157,9 @@ __all__ = [
     "KernelConfig",
     "MemoryPlan",
     "NoDecision",
+    "PairEmissionDecision",
+    "PairEmissionSpec",
+    "PairList",
     "PixelLabel",
     "PixelLedger",
     "PixelSelection",
@@ -158,6 +167,7 @@ __all__ = [
     "Precision",
     "PreparedWeightCache",
     "Rectangle",
+    "S2Neighborhood",
     "SearchGeometry",
     "SearchResult",
     "SearchSchedule",
@@ -172,6 +182,7 @@ __all__ = [
     "WeightSource",
     "ZScoreIntervalClassifier",
     "classify_zscore_interval",
+    "healpix_orientations",
     "make_featurizer",
     "nested_schedule",
     "psi_degrees",
