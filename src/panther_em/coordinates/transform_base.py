@@ -389,6 +389,20 @@ class CoordinateTransform(ABC):
         self._device_cache.clear()
 
     # ------------------------------------------------------------------ #
+    # Radial boundary hooks for the polar -> Cartesian warp
+    # ------------------------------------------------------------------ #
+
+    def _pad_radial_axis(
+        self, image: np.ndarray | torch.Tensor
+    ) -> tuple[np.ndarray | torch.Tensor, int]:
+        """Extend a polar image along its radial axis before the inverse warp."""
+        return image, 0
+
+    def _outer_radius_index(self) -> float | None:
+        """Largest radial coordinate inside the transform's support."""
+        return None
+
+    # ------------------------------------------------------------------ #
     # Concrete warp methods
     # ------------------------------------------------------------------ #
 
@@ -498,6 +512,7 @@ class CoordinateTransform(ABC):
         image: np.ndarray | torch.Tensor,
         preserve_energy: bool = True,
         wrap_angular_axis: bool = True,
+        pad_radial_axis: bool = True,
         order: int = 5,
         mode: str = "constant",
         cval: float = 0.0,
@@ -515,6 +530,9 @@ class CoordinateTransform(ABC):
         wrap_angular_axis : bool, optional
             Apply circular padding at the 0°/360° boundary before warping.
             Only applied when :attr:`has_periodic_axis` is ``True``. Default True.
+        pad_radial_axis : bool, optional
+            Continue the radial axis past its first and last samples before warping and
+            zero the pixels outside the support afterwards.
         order : int, optional
             Spline interpolation order. Default 5.
         mode : str, optional
@@ -538,6 +556,7 @@ class CoordinateTransform(ABC):
                     im,
                     preserve_energy=preserve_energy,
                     wrap_angular_axis=wrap_angular_axis,
+                    pad_radial_axis=pad_radial_axis,
                     order=order,
                     mode=mode,
                     cval=cval,
@@ -561,6 +580,7 @@ class CoordinateTransform(ABC):
                 image.real,
                 preserve_energy=preserve_energy,
                 wrap_angular_axis=wrap_angular_axis,
+                pad_radial_axis=pad_radial_axis,
                 order=order,
                 mode=mode,
                 cval=cval,
@@ -570,6 +590,7 @@ class CoordinateTransform(ABC):
                 image.imag,
                 preserve_energy=preserve_energy,
                 wrap_angular_axis=wrap_angular_axis,
+                pad_radial_axis=pad_radial_axis,
                 order=order,
                 mode=mode,
                 cval=cval,
@@ -587,6 +608,13 @@ class CoordinateTransform(ABC):
 
         coords = dc["cartesian"]
 
+        # Continue the radial axis though origin for spline interpolation
+        if pad_radial_axis:
+            image, num_prepended = self._pad_radial_axis(image)
+            if num_prepended:
+                coords = coords.copy() if device == "numpy" else coords.clone()
+                coords[1, ...] += num_prepended
+
         # Handle periodic angular axis to prevent boundary artifacts by wrap/circular
         # padding around the boundary before interpolation
         if wrap_angular_axis and self.has_periodic_axis:
@@ -594,7 +622,9 @@ class CoordinateTransform(ABC):
                 raise NotImplementedError(
                     "Periodic padding is only implemented for periodic_axis=0."
                 )
-            pad_size = order
+            # The spline prefilter's boundary error decays like |pole|**rows (~0.43
+            # for order 5), so `order` rows left ~4e-3 at the 0/360 seam
+            pad_size = 4 * order
             if device == "numpy":
                 image = np.pad(image, ((pad_size, pad_size), (0, 0)), mode="wrap")
             else:
@@ -606,7 +636,7 @@ class CoordinateTransform(ABC):
             coords[0, ...] += pad_size
 
         warp_fn = get_warp_function(device)
-        return warp_fn(
+        warped = warp_fn(
             image,
             coords,
             output_shape=self.cartesian_shape,
@@ -615,6 +645,12 @@ class CoordinateTransform(ABC):
             cval=cval,
             **kwargs,
         )
+
+        # Zero the pixels outside the support, which padded rows could otherwise reach
+        outer_index = self._outer_radius_index() if pad_radial_axis else None
+        if outer_index is not None:
+            warped = warped * (dc["cartesian"][1] <= outer_index)
+        return warped
 
 
 # ---------------------------------------------------------------------------
@@ -674,11 +710,54 @@ class GridTransform(CoordinateTransform):
         self._polar_shape = polar_shape
         self._cartesian_shape = cartesian_shape
         self.source_params = source_params
+        self._source_transform: CoordinateTransform | None = None
+        self._source_resolved = False
 
         # Instance-level overrides of class-level flags
         self.has_periodic_axis = has_periodic_axis
         self.periodic_axis = periodic_axis
         self.supports_energy_preservation = jacobian is not None
+
+    @property
+    def source_transform(self) -> CoordinateTransform | None:
+        """The parameterized transform these grids were built from, or ``None``.
+
+        Raises
+        ------
+        ValueError
+            If the rebuilt transform's shapes do not match the stored grids.
+        """
+        if not self._source_resolved:
+            self._source_resolved = True
+            name = (self.source_params or {}).get("transform_name")
+            if name is not None and name != self.transform_name and name in _REGISTRY:
+                source = reconstruct_transform(self.source_params)  # type: ignore[arg-type]
+                if (source.polar_shape, source.cartesian_shape) != (
+                    self.polar_shape,
+                    self.cartesian_shape,
+                ):
+                    raise ValueError(
+                        f"source_params describe a {name} transform with polar shape "
+                        f"{source.polar_shape} and Cartesian shape "
+                        f"{source.cartesian_shape}, but the grids have "
+                        f"{self.polar_shape} and {self.cartesian_shape}."
+                    )
+                self._source_transform = source
+        return self._source_transform
+
+    def _pad_radial_axis(
+        self, image: np.ndarray | torch.Tensor
+    ) -> tuple[np.ndarray | torch.Tensor, int]:
+        """Delegate to :attr:`source_transform` (no padding without one)."""
+        source = self.source_transform
+        if source is None:
+            return image, 0
+        return source._pad_radial_axis(image)
+
+    def _outer_radius_index(self) -> float | None:
+        """Delegate to :attr:`source_transform` (no masking without one)."""
+        source = self.source_transform
+        return None if source is None else source._outer_radius_index()
 
     @classmethod
     def from_transform(cls, transform: CoordinateTransform) -> GridTransform:

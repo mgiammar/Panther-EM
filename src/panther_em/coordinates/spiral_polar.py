@@ -63,11 +63,18 @@ radial step along it::
 
     row = r(radius_idx) * sin(theta) + center_row
     col = r(radius_idx) * cos(theta) + center_col
+
+Radial boundaries of the inverse warp
+--------------------------------------
+The first ring sits at ``t = dt`` so the Cartesian pixels nearest the centre map to
+``radius_idx`` in ``[-1, 0)``, outside the polar image. Before the polar -> Cartesian
+warp, :meth:`SpiralPolarTransform._pad_radial_axis` extends both axes.
 """
 
 from typing import Any
 
 import numpy as np
+import torch
 
 from .transform_base import CoordinateTransform, get_transform, register_transform
 
@@ -410,6 +417,101 @@ def jacobian_correction_spiral_polar(
 
 
 # ---------------------------------------------------------------------------
+# Radial boundaries of the inverse warp
+# ---------------------------------------------------------------------------
+
+
+RADIAL_PAD = 10
+
+
+def _lagrange_weights(nodes: np.ndarray, x: float) -> np.ndarray:
+    """Weights of the Lagrange polynomial through ``nodes``, evaluated at ``x``."""
+    weights = np.ones(len(nodes))
+    for j, node in enumerate(nodes):
+        others = np.delete(nodes, j)
+        weights[j] = np.prod((x - others) / (node - others))
+    return weights
+
+
+def origin_continuation(
+    num_angle: int,
+    num_radius: int,
+    max_radius: float,
+    c: float = 0.3,
+    percent_arc_offset: float = 0.322,
+    num_rows: int = RADIAL_PAD,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Linear map from the innermost rings to rows continued through the origin.
+
+    Notes
+    -----
+    Padded row ``m`` sits at ``radius_idx = -1 - m`` (``t = -m * dt``). With
+    ``A = rfft(f[:, :num_nodes], axis=0) * untwist`` (angular Fourier coefficients of
+    the rings, twist removed), the row is::
+
+        irfft(sum_j weights[m, j] * A[:, nodes[m, j]] * phases[:, m], n=num_angle)
+
+    Parameters
+    ----------
+    num_angle : int
+        Number of angular samples (spiral arms).
+    num_radius : int
+        Number of radial samples per arm (at least 4).
+    max_radius : float
+        Maximum radius of the transform, in pixels.
+    c : float, optional
+        Radial growth parameter; see module docstring. Default 0.3.
+    percent_arc_offset : float, optional
+        Fraction of a full turn rotated per radial step. Default 0.322.
+    num_rows : int, optional
+        Requested number of rows. Fewer are returned if the spiral map does not
+        extend that far below ``t = 0`` (it needs ``c**2 + 2*t > 0``). Default
+        :data:`RADIAL_PAD`.
+
+    Returns
+    -------
+    untwist : np.ndarray
+        ``(num_angle // 2 + 1, num_nodes)`` complex128 ``exp(-i k twist(t_i))``.
+    nodes : np.ndarray
+        ``(rows, 4)`` int64 ring indices interpolated from, all ``< num_nodes``.
+    weights : np.ndarray
+        ``(rows, 4)`` float64 interpolation weights.
+    phases : np.ndarray
+        ``(num_angle // 2 + 1, rows)`` complex128 ``(-1)**k exp(i k twist(t_m))``
+        (only ``k = 0`` for the row at the origin).
+    """
+    if num_radius < 4:
+        raise ValueError(f"num_radius must be at least 4; got {num_radius}.")
+    dt, twist_rate = _spiral_geometry(num_angle, num_radius, c, percent_arc_offset)
+    num_rows = min(num_rows, int(np.ceil(c**2 / (2 * dt))))
+
+    k = np.arange(num_angle // 2 + 1)
+    radii = _radius_from_t((np.arange(num_radius) + 1) * dt, max_radius, c)
+    nodes = np.zeros((num_rows, 4), dtype=np.int64)
+    weights = np.zeros((num_rows, 4))
+    phases = np.zeros((k.size, num_rows), dtype=np.complex128)
+    for m in range(num_rows):
+        if m == 0:
+            # Origin: a_0 is even in r, so a quadratic in r**2 through three rings
+            nodes[m] = np.arange(4)
+            weights[m, :3] = _lagrange_weights(radii[:3] ** 2, 0.0)
+            phases[0, m] = 1.0
+            continue
+        t_m = -m * dt
+        rho = _radius_from_t(t_m, max_radius, c)  # negative
+        s = _t_from_radius(-rho, max_radius, c) / dt - 1  # radius_idx of |rho|
+        start = min(max(int(np.floor(s)) - 1, 0), num_radius - 4)
+        nodes[m] = start + np.arange(4)
+        weights[m] = _lagrange_weights(nodes[m].astype(np.float64), s)
+        phases[:, m] = (-1.0) ** k * np.exp(1j * k * twist_rate * t_m)
+
+    num_nodes = int(nodes.max()) + 1
+    ring_t = (np.arange(num_nodes) + 1) * dt
+    untwist = np.exp(-1j * k[:, None] * twist_rate * ring_t[None, :])
+    return untwist, nodes, weights, phases
+
+
+# ---------------------------------------------------------------------------
 # SpiralPolarTransform
 # ---------------------------------------------------------------------------
 
@@ -489,6 +591,8 @@ class SpiralPolarTransform(CoordinateTransform):
             c,
             percent_arc_offset,
         )
+        # Per-device tensors of `origin_continuation`, built on first use
+        self._continuation_cache: dict[str, tuple[torch.Tensor, ...]] = {}
 
     @classmethod
     def from_image(
@@ -653,6 +757,63 @@ class SpiralPolarTransform(CoordinateTransform):
         return np.broadcast_to(
             jac_sqrt[np.newaxis, :], (self.num_angle, self.num_radius)
         ).copy()
+
+    # ------------------------------------------------------------------ #
+    # Radial boundaries of the inverse warp
+    # ------------------------------------------------------------------ #
+
+    def clear_cache(self) -> None:
+        """Release cached grids, device copies and origin-continuation tensors."""
+        super().clear_cache()
+        self._continuation_cache.clear()
+
+    def _continuation_tensors(self, device: torch.device) -> tuple[torch.Tensor, ...]:
+        """:func:`origin_continuation` as tensors on ``device`` (cached)."""
+        key = str(device)
+        if key not in self._continuation_cache:
+            arrays = origin_continuation(
+                self.num_angle,
+                self.num_radius,
+                self.radius,
+                self.c,
+                self.percent_arc_offset,
+            )
+            self._continuation_cache[key] = tuple(
+                torch.as_tensor(a, device=device) for a in arrays
+            )
+        return self._continuation_cache[key]
+
+    def _pad_radial_axis(
+        self, image: np.ndarray | torch.Tensor
+    ) -> tuple[np.ndarray | torch.Tensor, int]:
+        """Continue the radial axis through the origin and mirror it past ``radius``.
+
+        Parameters
+        ----------
+        image : np.ndarray or torch.Tensor
+            ``(num_angle, num_radius)`` real polar image, Jacobian already removed.
+
+        Returns
+        -------
+        tuple[np.ndarray | torch.Tensor, int]
+            The padded image and the number of rows prepended.
+        """
+        is_numpy = isinstance(image, np.ndarray)
+        f = torch.from_numpy(image) if is_numpy else image
+        untwist, nodes, weights, phases = self._continuation_tensors(f.device)
+
+        rings = torch.fft.rfft(f[:, : untwist.shape[1]].double(), dim=0) * untwist
+        spectrum = (rings[:, nodes] * weights).sum(dim=-1) * phases
+        inner = torch.fft.irfft(spectrum, n=self.num_angle, dim=0)
+        inner = inner.flip(-1).to(f.dtype)  # radius_idx -rows ... -1
+        outer = f[:, -RADIAL_PAD:].flip(-1)  # radius_idx n_r ... n_r + RADIAL_PAD - 1
+
+        padded = torch.cat([inner, f, outer], dim=1)
+        return (padded.numpy() if is_numpy else padded), inner.shape[1]
+
+    def _outer_radius_index(self) -> float:
+        """``radius_idx`` of ``r = radius``: the last ring (plus rounding slack)."""
+        return self.num_radius - 1 + 1e-6
 
     # ------------------------------------------------------------------ #
     # Serialization
