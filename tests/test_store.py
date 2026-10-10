@@ -155,3 +155,62 @@ def test_store_validation():
             device="cpu",
             residency="transient",
         )
+
+
+def test_plane_restricted_groups_cover_and_reject_overlap():
+    store = _store(n_px=10, block_pixels=4, n_defocus=3)
+    rect = (0, 0, 2, 3)
+    g_a = store.add_group(rect, "fp32", planes=(2,))
+    assert g_a.planes == (2,) and g_a.blocks[0].shape == (1, 2, 4, 3)
+    assert store.missing_planes(rect, "fp32", (0, 1, 2)) == (0, 1)
+    with pytest.raises(ValueError, match="already holds planes"):
+        store.add_group(rect, "fp32", planes=(1, 2))
+    with pytest.raises(ValueError):
+        store.add_group(rect, "fp32", planes=(3,))
+    g_b = store.add_group(rect, "fp32", planes=(0, 1))
+    assert store.missing_planes(rect, "fp32", (0, 1, 2)) == ()
+    covering = store.groups_covering(rect, "fp32", (0, 2, 1))
+    assert covering == [(g_b, 0), (g_a, 0), (g_b, 1)]
+    with pytest.raises(KeyError):
+        store.groups_covering(rect, "fp16", (0,))
+    assert store.group_for(rect, "fp32", planes=(2,)) is g_a
+    assert store.group_for(rect, "fp32", planes=(0, 1)) is g_b
+    assert store.group_for(rect, "fp32") is g_a  # first match when planes unspecified
+    assert g_a.local_plane(2) == 0 and g_b.local_plane(1) == 1 and not g_a.holds(0)
+    with pytest.raises(ValueError):
+        g_a.local_plane(0)
+
+    # writes address planes globally and completeness is tracked per plane
+    data = _random_group_data(g_b, 10)  # (2, cells, 10) in group plane order
+    w = store.writer(g_b)
+    w.write(slice(0, 6), (0, 10), data[1], plane=1)
+    with pytest.raises(ValueError, match="incomplete"):
+        w.close()
+    w.write(slice(0, 6), (0, 10), data[0], plane=0)
+    w.close()
+    torch.testing.assert_close(read_group(store, g_b, 1), data[1].T.reshape(10, 2, 3))
+    with pytest.raises(ValueError):
+        store.writer(g_a).write(
+            slice(0, 6), (0, 10), data[0], plane=0
+        )  # g_a lacks plane 0
+
+    # compaction preserves plane sets and ids; gather_columns matches read_group
+    wa = store.writer(g_a)
+    wa.write(slice(0, 6), (0, 10), data[1], plane=2)
+    wa.close()
+    keep = torch.tensor([1, 0, 1, 1, 0, 0, 1, 0, 1, 1], dtype=torch.bool)
+    sub = store.subset(keep, block_pixels=3)
+    assert [(g.id, g.planes) for g in sub.groups] == [(0, (2,)), (1, (0, 1))]
+    positions = torch.tensor([9, 2, 6, 0])
+    gathered = store.gather_columns(g_b, positions)
+    assert gathered.shape == (2, 2, 4, 3)
+    expected = torch.stack(
+        [read_group(store, g_b, d)[positions].permute(1, 0, 2) for d in range(2)]
+    )  # (D, num_k, n, num_m)
+    torch.testing.assert_close(gathered, expected)
+    assert store.gather_columns(g_b, torch.empty(0, dtype=torch.long)).shape == (
+        2,
+        2,
+        0,
+        3,
+    )

@@ -342,7 +342,7 @@ class FFTCorrelationFeaturizer:
         cells = group_cells(group)
         n_cells = int(cells.shape[0])
         with _stream_scope(stream):
-            for plane in range(group.n_defocus):
+            for plane in group.planes:
                 filtered = _FilteredImageCache(images, plane, self.device)
                 for tile, image_fft, cell_range in self._iterate(
                     schedule.tiles(), filtered, grid, n_cells, chunk, order
@@ -475,7 +475,7 @@ class InnerProductFeaturizer:
         cells = group_cells(group)
         n_cells = int(cells.shape[0])
         with _stream_scope(stream):
-            for plane in range(group.n_defocus):
+            for plane in group.planes:
                 for batch in schedule.image_batches():
                     boxes = self._centered_boxes(images, batch.images, plane)
                     for cell_range in cell_chunks(n_cells, chunk):

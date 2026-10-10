@@ -24,7 +24,7 @@ from panther_em.inference.search.hypotheses import HypothesisPlan
 from panther_em.inference.search.statistics import SpectrumSpec
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable, Sequence
 
     from panther_em.inference.search.context import SearchContext
     from panther_em.inference.search.contraction import ContractionEngine
@@ -37,17 +37,37 @@ if TYPE_CHECKING:
 
 
 def feature_bytes_per_pixel(
-    rectangles_and_precisions: list[tuple[tuple[int, int, int, int], Precision]],
-    n_defocus: int,
+    groups: Iterable[tuple[tuple[int, int, int, int], Precision | str, int]],
 ) -> int:
-    """Bytes one pixel's features occupy across the given groups."""
+    """Bytes one pixel's features occupy across ``(rect, precision, n_planes)``."""
     total = 0
-    for rect, precision in rectangles_and_precisions:
+    for rect, precision, n_planes in groups:
         engine = make_engine(precision)
         elem = torch.empty((), dtype=engine.block_dtype).element_size()
         inner = engine.block_shape(1, rect[2], rect[3], 1)[-1]
-        total += n_defocus * rect[2] * inner * elem
+        total += int(n_planes) * rect[2] * inner * elem
     return total
+
+
+def resident_groups(
+    spec: StageSpec, planes: Sequence[int], store: FeatureStore | None
+) -> list[tuple[tuple[int, int, int, int], Precision, int]]:
+    """``(rect, precision, n_planes)`` per group the stage will have resident."""
+    out: list[tuple[tuple[int, int, int, int], Precision, int]] = []
+    for rect in spec.rectangles:
+        if store is None:
+            out.append((rect, spec.precision, len(planes)))
+            continue
+        seen: set[int] = set()
+        for g in store.groups:
+            if g.rect == rect and g.precision is spec.precision and g.id not in seen:
+                if any(g.holds(p) for p in planes):
+                    seen.add(g.id)
+                    out.append((rect, spec.precision, g.n_defocus))
+        missing = store.missing_planes(rect, spec.precision, planes)
+        if missing:
+            out.append((rect, spec.precision, len(missing)))
+    return out
 
 
 def plan_memory(
@@ -55,20 +75,26 @@ def plan_memory(
     spec: StageSpec,
     *,
     n_pixels: int,
-    n_defocus: int,
     space: HypothesisSpace,
     subset: HypothesisSubset | None = None,
     batch: BatchShape | None = None,
     block_pixels: int | None = None,
     use_cuda_graph: bool = True,
     use_fused_kernel: bool = True,
+    store: FeatureStore | None = None,
 ) -> tuple[MemoryPlan, StatsBackend, ContractionEngine, HypothesisPlan]:
-    """Resolve batch shape, block size, engine, stats backend and hypothesis plan."""
+    """Resolve batch shape, block size, engine, stats backend and hypothesis plan.
+
+    Notes
+    -----
+    ``store`` (when given) lets the per-pixel byte estimate count the groups that
+    will actually be resident, including planes held beyond the stage's own.
+    """
     engine = make_engine(spec.precision)
     provisional = HypothesisPlan(space, subset, hyp_batch=1, n_psi=spec.n_psi)
     n_virtual = provisional.n_virtual
-    rects = [(rect, spec.precision) for rect in spec.rectangles]
-    per_pixel = feature_bytes_per_pixel(rects, n_defocus)
+    planes = provisional.defocus_planes()
+    per_pixel = feature_bytes_per_pixel(resident_groups(spec, planes, store))
 
     # The backend decides whether graphs are possible; probe it with the eventual dtype.
     probe = SpectrumSpec(
@@ -88,7 +114,7 @@ def plan_memory(
         n_freq=spec.k_stop,
         n_psi=spec.n_psi,
         n_virtual=n_virtual,
-        n_defocus=n_defocus,
+        n_defocus=len(planes),
         feature_bytes_per_pixel=per_pixel,
         spectrum_dtype=engine.spectrum_dtype,
         precision=spec.precision,
@@ -112,8 +138,11 @@ class StagePlan:
     index : int
     spec : StageSpec
     layout : FeatureLayout
-        The stage's rectangles; ``groups[i]`` holds ``layout.rectangles[i]``.
+        The stage's rectangles.
     groups : tuple[ColumnGroup, ...]
+        Every group the stage reads (addressed by ``group.id``).
+    plane_lookup : tuple[tuple[tuple[int, int], ...], ...]
+        ``[rect_index][d_local] -> (group id, local plane index)``.
     engine : ContractionEngine
     stats_backend : StatsBackend
     spectrum : SpectrumSpec
@@ -127,6 +156,7 @@ class StagePlan:
     spec: StageSpec
     layout: FeatureLayout
     groups: tuple[ColumnGroup, ...]
+    plane_lookup: tuple[tuple[tuple[int, int], ...], ...]
     engine: ContractionEngine
     stats_backend: StatsBackend
     spectrum: SpectrumSpec
@@ -152,14 +182,18 @@ def plan_stage(
 ) -> StagePlan:
     """Freeze a stage plan against a store whose groups already exist."""
     layout = spec.layout()
-    groups = []
+    planes = hyp_plan.defocus_planes()
+    groups: list[ColumnGroup] = []
+    lookup: list[tuple[tuple[int, int], ...]] = []
     for rect in layout.rectangles:
-        group = store.group_for(rect, spec.precision)
-        if group is None:
-            raise ValueError(
-                f"store has no {spec.precision.value} group for rectangle {rect}"
-            )
-        groups.append(group)
+        try:
+            covering = store.groups_covering(rect, spec.precision, planes)
+        except KeyError as exc:
+            raise ValueError(str(exc)) from exc
+        lookup.append(tuple((g.id, local) for g, local in covering))
+        for g, _ in covering:
+            if g not in groups:
+                groups.append(g)
     if memory.block_pixels != store.block_pixels:
         raise ValueError(
             f"memory plan block_pixels {memory.block_pixels} != store block_pixels "
@@ -178,7 +212,8 @@ def plan_stage(
     signature = (
         layout.rectangles,
         spec.precision,
-        store.n_defocus,
+        tuple((g.id, g.rect, g.precision, g.planes) for g in groups),
+        tuple(lookup),
         memory.gemm_pixels,
         memory.block_pixels,
         memory.hyp_batch,
@@ -192,6 +227,7 @@ def plan_stage(
         spec=spec,
         layout=layout,
         groups=tuple(groups),
+        plane_lookup=tuple(lookup),
         engine=engine,
         stats_backend=backend,
         spectrum=spectrum,
@@ -278,6 +314,7 @@ class StageExecutor:
         inputs = LoopInputs(
             layout=plan.layout,
             groups=plan.groups,
+            plane_lookup=plan.plane_lookup,
             engine=plan.engine,
             hyp_plan=plan.hyp_plan,
             prepared=prepared,

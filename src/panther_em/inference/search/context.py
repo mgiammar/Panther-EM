@@ -286,9 +286,11 @@ class LoopInputs:
     Attributes
     ----------
     layout : FeatureLayout
-        The stage's rectangles (in group order).
+        The stage's rectangles.
     groups : tuple[ColumnGroup, ...]
-        ``groups[i]`` holds ``layout.rectangles[i]``.
+        Every group the stage reads (any order; addressed by ``group.id``).
+    plane_lookup : tuple[tuple[tuple[int, int], ...], ...]
+        ``plane_lookup[rect_index][d_local] -> (group id, local plane index)``.
     engine : ContractionEngine
     hyp_plan : HypothesisPlan
     prepared : Mapping[tuple[int, int], torch.Tensor]
@@ -299,6 +301,7 @@ class LoopInputs:
 
     layout: FeatureLayout
     groups: tuple[ColumnGroup, ...]
+    plane_lookup: tuple[tuple[tuple[int, int], ...], ...]
     engine: ContractionEngine
     hyp_plan: HypothesisPlan
     prepared: Mapping[tuple[int, int], torch.Tensor]
@@ -345,7 +348,6 @@ def _loop_body(
     engine = inputs.engine
     memory = inputs.memory
     plan = inputs.hyp_plan
-    planes = plan.defocus_planes()
     stats.clear()
     for sub in range(memory.n_sub):
         p0 = sub * memory.gemm_pixels
@@ -355,17 +357,16 @@ def _loop_body(
         for epoch in plan.epochs:
             for batch_index in range(epoch.batches.start, epoch.batches.stop):
                 batch = plan.batches[batch_index]
-                plane = planes[batch.d_local]
                 spectrum = spectra[batch.size]
                 for run_index, run in enumerate(inputs.layout.k_runs):
                     a_parts = []
                     for part in run.parts:
-                        group = inputs.groups[part.rect]
-                        k_start = group.rect[0]
+                        gid, local_plane = inputs.plane_lookup[part.rect][batch.d_local]
+                        k_start = inputs.layout.rectangles[part.rect][0]
                         a_parts.append(
                             engine.operand(
-                                operands[group.id],
-                                plane,
+                                operands[gid],
+                                local_plane,
                                 run.k_start - k_start,
                                 run.k_stop - k_start,
                                 p0,

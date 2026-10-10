@@ -42,6 +42,7 @@ class StubFeaturizer:
     def __init__(self, seed: int = 1) -> None:
         self.seed = seed
         self.calls = 0
+        self.planes_produced = 0
 
     def schedule(self, geometry, pixels) -> TileSchedule:
         idx = pixels.index.to("cpu")
@@ -59,15 +60,17 @@ class StubFeaturizer:
         stream=None,
     ):
         self.calls += 1
+        self.planes_produced += len(group.planes)
         n = int(schedule.column_index.numel())
         k0, m0, ke, me = group.rect
         for c, (k, m) in enumerate((k0 + i // me, m0 + i % me) for i in range(ke * me)):
             gen = torch.Generator().manual_seed(self.seed * 100003 + k * 1009 + m)
             full = torch.complex(
-                torch.randn(group.n_defocus, 10_000, generator=gen),
-                torch.randn(group.n_defocus, 10_000, generator=gen),
+                torch.randn(images.n_defocus, 10_000, generator=gen),
+                torch.randn(images.n_defocus, 10_000, generator=gen),
             )
-            data = full[:, schedule.column_index]  # pixel-identity features
+            # pixel-identity features, per global plane; the group holds a subset
+            data = full[list(group.planes)][:, schedule.column_index]
             writer.write(slice(c, c + 1), (0, n), data[:, None, :])
         writer.close()
 
@@ -376,3 +379,55 @@ def test_cuda_mixed_precision_session_matches_cpu(synthetic_result):
     torch.testing.assert_close(gpu.mip[final], cpu.mip[final], rtol=1e-4, atol=1e-4)
     assert torch.equal(gpu.best_index[final], cpu.best_index[final])
     assert gpu.geometry == cpu.geometry and gpu.n_psi_of_stage == (128, 128)
+
+
+def test_stage_planes_are_featurized_only_where_needed(template):
+    stub = StubFeaturizer()
+    space_planes = 3
+    rect = (0, 0, 3, 3)
+    schedule = SearchSchedule(
+        (
+            StageSpec(
+                [rect],
+                n_psi=16,
+                hypotheses=HypothesisSubset(defocus_ids=torch.tensor([1])),
+            ),
+            StageSpec([rect], n_psi=16),
+        ),
+        (TopFractionSelector(fraction=0.5), NoDecision()),
+        keep_stage_results=True,
+    )
+    searcher = Searcher(
+        template, schedule, execution=EXEC, featurizer=stub, n_defocus=space_planes
+    )
+    images = ImageSet.from_stack(torch.zeros(1, 30, 30), filters=torch.ones(3, 30, 16))
+    session = searcher.session(images)
+    stages = list(session)
+    assert (
+        stub.calls == 2 and stub.planes_produced == 3
+    )  # plane 1, then planes 0 and 2 only
+    assert [g.planes for g in session.store.groups] == [(1,), (0, 2)]
+    assert stages[0].n_pixels == 121 and stages[1].n_pixels == round(0.5 * 121)
+
+    # stage 1 (all planes, survivors only) equals a fresh all-plane search there
+    mask = torch.zeros(1, 11, 11, dtype=torch.bool)
+    mask.reshape(-1)[stages[1].pixel_index] = True
+    fresh = Searcher(
+        template,
+        SearchSchedule.single(StageSpec([rect], n_psi=16)),
+        execution=EXEC,
+        featurizer=StubFeaturizer(),
+        n_defocus=space_planes,
+    ).run(
+        ImageSet.from_stack(
+            torch.zeros(1, 30, 30), filters=torch.ones(3, 30, 16), mask=mask
+        )
+    )
+    order = torch.argsort(stages[1].pixel_index)
+    torch.testing.assert_close(
+        stages[1].maps.mip[order], fresh.mip.reshape(-1)[stages[1].pixel_index[order]]
+    )
+    assert torch.equal(
+        stages[1].best_index[order],
+        fresh.best_index.reshape(-1)[stages[1].pixel_index[order]],
+    )

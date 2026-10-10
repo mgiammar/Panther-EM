@@ -214,9 +214,13 @@ class SearchSession:
     # -- stage machinery ---------------------------------------------------------
 
     def _prepare_store(
-        self, block_pixels: int, precision: Precision, spec_rects: Sequence[Rectangle]
+        self,
+        block_pixels: int,
+        precision: Precision,
+        spec_rects: Sequence[Rectangle],
+        planes: Sequence[int],
     ) -> FeatureStore:
-        """Re-block / compact the store to the current pixels and add missing groups."""
+        """Re-block / compact the store to the current pixels; featurize what is new."""
         exe = self.searcher.execution
         pixels = self.pixels
         store = self.store
@@ -244,13 +248,15 @@ class SearchSession:
                 raise RuntimeError("featurizer column order diverged from the store's")
         ctx = self.searcher.ctx
         missing = [
-            rect for rect in spec_rects if store.group_for(rect, precision) is None
+            (rect, mp)
+            for rect in spec_rects
+            if (mp := store.missing_planes(rect, precision, planes))
         ]
         if missing and ctx.featurize is not None:
             # Blocks were zero-allocated on the current stream: featurize after it.
             ctx.featurize.wait_stream(torch.cuda.current_stream(ctx.device))
-        for rect in missing:
-            group = store.add_group(rect, precision)
+        for rect, missing_planes in missing:
+            group = store.add_group(rect, precision, missing_planes)
             self.featurizer.produce(
                 self.images,
                 group,
@@ -275,16 +281,19 @@ class SearchSession:
             searcher.ctx,
             spec,
             n_pixels=len(self.pixels),
-            n_defocus=self.images.n_defocus,
             space=searcher.space,
             subset=spec.hypotheses,
             batch=exe.batch,
             block_pixels=exe.block_pixels,
             use_cuda_graph=exe.use_cuda_graph,
             use_fused_kernel=exe.use_fused_kernel,
+            store=self.store,
         )
         store = self._prepare_store(
-            memory.block_pixels, spec.precision, spec.rectangles
+            memory.block_pixels,
+            spec.precision,
+            spec.rectangles,
+            hyp_plan.defocus_planes(),
         )
         plan = plan_stage(
             searcher.ctx, index, spec, store, memory, backend, engine, hyp_plan
@@ -357,16 +366,21 @@ class SearchSession:
         index = self.stage_index if stage_index is None else stage_index
         spec = self.searcher.schedule.stages[index]
         exe = self.searcher.execution
-        memory, _, _, _ = plan_memory(
+        memory, _, _, hyp_plan = plan_memory(
             self.searcher.ctx,
             spec,
             n_pixels=len(self.pixels),
-            n_defocus=self.images.n_defocus,
             space=self.searcher.space,
             subset=spec.hypotheses,
             batch=exe.batch,
             block_pixels=exe.block_pixels,
             use_cuda_graph=exe.use_cuda_graph,
             use_fused_kernel=exe.use_fused_kernel,
+            store=self.store,
         )
-        self._prepare_store(memory.block_pixels, spec.precision, spec.rectangles)
+        self._prepare_store(
+            memory.block_pixels,
+            spec.precision,
+            spec.rectangles,
+            hyp_plan.defocus_planes(),
+        )

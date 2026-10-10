@@ -32,8 +32,9 @@ class ColumnGroup:
         Position in :attr:`FeatureStore.groups`.
     rect : Rectangle
         ``(k_start, m_start, k_extent, m_extent)``.
-    n_defocus : int
-        Defocus planes ``D``.
+    planes : tuple[int, ...]
+        Global defocus plane ids held, in the order the blocks' leading axis
+        stores them (sorted ascending).
     precision : Precision
         Decides the block layout/dtype through :attr:`engine`.
     engine : ContractionEngine
@@ -46,11 +47,29 @@ class ColumnGroup:
 
     id: int
     rect: Rectangle
-    n_defocus: int
+    planes: tuple[int, ...]
     precision: Precision
     engine: ContractionEngine
     blocks: list[torch.Tensor] = field(default_factory=list)
     complete: bool = False
+
+    @property
+    def n_defocus(self) -> int:
+        """Planes held, ``D_g = len(planes)``."""
+        return len(self.planes)
+
+    def holds(self, plane: int) -> bool:
+        """Whether global plane ``plane`` lives in this group."""
+        return int(plane) in self.planes
+
+    def local_plane(self, plane: int) -> int:
+        """Position of global plane ``plane`` in the blocks' leading axis."""
+        try:
+            return self.planes.index(int(plane))
+        except ValueError as exc:
+            raise ValueError(
+                f"group {self.id} holds planes {self.planes}, not {plane}"
+            ) from exc
 
     @property
     def num_k(self) -> int:
@@ -146,7 +165,7 @@ class BlockWriter:
     def __init__(self, store: FeatureStore, group: ColumnGroup) -> None:
         self.store = store
         self.group = group
-        self._written_cells = 0
+        self._written = [0] * group.n_defocus  # cell-columns written per plane
 
     def write(
         self,
@@ -165,12 +184,14 @@ class BlockWriter:
         col_range : tuple[int, int]
             Compact columns ``[start, stop)`` the data covers.
         data : torch.Tensor
-            Complex features ``(D, n_cells, n_cols)``, or ``(n_cells, n_cols)`` when
-            ``plane`` is given.
+            Complex features ``(D_g, n_cells, n_cols)`` in the group's plane order, or
+            ``(n_cells, n_cols)`` when ``plane`` is given.
         plane : int, optional
-            Write only defocus plane ``plane``.
+            Write only the **global** defocus plane ``plane`` (which the group must
+            hold).
         """
         start, stop = col_range
+        local_plane = None if plane is None else self.group.local_plane(plane)
         if plane is None:
             if data.dim() != 3 or data.shape[0] != self.group.n_defocus:
                 raise ValueError(
@@ -196,23 +217,33 @@ class BlockWriter:
             local = slice(b0 - b * bp, b1 - b * bp)
             chunk = data[..., b0 - start : b1 - start]
             block = self.group.blocks[b]
-            if plane is None:
+            if local_plane is None:
                 engine.write_block(block, cells, local, chunk.to(block.device))
             else:
                 engine.write_block(
-                    block[plane : plane + 1], cells, local, chunk.to(block.device)[None]
+                    block[local_plane : local_plane + 1],
+                    cells,
+                    local,
+                    chunk.to(block.device)[None],
                 )
-        if plane is None or plane == self.group.n_defocus - 1:
-            self._written_cells += n_cells * (stop - start)
+        written = n_cells * (stop - start)
+        if local_plane is None:
+            self._written = [w + written for w in self._written]
+        else:
+            self._written[local_plane] += written
 
     def close(self) -> None:
         """Mark the group complete (every cell x column written at least once)."""
         expected = self.group.num_cells * self.store.n_pixels
-        if self._written_cells < expected:
+        short = [
+            (plane, w)
+            for plane, w in zip(self.group.planes, self._written, strict=True)
+            if w < expected
+        ]
+        if short:
             raise ValueError(
-                f"group {self.group.id} incomplete: {self._written_cells} of "
-                f"{expected} "
-                "cell-columns written"
+                f"group {self.group.id} incomplete: planes {short} have fewer than "
+                f"{expected} cell-columns written"
             )
         self.group.complete = True
 
@@ -232,7 +263,8 @@ class FeatureStore:
     block_pixels : int
         Pixels per block; a multiple of the GEMM pixel batch.
     n_defocus : int
-        Defocus planes ``D`` stored per column.
+        Defocus planes the image set carries (the valid range of plane ids; each group
+        holds a subset, though may also hold all defocus planes).
     device : torch.device or str
         Where blocks live (device residency).
     residency : {"device"}
@@ -284,35 +316,102 @@ class FeatureStore:
 
     # -- groups ---------------------------------------------------------------
 
+    def _planes(self, planes: Sequence[int] | None) -> tuple[int, ...]:
+        if planes is None:
+            return tuple(range(self.n_defocus))
+        ids = tuple(sorted({int(p) for p in planes}))
+        if not ids:
+            raise ValueError("planes must not be empty")
+        if ids[0] < 0 or ids[-1] >= self.n_defocus:
+            raise ValueError(
+                f"planes {ids} outside the image set's [0, {self.n_defocus}) planes"
+            )
+        return ids
+
     def group_for(
-        self, rect: Rectangle, precision: Precision | str | None = None
+        self,
+        rect: Rectangle,
+        precision: Precision | str | None = None,
+        planes: Sequence[int] | None = None,
     ) -> ColumnGroup | None:
-        """The group holding exactly ``rect`` (at ``precision`` when given), if any."""
+        """The group holding ``rect`` (at ``precision`` / ``planes`` if given)."""
         rect = tuple(int(v) for v in rect)  # type: ignore[assignment]
         wanted = None if precision is None else Precision.coerce(precision)
+        wanted_planes = None if planes is None else self._planes(planes)
         for g in self.groups:
-            if g.rect == rect and (wanted is None or g.precision is wanted):
+            if (
+                g.rect == rect
+                and (wanted is None or g.precision is wanted)
+                and (wanted_planes is None or g.planes == wanted_planes)
+            ):
                 return g
         return None
 
-    def add_group(self, rect: Rectangle, precision: Precision | str) -> ColumnGroup:
-        """Allocate zeroed blocks for a new rectangle (no featurization here).
-
-        The same rectangle may be held once per precision (a later stage at a higher
-        precision gets its own group).
-        """
+    def groups_covering(
+        self, rect: Rectangle, precision: Precision | str, planes: Sequence[int]
+    ) -> list[tuple[ColumnGroup, int]]:
+        """``(group, local plane index)`` for each of ``planes``, in request order."""
         rect = tuple(int(v) for v in rect)  # type: ignore[assignment]
-        if self.group_for(rect, precision) is not None:
-            raise ValueError(f"rectangle {rect} already has a {precision} group")
+        wanted = Precision.coerce(precision)
+        out: list[tuple[ColumnGroup, int]] = []
+        missing = []
+        for plane in planes:
+            for g in self.groups:
+                if g.rect == rect and g.precision is wanted and g.holds(plane):
+                    out.append((g, g.local_plane(plane)))
+                    break
+            else:
+                missing.append(int(plane))
+        if missing:
+            raise KeyError(
+                f"no {wanted.value} group of rectangle {rect} holds planes {missing}"
+            )
+        return out
+
+    def missing_planes(
+        self, rect: Rectangle, precision: Precision | str, planes: Sequence[int]
+    ) -> tuple[int, ...]:
+        """The subset of ``planes`` no group of ``rect`` at ``precision`` holds."""
+        rect = tuple(int(v) for v in rect)  # type: ignore[assignment]
+        wanted = Precision.coerce(precision)
+        held = {
+            p
+            for g in self.groups
+            if g.rect == rect and g.precision is wanted
+            for p in g.planes
+        }
+        return tuple(int(p) for p in planes if int(p) not in held)
+
+    def add_group(
+        self,
+        rect: Rectangle,
+        precision: Precision | str,
+        planes: Sequence[int] | None = None,
+    ) -> ColumnGroup:
+        """Allocate zeroed blocks for a new rectangle (no featurization here)."""
+        rect = tuple(int(v) for v in rect)  # type: ignore[assignment]
+        ids = self._planes(planes)
+        wanted = Precision.coerce(precision)
+        overlap = sorted(
+            p
+            for g in self.groups
+            if g.rect == rect and g.precision is wanted
+            for p in g.planes
+            if p in ids
+        )
+        if overlap:
+            raise ValueError(
+                f"rectangle {rect} already holds planes {overlap} at {wanted.value}"
+            )
         engine = make_engine(precision)
         group = ColumnGroup(
             id=len(self.groups),
             rect=rect,
-            n_defocus=self.n_defocus,
+            planes=ids,
             precision=engine.precision,
             engine=engine,
         )
-        shape = engine.block_shape(self.n_defocus, rect[2], rect[3], self.block_pixels)
+        shape = engine.block_shape(len(ids), rect[2], rect[3], self.block_pixels)
         group.blocks = [
             torch.zeros(shape, dtype=engine.block_dtype, device=self.device)
             for _ in range(self.n_blocks)
@@ -365,21 +464,44 @@ class FeatureStore:
         )
         positions = torch.nonzero(keep_cpu, as_tuple=False).squeeze(-1)
         for g in self.groups:
-            ng = new.add_group(g.rect, g.precision)
+            ng = new.add_group(g.rect, g.precision, g.planes)
             cursor = 0
             for i, block in enumerate(g.blocks):
                 start, stop = self.block_range(i)
                 sel = positions[(positions >= start) & (positions < stop)] - start
                 if sel.numel() == 0:
                     continue
-                gathered = block.index_select(
-                    2, sel.to(block.device)
-                )  # (D, k, n, inner)
-                n = int(sel.numel())
+                gathered = block.index_select(2, sel.to(block.device))
                 _scatter_columns(new, ng, cursor, gathered)
-                cursor += n
+                cursor += int(sel.numel())
             ng.complete = g.complete
         return new
+
+    def gather_columns(
+        self, group: ColumnGroup, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Engine-layout columns ``(D_g, num_k, n, inner)`` at compact ``positions``.
+
+        Gathers block by block (``positions`` need not be sorted; order is kept).
+        """
+        pos = positions.to(torch.long)
+        if pos.numel() == 0:
+            d, k, _, inner = group.blocks[0].shape
+            return torch.empty(
+                (d, k, 0, inner), dtype=group.blocks[0].dtype, device=self.device
+            )
+        dev_pos = pos.to(self.device)
+        block_of = dev_pos // self.block_pixels
+        within = dev_pos % self.block_pixels
+        out = torch.empty(
+            (*group.blocks[0].shape[:2], int(pos.numel()), group.blocks[0].shape[-1]),
+            dtype=group.blocks[0].dtype,
+            device=self.device,
+        )
+        for b in torch.unique(block_of).tolist():
+            where = torch.nonzero(block_of == b, as_tuple=False).squeeze(-1)
+            out[:, :, where, :] = group.blocks[b].index_select(2, within[where])
+        return out
 
 
 def _scatter_columns(

@@ -113,13 +113,13 @@ def _run_stage(
         ctx,
         spec,
         n_pixels=store.n_pixels,
-        n_defocus=store.n_defocus,
         space=space,
         subset=subset,
         batch=batch,
         block_pixels=store.block_pixels,
         use_cuda_graph=use_cuda_graph,
         use_fused_kernel=use_fused_kernel,
+        store=store,
     )
     plan = plan_stage(ctx, 0, spec, store, memory, backend, engine, hyp_plan)
     maps = StageExecutor(ctx).run(store, plan)
@@ -313,3 +313,63 @@ def test_cuda_epochs_merge_with_base(synthetic_result, monkeypatch):
         result, spec, features, HypothesisPlan(space, None, hyp_batch=2, n_psi=128), 128
     )
     _assert_matches(maps, ref, plan.hyp_plan)
+
+
+def _fill_store_split(result, spec, plane_groups, block_pixels, device, seed=0):
+    """Like ``_fill_store`` but each rectangle's planes live in several groups."""
+    n_defocus = sum(len(pg) for pg in plane_groups)
+    geo = _geometry(1)
+    pixels = PixelSelection.all(geo)
+    store = FeatureStore(
+        geo,
+        pixels,
+        pixels.index,
+        block_pixels=block_pixels,
+        n_defocus=n_defocus,
+        device=device,
+    )
+    gen = torch.Generator().manual_seed(seed)
+    features = {}
+    for rect in spec.rectangles:
+        n_cells = rect[2] * rect[3]
+        re = torch.randn(n_defocus, n_cells, store.n_pixels, generator=gen)
+        im = torch.randn(n_defocus, n_cells, store.n_pixels, generator=gen)
+        data = torch.complex(re, im)
+        for planes in plane_groups:
+            group = store.add_group(rect, spec.precision, planes)
+            w = store.writer(group)
+            for plane in planes:
+                w.write(
+                    slice(0, n_cells), (0, store.n_pixels), data[plane], plane=plane
+                )
+            w.close()
+        features[rect] = data
+    return store, features
+
+
+def test_planes_split_across_groups_match_dense_reference(synthetic_result):
+    result = synthetic_result()
+    space = HypothesisSpace.from_result(result, n_defocus=3)
+    spec = StageSpec([(0, 0, 4, 3), (0, 3, 2, 2)], n_psi=16)
+    store, features = _fill_store_split(result, spec, ((0, 2), (1,)), 8, "cpu")
+    assert [g.planes for g in store.groups] == [(0, 2), (1,), (0, 2), (1,)]
+    ctx = SearchContext("cpu", WeightSource(result, "cpu"))
+    plan, maps = _run_stage(ctx, result, spec, store, space, batch=BatchShape(4, 6))
+    assert len(plan.groups) == 4
+    # rect 0: planes 0,1,2 -> (group 0 local 0), (group 1 local 0), (group 0 local 1)
+    assert plan.plane_lookup[0] == ((0, 0), (1, 0), (0, 1))
+    assert plan.plane_lookup[1] == ((2, 0), (3, 0), (2, 1))
+    _assert_matches(
+        maps, _reference(result, spec, features, plan.hyp_plan, 16), plan.hyp_plan
+    )
+
+    # a stage restricted to plane 2 reads only the first group's local slab 1
+    subset = HypothesisSubset.defocus(space, torch.tensor([2]))
+    plan2, maps2 = _run_stage(
+        ctx, result, spec, store, space, subset=subset, batch=BatchShape(4, 6)
+    )
+    assert plan2.plane_lookup[0] == ((0, 1),) and len(plan2.groups) == 2
+    _assert_matches(
+        maps2, _reference(result, spec, features, plan2.hyp_plan, 16), plan2.hyp_plan
+    )
+    assert plan2.signature != plan.signature

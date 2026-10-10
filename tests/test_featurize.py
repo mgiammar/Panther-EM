@@ -145,6 +145,18 @@ def test_filter_planes_match_prefiltered_reference(bank):
             read_group(store, group, d), expected, rtol=1e-4, atol=1e-5
         )
 
+    # a group holding only planes 2 and 0 (stored as (0, 2)) gets exactly those planes
+    partial = store.add_group((0, 0, 1, 2), "fp32", planes=(2, 0))
+    feat.produce(images, partial, store.writer(partial), sched, chunk=4)
+    assert partial.planes == (0, 2)
+    for local, d in enumerate((0, 2)):
+        pre = torch.fft.irfft2(torch.fft.rfft2(raw) * filters[d], s=(30, 28))
+        ref = _reference(bank, pre, (0, 0, 1, 2))
+        expected = _expected_columns(ref, geo, sched.column_index).reshape(-1, 1, 2)
+        torch.testing.assert_close(
+            read_group(store, partial, local), expected, rtol=1e-4, atol=1e-5
+        )
+
     per_image = ImageSet.from_stack(raw, filters=torch.rand(2, 2, 30, 15))
     sched, store, group = _run(feat, per_image, geo, pixels, RECT)
     for d in range(2):
