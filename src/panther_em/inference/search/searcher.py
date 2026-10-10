@@ -202,7 +202,10 @@ class SearchSession:
         )
         initial = PixelSelection.from_mask(self.geometry, images.mask)
         self.ledger = PixelLedger(
-            self.geometry, exe.ledger_device or searcher.device, initial=initial
+            self.geometry,
+            exe.ledger_device or searcher.device,
+            initial=initial,
+            aux=self.geometry.validate_pixel_maps(images.pixel_maps),
         )
         self.pixels: PixelSelection = initial
         self.store: FeatureStore | None = None

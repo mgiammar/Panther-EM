@@ -57,7 +57,7 @@ Example
         error_model=ErrorModel.from_result(template.result),
     )
     searcher = Searcher(template, schedule)
-    result = searcher.run(ImageSet.single(micrograph))        # (1, out_h, out_w) maps
+    result = searcher.run(ImageSet.single(micrograph))  # (1, out_h, out_w) maps
     result.decode().phi, result.decode().psi, result.label
 
 Particle stacks: ``ImageSet.from_boxes(boxes)`` (box == template -> center-only
@@ -84,10 +84,12 @@ from panther_em.inference.search.decisions import (
     DecisionChain,
     DilationAbsorb,
     NoDecision,
+    SurpassThresholdDecision,
     ThresholdClassifier,
     TopFractionSelector,
     ZScoreIntervalClassifier,
     classify_zscore_interval,
+    surpass_threshold,
     zscore_error_intervals,
 )
 from panther_em.inference.search.featurize import (
@@ -163,6 +165,7 @@ __all__ = [
     "Searcher",
     "StageResult",
     "StageSpec",
+    "SurpassThresholdDecision",
     "Template",
     "ThresholdClassifier",
     "TopFractionSelector",
@@ -172,5 +175,6 @@ __all__ = [
     "make_featurizer",
     "nested_schedule",
     "psi_degrees",
+    "surpass_threshold",
     "zscore_error_intervals",
 ]
