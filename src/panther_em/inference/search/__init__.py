@@ -123,6 +123,7 @@ from panther_em.inference.search.searcher import (
     Searcher,
     SearchSession,
 )
+from panther_em.inference.search.sparse import PairScores, SparsePairEvaluator
 from panther_em.inference.search.store import FeatureStore
 from panther_em.inference.search.tiling import FeatureLayout
 from panther_em.inference.search.types import (
@@ -160,6 +161,7 @@ __all__ = [
     "PairEmissionDecision",
     "PairEmissionSpec",
     "PairList",
+    "PairScores",
     "PixelLabel",
     "PixelLedger",
     "PixelSelection",
@@ -173,6 +175,7 @@ __all__ = [
     "SearchSchedule",
     "SearchSession",
     "Searcher",
+    "SparsePairEvaluator",
     "StageResult",
     "StageSpec",
     "SurpassThresholdDecision",

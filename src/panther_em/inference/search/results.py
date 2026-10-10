@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
     from panther_em.inference.search.executor import StageMaps
     from panther_em.inference.search.ledger import PixelLedger
+    from panther_em.inference.search.sparse import PairScores
     from panther_em.inference.search.types import Rectangle
 
 MAP_NAMES = (
@@ -67,6 +68,8 @@ class StageResult:
     elapsed_s : float
     pairs : PairList, optional
         The ``(pixel, template)`` pairs an emitting stage produced (after dilation).
+    scores : PairScores, optional
+        A sparse stage's per-pair scores.
     """
 
     stage_index: int
@@ -78,6 +81,7 @@ class StageResult:
     n_uncertain_after: int
     elapsed_s: float
     pairs: PairList | None = None
+    scores: PairScores | None = None
 
     @property
     def n_pixels(self) -> int:
@@ -300,6 +304,7 @@ class SearchResult:
                         "error": s.error,
                         "name": s.name,
                         "pairs": _pairs_spec_to_json(s.pairs),
+                        "mode": s.mode,
                     }
                     for s in self.schedule.stages
                 ]
@@ -350,6 +355,7 @@ class SearchResult:
                     error=s["error"],
                     name=s.get("name", ""),
                     pairs=_pairs_spec_from_json(s.get("pairs")),
+                    mode=s.get("mode", "dense"),
                 )
                 for s in json.loads(f.attrs["stages"])
             )

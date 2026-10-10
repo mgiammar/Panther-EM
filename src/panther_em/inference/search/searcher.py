@@ -28,14 +28,20 @@ from typing import TYPE_CHECKING
 import torch
 
 from panther_em.inference.search.context import Planner, SearchContext
-from panther_em.inference.search.executor import StageExecutor, plan_memory, plan_stage
+from panther_em.inference.search.executor import (
+    StageExecutor,
+    StageMaps,
+    plan_memory,
+    plan_stage,
+)
 from panther_em.inference.search.featurize import make_featurizer
-from panther_em.inference.search.hypotheses import HypothesisSpace
-from panther_em.inference.search.ledger import PixelLedger
+from panther_em.inference.search.hypotheses import HypothesisPlan, HypothesisSpace
+from panther_em.inference.search.ledger import PixelLabel, PixelLedger
 from panther_em.inference.search.orientations import S2Neighborhood
 from panther_em.inference.search.pairs import PairCollector
 from panther_em.inference.search.results import SearchResult, StageResult
 from panther_em.inference.search.schedule import ErrorModel
+from panther_em.inference.search.sparse import SparsePairEvaluator
 from panther_em.inference.search.store import FeatureStore
 from panther_em.inference.search.types import (
     ImageSet,
@@ -81,6 +87,9 @@ class ExecutionConfig:
         Byte budget of the prepared-weight cache.
     show_progress : bool
         Print per-stage progress bars.
+    sparse_pixel_chunk, sparse_pair_chunk : int
+        Chunk sizes of the sparse pair evaluator (pixels featurized per chunk, pairs
+        contracted per call).
     """
 
     batch: BatchShape | None = None
@@ -94,6 +103,8 @@ class ExecutionConfig:
     ledger_device: torch.device | str | None = None
     prepared_budget: int | None = None
     show_progress: bool = False
+    sparse_pixel_chunk: int = 2048
+    sparse_pair_chunk: int = 1024
 
 
 class Searcher:
@@ -297,6 +308,8 @@ class SearchSession:
         exe = searcher.execution
         spec = searcher.schedule.stages[index]
         t0 = time.perf_counter()
+        if spec.mode == "sparse_pairs":
+            return self._run_sparse_stage(index, t0)
         memory, backend, engine, hyp_plan = plan_memory(
             searcher.ctx,
             spec,
@@ -365,6 +378,57 @@ class SearchSession:
             pairs=pairs,
         )
 
+    def _run_sparse_stage(self, index: int, t0: float) -> StageResult:
+        """Score the latest emitted pairs at the stage's rank; keep stage-1 moments."""
+        searcher = self.searcher
+        exe = searcher.execution
+        spec = searcher.schedule.stages[index]
+        ledger = self.ledger
+        emitted = max(i for i in ledger.pairs if i < index)
+        pairs = ledger.pairs[emitted].to(ledger.device)
+        pairs = pairs.select(ledger.label[pairs.pixel] == int(PixelLabel.UNCERTAIN))
+        planes = HypothesisPlan(
+            searcher.space, spec.hypotheses, hyp_batch=1, n_psi=spec.n_psi
+        ).defocus_planes()
+        scores = SparsePairEvaluator(
+            searcher.template,
+            self.featurizer,
+            pixel_chunk=exe.sparse_pixel_chunk,
+            pair_chunk=exe.sparse_pair_chunk,
+            cell_chunk=exe.cell_chunk,
+        ).evaluate(self.images, pairs, spec, planes=planes)
+        pixel, best = scores.best_per_pixel()
+        pixel_l = pixel.to(ledger.device)
+        mean, variance = ledger.mean[pixel_l], ledger.variance[pixel_l]
+        mip = scores.value[best].to(ledger.device)
+        maps = StageMaps(
+            mip=mip,
+            mean=mean,
+            variance=variance,
+            zscore=(mip - mean) / variance.clamp_min(0.0).sqrt(),
+            best_virtual=scores.global_ids()[best].to(ledger.device),
+            best_psi=scores.psi[best].to(ledger.device),
+            n_evaluated=len(pairs) * spec.n_psi,
+        )
+        # all templates, all planes: virtual ids are global ids under this plan
+        full = HypothesisPlan(searcher.space, None, hyp_batch=1, n_psi=spec.n_psi)
+        ledger.write(maps, pixel_l, index, full)
+        searcher.schedule.decisions[index](ledger, pixel_l, spec, index)
+        self.pixels = ledger.uncertain()
+        elapsed = time.perf_counter() - t0
+        self.elapsed_s += elapsed
+        return StageResult(
+            stage_index=index,
+            spec=spec,
+            pixel_index=pixel_l.clone(),
+            maps=maps,
+            best_index=maps.best_virtual,
+            labels_after=ledger.label[pixel_l].clone(),
+            n_uncertain_after=len(self.pixels),
+            elapsed_s=elapsed,
+            scores=scores,
+        )
+
     def set_pairs(self, stage_index: int, pairs: PairList) -> None:
         """Inject a pair list as if ``stage_index`` had emitted it."""
         self.ledger.pairs[stage_index] = pairs
@@ -404,9 +468,14 @@ class SearchSession:
         )
 
     def featurize(self, stage_index: int | None = None) -> None:
-        """Eagerly featurize for a stage (profiling warm-up); no search runs."""
+        """Eagerly featurize for a dense stage (profiling warm-up); no search runs.
+
+        A ``sparse_pairs`` stage featurizes per chunk while it runs: no-op here.
+        """
         index = self.stage_index if stage_index is None else stage_index
         spec = self.searcher.schedule.stages[index]
+        if spec.mode == "sparse_pairs":
+            return
         exe = self.searcher.execution
         memory, _, _, hyp_plan = plan_memory(
             self.searcher.ctx,

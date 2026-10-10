@@ -6,7 +6,7 @@ import csv
 import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import numpy as np
 import torch
@@ -77,6 +77,9 @@ class StageSpec:
         Emit the sparse ``(pixel, template)`` pairs passing a threshold (plus their
         dilation) for a following sparse stage; ``NoDecision`` on such a stage
         becomes ``PairEmissionDecision``.
+    mode : {"dense", "sparse_pairs"}
+        ``"sparse_pairs"`` evaluates only the pairs the previous emitting stage
+        produced (all templates; ``hypotheses`` may still restrict defocus planes).
     """
 
     rectangles: tuple[Rectangle, ...]
@@ -86,6 +89,7 @@ class StageSpec:
     hypotheses: HypothesisSubset | None = None
     name: str = ""
     pairs: PairEmissionSpec | None = None
+    mode: Literal["dense", "sparse_pairs"] = "dense"
 
     def __post_init__(self) -> None:
         """Normalise rectangles/precision and validate the psi cap."""
@@ -113,6 +117,18 @@ class StageSpec:
             raise ValueError(
                 f"error must be a relative error in [0, 1), got {self.error}"
             )
+        if self.mode not in ("dense", "sparse_pairs"):
+            raise ValueError(
+                f"mode must be 'dense' or 'sparse_pairs', got {self.mode!r}"
+            )
+        if self.mode == "sparse_pairs":
+            if self.pairs is not None:
+                raise ValueError("a sparse_pairs stage cannot emit pairs itself")
+            if self.hypotheses is not None and self.hypotheses.template_ids is not None:
+                raise ValueError(
+                    "a sparse_pairs stage evaluates the pairs' templates; "
+                    "only defocus_ids may restrict it"
+                )
 
     @property
     def emit_pairs(self) -> bool:
@@ -178,6 +194,13 @@ class SearchSchedule:
             PairEmissionDecision() if s.emit_pairs and isinstance(d, NoDecision) else d
             for s, d in zip(stages, decisions, strict=True)
         )
+        for i, stage in enumerate(stages):
+            if stage.mode == "sparse_pairs" and not any(
+                s.emit_pairs for s in stages[:i]
+            ):
+                raise ValueError(
+                    f"sparse_pairs stage {i} has no emitting stage before it"
+                )
         object.__setattr__(self, "stages", stages)
         object.__setattr__(self, "decisions", decisions)
 
