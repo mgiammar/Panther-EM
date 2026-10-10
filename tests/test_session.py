@@ -431,3 +431,29 @@ def test_stage_planes_are_featurized_only_where_needed(template):
         stages[1].best_index[order],
         fresh.best_index.reshape(-1)[stages[1].pixel_index[order]],
     )
+
+
+def test_session_surpass_threshold_decision_round_trip(template):
+    from panther_em.inference.search.decisions import SurpassThresholdDecision
+
+    stub = StubFeaturizer()
+    schedule = SearchSchedule.single(
+        StageSpec([(0, 0, 4, 5)], n_psi=16), SurpassThresholdDecision(1.0)
+    )
+    searcher = Searcher(template, schedule, execution=EXEC, featurizer=stub)
+    images = ImageSet.single(
+        torch.zeros(30, 30),
+        pixel_maps={
+            "image_norm": torch.ones(11, 11),
+            "noise_variance": torch.full((1, 11, 11), 2.0),
+        },
+    )
+    session = searcher.session(images)
+    assert session.ledger.aux["noise_variance"].shape == (121,)
+    res = session.run_all()
+    assert not (res.label == int(PixelLabel.UNCERTAIN)).any()
+    z = res.zscore[0]
+    assert torch.equal(res.label[0] == int(PixelLabel.ACCEPTED), z > 1.0)
+
+    with pytest.raises(KeyError, match="image_norm"):
+        searcher.run(ImageSet.single(torch.zeros(30, 30)))

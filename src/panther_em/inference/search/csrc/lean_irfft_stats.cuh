@@ -43,6 +43,11 @@ __device__ __forceinline__ unsigned long long pack(float v, unsigned idx) {
   return (static_cast<unsigned long long>(f2sortable(v)) << 32) | idx;
 }
 
+// Output conversion for the per-pair emission (EMIT=true instantiations).
+template <typename OutT> __device__ __forceinline__ OutT to_out(float v);
+template <> __device__ __forceinline__ float to_out<float>(float v) { return v; }
+template <> __device__ __forceinline__ __half to_out<__half>(float v) { return __float2half(v); }
+
 __device__ __forceinline__ float2 cmul(float2 a, float2 b) {
   return make_float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
@@ -147,18 +152,25 @@ __device__ __forceinline__ void fold_high_bins(const InT* __restrict__ c, size_t
 // constant-folding the zero bins through the Hermitian pack inflates register pressure.
 // All of these are bandwidth-bound; 8 warps/SM with 64+ outstanding loads each saturate DRAM.
 // ---------------------------------------------------------------------------
-constexpr unsigned min_blocks_per_sm(unsigned fmax, unsigned r) {
+// `emit` (the per-pair emission variant, EMIT=true) adds two live registers in the
+// epilogue only; it shares the table until a ptxas report shows a spill for an entry.
+constexpr unsigned min_blocks_per_sm(unsigned fmax, unsigned r, bool emit = false) {
+  (void)emit;
   if (fmax > 64) return 2;
   if (r == 2 && (fmax == 24 || fmax == 40 || fmax == 48 || fmax == 56)) return 2;
   return 3;
 }
 
-template <unsigned FMAX, unsigned R, typename InT>
-__global__ void __launch_bounds__(128, min_blocks_per_sm(FMAX, R))
+// EMIT=true additionally writes, per (pixel, hypothesis) pair, the maximum of the
+// recovered correlogram over psi to pair_out[p * pair_ld + q] (row stride pair_ld >= Q,
+// so a stage's hypothesis batches can fill one (P, Q_total) slab). One writer per pair,
+// coalesced; the per-pixel statistics path is unchanged. EMIT=false ignores pair_out.
+template <unsigned FMAX, unsigned R, typename InT, bool EMIT, typename OutT>
+__global__ void __launch_bounds__(128, min_blocks_per_sm(FMAX, R, EMIT))
 lean_irfft_stats_transposed(const InT* __restrict__ c, float* __restrict__ s1,
                             float* __restrict__ s2, unsigned long long* __restrict__ argmax_packed,
                             unsigned F, unsigned P, unsigned Q, unsigned q_tiles,
-                            unsigned hyp_offset) {
+                            unsigned hyp_offset, OutT* __restrict__ pair_out, size_t pair_ld) {
   static_assert(R == 2 || R == 4, "R in {2,4}");
   constexpr unsigned T = R / 2;
   constexpr unsigned NPSI = 64 * R;
@@ -222,6 +234,13 @@ lean_irfft_stats_transposed(const InT* __restrict__ c, float* __restrict__ s1,
     if (wi[j] > best) { best = wi[j]; bidx = R * j + h + T; }
   }
   if (!active) best = -FLT_MAX;
+  if constexpr (EMIT) {
+    // The pair's max over all psi: at T=2 the partner lane (xor 1) holds the other
+    // two residues. Every lane reaches this point, so the full mask is safe.
+    float pbest = best;
+    if constexpr (T > 1) pbest = fmaxf(pbest, __shfl_xor_sync(0xffffffffu, pbest, 1));
+    if (active && h == 0) pair_out[static_cast<size_t>(p) * pair_ld + q] = to_out<OutT>(pbest);
+  }
   // Flat (hypothesis, psi) index, global across hypothesis batches via hyp_offset so the
   // packed (value, index) max can accumulate over a whole stage without a decode step.
   unsigned flat = (hyp_offset + q) * NPSI + bidx;
@@ -255,34 +274,41 @@ lean_irfft_stats_transposed(const InT* __restrict__ c, float* __restrict__ s1,
 // ---------------------------------------------------------------------------
 // Launch: runtime NumFreq F -> the smallest FMAX (multiple of 8) instantiation.
 // ---------------------------------------------------------------------------
-template <unsigned FMAX, unsigned R, typename InT>
+template <unsigned FMAX, unsigned R, typename InT, bool EMIT = false, typename OutT = float>
 inline void launch_lean_transposed_fmax(const InT* c, float* s1, float* s2, unsigned long long* pk,
                                         unsigned F, unsigned P, unsigned Q, unsigned hyp_offset,
-                                        cudaStream_t stream) {
+                                        cudaStream_t stream, OutT* pair_out = nullptr,
+                                        size_t pair_ld = 0) {
   constexpr unsigned PAIRS = 128 / (R / 2);
   const unsigned q_tiles = (Q + PAIRS - 1) / PAIRS;
-  lean_irfft_stats_transposed<FMAX, R, InT><<<P * q_tiles, 128, 0, stream>>>(
-      c, s1, s2, pk, F, P, Q, q_tiles, hyp_offset);
+  lean_irfft_stats_transposed<FMAX, R, InT, EMIT, OutT><<<P * q_tiles, 128, 0, stream>>>(
+      c, s1, s2, pk, F, P, Q, q_tiles, hyp_offset, pair_out, pair_ld);
 }
 
-template <unsigned FMAX, unsigned R, typename InT>
+template <unsigned FMAX, unsigned R, typename InT, bool EMIT = false, typename OutT = float>
 inline void launch_lean_by_fmax(const InT* c, float* s1, float* s2, unsigned long long* pk,
                                 unsigned F, unsigned P, unsigned Q, unsigned hyp_offset,
-                                cudaStream_t stream) {
+                                cudaStream_t stream, OutT* pair_out = nullptr,
+                                size_t pair_ld = 0) {
   if constexpr (FMAX > 8) {
     if (F <= FMAX - 8)
-      return launch_lean_by_fmax<FMAX - 8, R, InT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream);
+      return launch_lean_by_fmax<FMAX - 8, R, InT, EMIT, OutT>(c, s1, s2, pk, F, P, Q, hyp_offset,
+                                                               stream, pair_out, pair_ld);
   }
-  launch_lean_transposed_fmax<FMAX, R, InT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream);
+  launch_lean_transposed_fmax<FMAX, R, InT, EMIT, OutT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream,
+                                                        pair_out, pair_ld);
 }
 
-// F in [1, 32R + 1] (i.e. NumFreq <= n_psi/2 + 1).
-template <unsigned R, typename InT>
+// F in [1, 32R + 1] (i.e. NumFreq <= n_psi/2 + 1). EMIT/OutT select the per-pair
+// emission variant (see the kernel comment); the defaults are the dense kernel.
+template <unsigned R, typename InT, bool EMIT = false, typename OutT = float>
 inline void launch_lean_transposed(const InT* c, float* s1, float* s2, unsigned long long* pk,
                                    unsigned F, unsigned P, unsigned Q, unsigned hyp_offset,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, OutT* pair_out = nullptr,
+                                   size_t pair_ld = 0) {
   constexpr unsigned FTOP = ((32 * R + 1) + 7) / 8 * 8;  // ceil8(NPSI/2 + 1): 72 (R=2), 136 (R=4)
-  launch_lean_by_fmax<FTOP, R, InT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream);
+  launch_lean_by_fmax<FTOP, R, InT, EMIT, OutT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream, pair_out,
+                                                pair_ld);
 }
 
 // ---------------------------------------------------------------------------

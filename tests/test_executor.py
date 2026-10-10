@@ -68,8 +68,8 @@ def _fill_store(result, spec, n_defocus, block_pixels, device, n_images=1, seed=
     return store, features
 
 
-def _reference(result, spec, features, hyp_plan, n_psi):
-    """Dense per-pixel statistics over (defocus, template, psi)."""
+def _reference_corr(result, spec, features, hyp_plan, n_psi):
+    """Dense correlogram ``(P, D_sel, N_sel, psi)`` from the store's features."""
     src = WeightSource(result, "cpu")
     rows = hyp_plan.template_rows()
     planes = hyp_plan.defocus_planes()
@@ -85,7 +85,19 @@ def _reference(result, spec, features, hyp_plan, n_psi):
         )
         y = y[list(planes)]  # (D_sel, P, ke, me)
         C[:, :, :, k0 : k0 + ke] += torch.einsum("dpkm,nkm->pdnk", y, w.conj())
-    corr = torch.fft.irfft(C, n=n_psi, dim=-1, norm="forward")  # (P, D, N, psi)
+    return torch.fft.irfft(C, n=n_psi, dim=-1, norm="forward")  # (P, D, N, psi)
+
+
+def _reference_pair_max(result, spec, features, hyp_plan, n_psi):
+    """``(P, n_virtual)`` max over psi; columns are virtual ids ``d*N_sel + j``."""
+    corr = _reference_corr(result, spec, features, hyp_plan, n_psi)
+    return corr.amax(dim=-1).reshape(corr.shape[0], -1)
+
+
+def _reference(result, spec, features, hyp_plan, n_psi):
+    """Dense per-pixel statistics over (defocus, template, psi)."""
+    corr = _reference_corr(result, spec, features, hyp_plan, n_psi)
+    P = corr.shape[0]
     flat = corr.reshape(P, -1)
     mip, amax = flat.max(dim=1)
     mean = flat.mean(dim=1)
@@ -108,6 +120,8 @@ def _run_stage(
     batch=None,
     use_cuda_graph=False,
     use_fused_kernel=True,
+    pair_dtype=None,
+    collector=None,
 ):
     memory, backend, engine, hyp_plan = plan_memory(
         ctx,
@@ -120,10 +134,31 @@ def _run_stage(
         use_cuda_graph=use_cuda_graph,
         use_fused_kernel=use_fused_kernel,
         store=store,
+        pair_dtype=pair_dtype,
     )
     plan = plan_stage(ctx, 0, spec, store, memory, backend, engine, hyp_plan)
-    maps = StageExecutor(ctx).run(store, plan)
+    maps = StageExecutor(ctx).run(store, plan, collector=collector)
     return plan, maps
+
+
+class _SlabRecorder:
+    """A ``BlockPairSink`` that stitches the block slabs back into one matrix."""
+
+    def __init__(self, n_pixels, n_virtual, dtype, device):
+        self.pair_max = torch.full(
+            (n_pixels, n_virtual), float("nan"), dtype=dtype, device=device
+        )
+        self.mean = torch.full((n_pixels,), float("nan"), device=device)
+        self.variance = torch.full((n_pixels,), float("nan"), device=device)
+        self.blocks = []
+
+    def consume_block(self, pair_max, *, col_start, n_valid, mean, variance):
+        assert pair_max.shape == (n_valid, self.pair_max.shape[1])
+        assert mean.shape == variance.shape == (n_valid,)
+        self.pair_max[col_start : col_start + n_valid] = pair_max
+        self.mean[col_start : col_start + n_valid] = mean
+        self.variance[col_start : col_start + n_valid] = variance
+        self.blocks.append((col_start, n_valid))
 
 
 def _assert_matches(maps, ref, hyp_plan, *, rtol=1e-4, atol=1e-4):
@@ -203,6 +238,82 @@ def test_strided_subset_matches_restricted_reference_and_decodes_globally(
     assert set(global_ids.tolist()) <= {1 * 10 + t for t in (1, 4, 7)}
 
 
+@pytest.mark.parametrize("block_pixels", [24, 8, 4])
+def test_cpu_pair_slab_matches_reference_max_over_psi(synthetic_result, block_pixels):
+    result = synthetic_result(n_orientations=6)
+    space = HypothesisSpace.from_result(result, n_defocus=2)
+    spec = StageSpec([(0, 0, 4, 3), (0, 3, 2, 2)], precision="fp32", n_psi=16)
+    store, features = _fill_store(result, spec, 2, block_pixels, "cpu")
+    ctx = SearchContext("cpu", WeightSource(result, "cpu"))
+    n_virtual = 2 * result.num_fourier_filters * 6
+    rec = _SlabRecorder(store.n_pixels, n_virtual, torch.float32, "cpu")
+    plan, maps = _run_stage(
+        ctx,
+        result,
+        spec,
+        store,
+        space,
+        batch=BatchShape(4, 4),
+        pair_dtype=torch.float32,
+        collector=rec,
+    )
+    assert plan.memory.pair_dtype is torch.float32
+    assert plan.spectrum.pair_dtype is torch.float32
+    assert plan.hyp_plan.n_virtual == n_virtual
+    assert plan.memory.pair_slab_bytes(n_virtual) == block_pixels * n_virtual * 4
+    assert [n for _, n in rec.blocks] == [
+        min(block_pixels, store.n_pixels - s) for s, _ in rec.blocks
+    ]
+    assert sum(n for _, n in rec.blocks) == store.n_pixels
+    ref = _reference_pair_max(result, spec, features, plan.hyp_plan, 16)
+    torch.testing.assert_close(rec.pair_max, ref, rtol=1e-4, atol=1e-4)
+    # the slab's row maximum is the per-pixel mip; moments are the finalized maps
+    torch.testing.assert_close(rec.pair_max.amax(dim=1), maps.mip)
+    assert torch.equal(rec.mean, maps.mean) and torch.equal(rec.variance, maps.variance)
+    _assert_matches(
+        maps, _reference(result, spec, features, plan.hyp_plan, 16), plan.hyp_plan
+    )
+    # the loop cache keys on the pair dtype: the dense plan is a different loop
+    plan_dense, _ = _run_stage(ctx, result, spec, store, space, batch=BatchShape(4, 4))
+    assert (
+        plan_dense.signature != plan.signature and plan_dense.memory.pair_dtype is None
+    )
+    with pytest.raises(ValueError, match="pair_dtype"):
+        _run_stage(
+            ctx, result, spec, store, space, batch=BatchShape(4, 4), collector=rec
+        )
+
+
+def test_cpu_pair_slab_strided_subset_and_fp16(synthetic_result):
+    result = synthetic_result(n_filters=2, n_orientations=5)
+    space = HypothesisSpace.from_result(result, n_defocus=2)
+    spec = StageSpec([(0, 0, 3, 4)], n_psi=16)
+    store, features = _fill_store(result, spec, 2, 25, "cpu")
+    ctx = SearchContext("cpu", WeightSource(result, "cpu"))
+    subset = HypothesisSubset(
+        template_ids=torch.arange(1, 10, 3), defocus_ids=torch.tensor([1])
+    )
+    rec = _SlabRecorder(store.n_pixels, 3, torch.float16, "cpu")
+    plan, _maps = _run_stage(
+        ctx,
+        result,
+        spec,
+        store,
+        space,
+        subset=subset,
+        batch=BatchShape(5, 2),
+        pair_dtype=torch.float16,
+        collector=rec,
+    )
+    assert plan.hyp_plan.n_virtual == 3
+    ref = _reference_pair_max(result, spec, features, plan.hyp_plan, 16)
+    torch.testing.assert_close(rec.pair_max.float(), ref, rtol=2e-3, atol=2e-2)
+    # virtual columns decode to the restricted global ids, plane 1 only
+    global_ids = plan.hyp_plan.decode(torch.arange(3))
+    assert global_ids.tolist() == [1 * 10 + t for t in (1, 4, 7)]
+    assert torch.all(space.decode(global_ids).defocus == 1)
+
+
 def test_planner_defaults_and_overrides():
     caps = DeviceCaps.probe("cpu")
     planner = Planner(l2_target=64 * 1024**2, block_bytes_max=1024)
@@ -246,6 +357,40 @@ def test_planner_defaults_and_overrides():
     )
 
 
+def test_planner_pair_slab_joins_block_budget():
+    from panther_em.inference.search.statistics import TorchStatsBackend
+
+    caps = DeviceCaps.probe("cpu")
+    planner = Planner(l2_target=64 * 1024**2, block_bytes_max=64 << 20)
+    common = {
+        "n_pixels": 100_000,
+        "n_freq": 64,
+        "n_psi": 256,
+        "n_virtual": 4096,
+        "n_defocus": 1,
+        "feature_bytes_per_pixel": 16,
+        "spectrum_dtype": torch.complex64,
+        "precision": "fp32",
+        "stats_backend": TorchStatsBackend(),
+        "batch": BatchShape(64, 256),
+    }
+    dense = planner.plan(caps, **common)
+    half = planner.plan(caps, **common, pair_dtype=torch.float16)
+    full = planner.plan(caps, **common, pair_dtype=torch.float32)
+    assert dense.pair_dtype is None and dense.pair_slab_bytes(4096) == 0
+    assert half.pair_dtype is torch.float16 and full.pair_dtype is torch.float32
+    # per pixel: 16 B dense, 16 + 8192 B fp16, 16 + 16384 B fp32 -> blocks shrink
+    assert dense.block_pixels > half.block_pixels > full.block_pixels >= 64
+    assert half.block_pixels % 64 == 0 and full.block_pixels % 64 == 0
+    assert half.pair_slab_bytes(4096) == half.block_pixels * 4096 * 2
+    # one GEMM batch of slab must fit in a quarter of free memory
+    tiny = DeviceCaps(
+        torch.device("cpu"), False, False, False, None, free_bytes=1 << 20
+    )
+    with pytest.raises(ValueError, match="pair slab"):
+        planner.plan(tiny, **common, pair_dtype=torch.float32)
+
+
 @pytest.mark.skipif(not CUDA, reason="needs CUDA")
 @pytest.mark.parametrize("precision", ["fp32", "fp16"])
 def test_cuda_fused_eager_and_graph_match_reference(synthetic_result, precision):
@@ -284,6 +429,79 @@ def test_cuda_fused_eager_and_graph_match_reference(synthetic_result, precision)
         ctx, result, spec, store, space, batch=BatchShape(4, 4), use_cuda_graph=True
     )
     assert len(ctx.loops) == n_loops
+
+
+@pytest.mark.skipif(not CUDA, reason="needs CUDA")
+# the torch-backend fallback compiles _reduce_stats for complex32 input; under
+# Python 3.13 triton's AST building emits a DeprecationWarning that pytest's
+# warnings-as-errors would otherwise turn into an inductor CompilationError
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+@pytest.mark.parametrize(
+    ("precision", "pair_dtype"),
+    [("fp32", torch.float32), ("fp32", torch.float16), ("fp16", torch.float16)],
+)
+def test_cuda_pair_slab_eager_graph_and_fallback(
+    synthetic_result, precision, pair_dtype
+):
+    device = torch.device("cuda")
+    result = synthetic_result(n_orientations=8)
+    space = HypothesisSpace.from_result(result, n_defocus=2)
+    spec = StageSpec([(0, 0, 4, 3), (0, 3, 2, 2)], precision=precision, n_psi=128)
+    store, features = _fill_store(result, spec, 2, 8, device)
+    ctx = SearchContext(device, WeightSource(result, device), want_pairs=True)
+    n_virtual = 2 * result.num_fourier_filters * 8
+    tol = (
+        {"rtol": 1e-4, "atol": 1e-4}
+        if precision == "fp32" and pair_dtype == torch.float32
+        else {"rtol": 2e-2, "atol": 5e-2}
+    )
+
+    def run(use_cuda_graph, use_fused_kernel=True):
+        rec = _SlabRecorder(store.n_pixels, n_virtual, pair_dtype, device)
+        plan, maps = _run_stage(
+            ctx,
+            result,
+            spec,
+            store,
+            space,
+            batch=BatchShape(4, 4),
+            use_cuda_graph=use_cuda_graph,
+            use_fused_kernel=use_fused_kernel,
+            pair_dtype=pair_dtype,
+            collector=rec,
+        )
+        torch.cuda.synchronize()
+        return plan, maps, rec
+
+    plan_e, eager, rec_e = run(use_cuda_graph=False)
+    if ctx.caps.pair_kernel:
+        assert plan_e.stats_backend.name == "fused"
+    assert plan_e.memory.loop == "eager"
+    ref = _reference_pair_max(result, spec, features, plan_e.hyp_plan, 128)
+    torch.testing.assert_close(rec_e.pair_max.float().cpu(), ref, **tol)
+    _assert_matches(
+        eager,
+        _reference(result, spec, features, plan_e.hyp_plan, 128),
+        plan_e.hyp_plan,
+        **(
+            {"rtol": 1e-4, "atol": 1e-4}
+            if precision == "fp32"
+            else {"rtol": 2e-2, "atol": 5e-2}
+        ),
+    )
+    assert not torch.isnan(rec_e.pair_max.float()).any()
+
+    plan_g, graphed, rec_g = run(use_cuda_graph=True)
+    if ctx.caps.pair_kernel:
+        assert plan_g.memory.loop == "graph"
+        assert isinstance(ctx.loops[plan_g.signature], GraphedHypLoop)
+    assert torch.equal(rec_g.pair_max, rec_e.pair_max)
+    assert torch.equal(graphed.best_virtual, eager.best_virtual)
+
+    # the torch backend (no fused kernel) emits the same slab from corr.amax
+    plan_t, _torch_maps, rec_t = run(use_cuda_graph=False, use_fused_kernel=False)
+    assert plan_t.stats_backend.name == "torch"
+    torch.testing.assert_close(rec_t.pair_max.float(), rec_e.pair_max.float(), **tol)
 
 
 @pytest.mark.skipif(not CUDA, reason="needs CUDA")

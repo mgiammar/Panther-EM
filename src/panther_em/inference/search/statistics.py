@@ -277,7 +277,10 @@ class PixelStats:
         self.best_psi_angle.fill_(-1)
 
     def _reduce(
-        self, spectrum: torch.Tensor, num_psi: int
+        self,
+        spectrum: torch.Tensor,
+        num_psi: int,
+        pair_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reduce one hypothesis batch's spectrum to ``(s1, s2, vmax, amax)``.
 
@@ -287,6 +290,9 @@ class PixelStats:
             The rfft-form angular spectrum ``C``, shape (num_pixels, hyp_batch, n_freq).
         num_psi : int
             Number of in-plane angles to reconstruct via irfft.
+        pair_out : torch.Tensor, optional
+            ``(num_pixels, hyp_batch)`` buffer receiving each pair's maximum over psi
+            (the per-pair emission; see ``BlockStats``).
 
         Returns
         -------
@@ -295,6 +301,8 @@ class PixelStats:
             :func:`_reduce_stats`.
         """
         corr = torch.fft.irfft(spectrum, n=num_psi, dim=-1, norm="forward")
+        if pair_out is not None:
+            pair_out.copy_(corr.amax(dim=-1).to(pair_out.dtype))
 
         return _reduce_stats(  # type: ignore[no-any-return]
             corr.to(self.best_corr.dtype), torch.view_as_real(spectrum)
@@ -307,6 +315,7 @@ class PixelStats:
         hyp_global_idx: torch.Tensor,
         num_psi: int,
         reverse_psi_axis: bool = True,
+        pair_out: torch.Tensor | None = None,
     ) -> None:
         """Update tracked statistics with a new hypothesis batch's raw spectrum.
 
@@ -323,9 +332,11 @@ class PixelStats:
         reverse_psi_axis : bool, optional
             Whether to reverse the psi axis when updating the best psi angle. By default
             True because correlogram is produced by irfft(C) rather than irfft(C.conj())
+        pair_out : torch.Tensor, optional
+            ``(num_pixels, hyp_batch)`` buffer receiving each pair's max over psi.
         """
         total_hypotheses = spectrum.shape[1] * num_psi
-        s1, s2, vmax, amax = self._reduce(spectrum, num_psi)
+        s1, s2, vmax, amax = self._reduce(spectrum, num_psi, pair_out)
         self._accumulate(
             s1,
             s2,
@@ -501,6 +512,7 @@ class PixelStats:
         hyp_offset: int,
         num_psi: int,
         reverse_psi_axis: bool = True,
+        pair_out: torch.Tensor | None = None,
     ) -> None:
         """Like :meth:`update`, but the accumulate step replays a captured CUDA graph.
 
@@ -516,9 +528,11 @@ class PixelStats:
             hyp_global_idx = torch.arange(
                 hyp_offset, hyp_offset + spectrum.shape[1], device=spectrum.device
             )
-            return self.update(spectrum, hyp_global_idx, num_psi, reverse_psi_axis)
+            return self.update(
+                spectrum, hyp_global_idx, num_psi, reverse_psi_axis, pair_out
+            )
 
-        s1, s2, vmax, amax = self._reduce(spectrum, num_psi)
+        s1, s2, vmax, amax = self._reduce(spectrum, num_psi, pair_out)
         self.accumulate_graphed(
             s1, s2, vmax, amax, hyp_offset, num_psi, reverse_psi_axis
         )
@@ -579,6 +593,9 @@ class SpectrumSpec:
         Hypotheses enumerated per pixel (all defocus planes x selected templates).
     device : torch.device
         Compute device.
+    pair_dtype : torch.dtype, optional
+        When set, every batch also emits its per-pair max over psi into a block
+        slab of this dtype (float16 or float32); ``None`` is the dense search.
     """
 
     dtype: torch.dtype
@@ -589,6 +606,7 @@ class SpectrumSpec:
     hyp_batch: int
     n_virtual: int
     device: torch.device
+    pair_dtype: torch.dtype | None = None
 
 
 class BlockStats:
@@ -611,6 +629,14 @@ class BlockStats:
         are then fed the kernel-relative ``HypBatch.kernel_offset`` and epochs are
         merged with their base (:meth:`FusedPixelStats.merge_packed`); otherwise the
         full ``virtual_offset`` is used directly (int64, no epoch bookkeeping).
+    n_virtual : int, optional
+        Hypotheses per pixel (columns of the pair slab); needed with ``pair_dtype``.
+    pair_dtype : torch.dtype, optional
+        Allocate the per-block pair slab ``(n_sub, gemm_pixels, n_virtual)`` in this
+        dtype and have every batch write its per-pair max over psi into it. Columns
+        are *virtual* hypothesis ids (``HypBatch.virtual_offset``), so epochs do not
+        matter and ``HypothesisPlan.decode`` recovers global ids. The slab is static
+        (captured by CUDA graphs) and fully overwritten every block.
     """
 
     def __init__(
@@ -622,6 +648,8 @@ class BlockStats:
         device: torch.device,
         n_psi: int,
         inkernel: bool,
+        n_virtual: int = 0,
+        pair_dtype: torch.dtype | None = None,
     ) -> None:
         self.stats = [stats_cls(gemm_pixels, device=device) for _ in range(n_sub)]
         self.n_sub = int(n_sub)
@@ -629,6 +657,16 @@ class BlockStats:
         self.n_psi = int(n_psi)
         self.inkernel = bool(inkernel)
         self.device = device
+        self.n_virtual = int(n_virtual)
+        self.pair_slab: torch.Tensor | None = None
+        if pair_dtype is not None:
+            if self.n_virtual < 1:
+                raise ValueError("pair_dtype needs n_virtual >= 1")
+            self.pair_slab = torch.empty(
+                (self.n_sub, self.gemm_pixels, self.n_virtual),
+                dtype=pair_dtype,
+                device=device,
+            )
 
     @torch.no_grad()
     def clear(self) -> None:
@@ -640,9 +678,23 @@ class BlockStats:
     def consume(self, spectrum_pnf: torch.Tensor, batch: HypBatch, sub: int) -> None:
         """Accumulate one batch's spectrum ``(P_g, N_b, F)`` into sub-batch ``sub``."""
         offset = batch.kernel_offset if self.inkernel else batch.virtual_offset
+        pair_out = None
+        if self.pair_slab is not None:
+            v0 = batch.virtual_offset
+            pair_out = self.pair_slab[sub][:, v0 : v0 + batch.size]
         self.stats[sub].update_graphed(
-            spectrum_pnf, offset, num_psi=self.n_psi, reverse_psi_axis=True
+            spectrum_pnf,
+            offset,
+            num_psi=self.n_psi,
+            reverse_psi_axis=True,
+            pair_out=pair_out,
         )
+
+    def block_pair_max(self, n_valid: int) -> torch.Tensor:
+        """View ``(n_valid, n_virtual)`` of the block's per-pair maxima, rows in order."""
+        if self.pair_slab is None:
+            raise ValueError("this accumulator was built without a pair slab")
+        return self.pair_slab.reshape(-1, self.n_virtual)[:n_valid]
 
     @torch.no_grad()
     def end_epoch(self, base: int, sub: int) -> None:
@@ -719,5 +771,6 @@ class TorchStatsBackend:
             device=spec.device,
             n_psi=spec.n_psi,
             inkernel=False,
+            n_virtual=spec.n_virtual,
+            pair_dtype=spec.pair_dtype,
         )
-

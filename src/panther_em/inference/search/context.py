@@ -62,6 +62,8 @@ class DeviceCaps:
         Whether CUDA graph capture works on this device.
     fused_kernel : bool
         Whether the fused iRFFT+stats extension compiled.
+    pair_kernel : bool
+        Whether the per-pair emission extension compiled (probed only on request).
     l2_bytes : int or None
         L2 cache size, when known.
     free_bytes : int or None
@@ -74,10 +76,16 @@ class DeviceCaps:
     fused_kernel: bool
     l2_bytes: int | None
     free_bytes: int | None
+    pair_kernel: bool = False
 
     @classmethod
-    def probe(cls, device: torch.device | str) -> DeviceCaps:
-        """Probe ``device`` (the fused-kernel probe may trigger the JIT build)."""
+    def probe(
+        cls, device: torch.device | str, *, want_pairs: bool = False
+    ) -> DeviceCaps:
+        """Probe ``device`` (the kernel probes may trigger the JIT builds).
+
+        ``want_pairs`` also probes (and builds) the per-pair emission extension.
+        """
         device = torch.device(device)
         if device.type != "cuda":
             return cls(device, False, False, False, None, None)
@@ -93,6 +101,9 @@ class DeviceCaps:
             fused_kernel=fused_kernel_loader._try_compile() is not None,
             l2_bytes=int(getattr(props, "L2_cache_size", 0)) or None,
             free_bytes=int(free),
+            pair_kernel=bool(
+                want_pairs and fused_kernel_loader._try_compile_pairs() is not None
+            ),
         )
 
 
@@ -114,6 +125,8 @@ class MemoryPlan:
     loop : {"eager", "graph"}
     n_slots : int
         Prefetch slots (meaningful for non-device residency).
+    pair_dtype : torch.dtype or None
+        Dtype of the per-block pair slab when the stage emits pairs.
     """
 
     gemm_pixels: int
@@ -123,6 +136,14 @@ class MemoryPlan:
     store_precision: Precision
     loop: LoopKind
     n_slots: int = 3
+    pair_dtype: torch.dtype | None = None
+
+    def pair_slab_bytes(self, n_virtual: int) -> int:
+        """Bytes of the ``(block_pixels, n_virtual)`` pair slab; 0 when not emitting."""
+        if self.pair_dtype is None:
+            return 0
+        elem = torch.empty((), dtype=self.pair_dtype).element_size()
+        return self.block_pixels * int(n_virtual) * elem
 
     @property
     def n_sub(self) -> int:
@@ -189,6 +210,7 @@ class Planner:
         block_pixels: int | None = None,
         use_cuda_graph: bool = True,
         residency: Residency | Literal["auto"] = "auto",
+        pair_dtype: torch.dtype | None = None,
     ) -> MemoryPlan:
         """Resolve a stage's plan.
 
@@ -214,6 +236,9 @@ class Planner:
             Allow the graphed loop when the device and backend permit it.
         residency : optional
             ``"auto"`` means device residency for now.
+        pair_dtype : torch.dtype, optional
+            Emit per-pair maxima into a block slab of this dtype; its
+            ``n_virtual * elem`` bytes per pixel join the block budget.
         """
         elem = torch.empty((), dtype=spectrum_dtype).element_size()
         l2_target = self.l2_target or (
@@ -229,8 +254,13 @@ class Planner:
             hyp_batch = min(hyp_batch, max(multiple, -(-n_virtual // 1)))
         gemm_pixels = max(1, min(gemm_pixels, max(1, n_pixels)))
 
+        pair_bytes = (
+            0
+            if pair_dtype is None
+            else int(n_virtual) * torch.empty((), dtype=pair_dtype).element_size()
+        )
         if block_pixels is None:
-            per_pixel = max(1, feature_bytes_per_pixel)
+            per_pixel = max(1, feature_bytes_per_pixel + pair_bytes)
             fit = max(
                 gemm_pixels,
                 (self.block_bytes_max // per_pixel) // gemm_pixels * gemm_pixels,
@@ -238,6 +268,18 @@ class Planner:
             needed = -(-max(1, n_pixels) // gemm_pixels) * gemm_pixels
             block_pixels = min(fit, needed)
         block_pixels = max(gemm_pixels, (block_pixels // gemm_pixels) * gemm_pixels)
+        if pair_bytes and caps.free_bytes:
+            # The slab alone may take at most a quarter of free device memory.
+            slab_budget = caps.free_bytes // 4
+            if gemm_pixels * pair_bytes > slab_budget:
+                mib = gemm_pixels * pair_bytes / 2**20
+                raise ValueError(
+                    f"pair slab for one GEMM batch needs {mib:.0f} MiB ({gemm_pixels} "
+                    f"pixels x {n_virtual} hypotheses); reduce the GEMM pixel batch, "
+                    "the hypothesis subset, or use a smaller pair dtype"
+                )
+            cap = (slab_budget // pair_bytes) // gemm_pixels * gemm_pixels
+            block_pixels = min(block_pixels, cap)
 
         loop: LoopKind = (
             "graph"
@@ -255,6 +297,7 @@ class Planner:
             store_residency=store_residency,
             store_precision=precision,
             loop=loop,
+            pair_dtype=pair_dtype,
         )
 
 
@@ -268,6 +311,12 @@ def choose_stats_backend(
     """First backend supporting ``spec`` (fused only when allowed and available)."""
     for backend in backends:
         if backend.name == "fused" and not (use_fused_kernel and caps.fused_kernel):
+            continue
+        if (
+            backend.name == "fused"
+            and spec.pair_dtype is not None
+            and not caps.pair_kernel
+        ):
             continue
         if backend.supports(spec):
             return backend
@@ -485,11 +534,12 @@ class SearchContext:
         *,
         prepared_budget: int | None = None,
         planner: Planner | None = None,
+        want_pairs: bool = False,
     ) -> None:
         from panther_em.inference.search.basis import PreparedWeightCache
 
         self.device = torch.device(device)
-        self.caps = DeviceCaps.probe(self.device)
+        self.caps = DeviceCaps.probe(self.device, want_pairs=want_pairs)
         self.planner = planner or Planner()
         self.prepared: PreparedWeightCache = PreparedWeightCache(
             weights, prepared_budget
