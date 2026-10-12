@@ -98,6 +98,11 @@ def test_kernel_bank_budget_eviction_and_host_tier(recon):
     assert dev <= 2 * one and host == 2 * one and built[0] == 4
     torch.testing.assert_close(bank.spatial(cells), ref)  # served from the two tiers
     assert built[0] == 4
+    # the host tier is inclusive: promoted kernels keep their host copy, so after the
+    # round trip every kernel is on the host and device evictions copy nothing
+    assert bank.bytes()[1] == 4 * one
+    torch.testing.assert_close(bank.spatial(cells), ref)
+    assert built[0] == 4 and bank.bytes() == (2 * one, 4 * one)
 
     no_host = KernelBank(recon, device_budget=2 * one)
     rebuilt = count_kernel_builds(no_host)
@@ -224,3 +229,54 @@ def test_template_bundle_and_hdf5_round_trip(synthetic_result, tmp_path):
     torch.testing.assert_close(loaded.weights.us, template.weights.us)
     template.release()
     assert template._weights is None and template.kernels.bytes() == (0, 0)
+
+
+@pytest.fixture
+def recon_cuda(synthetic_result):
+    from panther_em.inference.projection_reconstruction import ProjectionReconstructor
+
+    return ProjectionReconstructor(synthetic_result(), device="cuda")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_kernel_bank_separable_build_matches_generic_on_a_side_stream(recon_cuda):
+    """The CuPy fast path must agree with the generic warp, also when torch runs on a
+    non-default stream (its DLPack views and CuPy work are stream-ordered)."""
+    from panther_em.inference.search.basis import KernelBank
+
+    fast = KernelBank(recon_cuda, device="cuda")
+    slow = KernelBank(recon_cuda, device="cuda")
+    slow._sep = None  # force the generic path
+    cells = _cells((0, 0), (1, 3), (3, 4), (2, 1))
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        a = fast.spatial(cells)
+        _ = torch.randn(64 << 20, device="cuda")  # churn the allocator on the same stream
+    torch.cuda.synchronize()
+    b = slow.spatial(cells)
+    torch.cuda.synchronize()
+    rel = ((a - b).flatten(1).norm(dim=1) / b.flatten(1).norm(dim=1)).max().item()
+    assert fast._sep is not None and rel < 1e-2, rel
+
+
+def test_kernel_bank_planar_arena_matches_uncached_and_views_consecutive_cells(recon):
+    reference = KernelBank(recon)
+    cells = _cells((0, 0), (0, 1), (0, 2), (1, 0), (1, 1))
+    expected = reference.planar(cells)
+    row_bytes = 2 * 400 * 4
+    bank = KernelBank(recon, planar_budget=4 * row_bytes)  # room for four cells
+    first = bank.planar(cells[:3])
+    torch.testing.assert_close(first, expected[:, :3])
+    assert bank.planar_bytes == 4 * row_bytes
+    # consecutive resident cells come back as a view into the arena
+    again = bank.planar(cells[:3])
+    assert again.data_ptr() == bank._planar[torch.float32].rows.data_ptr()
+    # a permuted request gathers; a request beyond the arena's capacity builds the
+    # remainder on demand (cells (1,0) fills the last slot, (1,1) does not fit)
+    torch.testing.assert_close(bank.planar(cells[[2, 0]]), expected[:, [2, 0]])
+    torch.testing.assert_close(bank.planar(cells), expected)
+    assert bank._planar[torch.float32].n_used == 4
+    torch.testing.assert_close(bank.planar(cells[[4, 1]]), expected[:, [4, 1]])
+    bank.clear()
+    assert bank.planar_bytes == 0
+    torch.testing.assert_close(bank.planar(cells[1:4]), expected[:, 1:4])

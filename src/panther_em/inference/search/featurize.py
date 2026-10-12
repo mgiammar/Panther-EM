@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import torch
 
+from panther_em.inference.search.types import Precision
+
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
@@ -87,10 +89,22 @@ class TileGrid:
         return self.n_tile_rows * self.n_tile_cols
 
     @property
-    def fft_shape(self) -> tuple[int, int]:
-        """Input-region (and FFT) shape shared by every tile."""
+    def region_shape(self) -> tuple[int, int]:
+        """Input region a tile reads: ``tile + box - 1`` per side."""
         k_h, k_w = self.template_shape
         return self.tile_side + k_h - 1, self.tile_side + k_w - 1
+
+    @property
+    def fft_shape(self) -> tuple[int, int]:
+        """FFT shape shared by every tile: the region rounded up to a fast length.
+
+        Overlap-save only needs ``fft >= tile + box - 1``; the extra rows and columns
+        are zero padding whose outputs are discarded. ``1535 = 5 x 307`` costs cuFFT
+        a Bluestein transform, ``1536 = 2^9 x 3`` a radix one.
+        """
+        from scipy.fft import next_fast_len  # type: ignore[import-untyped]
+
+        return tuple(int(next_fast_len(n)) for n in self.region_shape)  # type: ignore[return-value]
 
     def tile_of(self, row: torch.Tensor, col: torch.Tensor) -> torch.Tensor:
         """Per-pixel tile id ``tile_row * n_tile_cols + tile_col``."""
@@ -347,12 +361,10 @@ class FFTCorrelationFeaturizer:
                 for tile, image_fft, cell_range in self._iterate(
                     schedule.tiles(), filtered, grid, n_cells, chunk, order
                 ):
-                    kernel_spectra = self.bank.spectral(
+                    spectra = self.bank.spectral_views(
                         cells[cell_range], grid.fft_shape
                     )
-                    features = self._correlate_tile(
-                        image_fft, kernel_spectra, tile, grid
-                    )
+                    features = self._correlate_tile(image_fft, spectra, tile, grid)
                     writer.write(
                         cell_range,
                         (tile.columns.start, tile.columns.stop),
@@ -396,27 +408,42 @@ class FFTCorrelationFeaturizer:
         filtered_image: torch.Tensor, tile: Tile, grid: TileGrid
     ) -> torch.Tensor:
         """FFT of the tile's input region (computed once per tile and plane)."""
-        fft_h, fft_w = grid.fft_shape
+        region_h, region_w = grid.region_shape
         region = filtered_image[
-            tile.row0 : tile.row0 + fft_h, tile.col0 : tile.col0 + fft_w
+            tile.row0 : tile.row0 + region_h, tile.col0 : tile.col0 + region_w
         ]
-        image_fft: torch.Tensor = torch.fft.fft2(region)
+        image_fft: torch.Tensor = torch.fft.fft2(region, s=grid.fft_shape)
         return image_fft
 
     @staticmethod
     def _correlate_tile(
         image_fft: torch.Tensor,
-        kernel_spectra: torch.Tensor,
+        kernel_spectra: Sequence[torch.Tensor],
         tile: Tile,
         grid: TileGrid,
     ) -> torch.Tensor:
-        """Valid correlation of one tile with a chunk of kernels, at owned pixels."""
-        side = grid.tile_side
-        correlation = torch.fft.ifft2(image_fft[None] * kernel_spectra)[:, :side, :side]
-        flat = correlation.reshape(correlation.shape[0], side * side)
-        owned: torch.Tensor = flat[:, tile.local.to(flat.device)]
+        """Valid correlation of one tile with a chunk of kernels, at owned pixels.
 
-        return owned
+        One cell at a time: the product and inverse FFT of a large tile (134 MB each
+        at 4096^2) never exist for the whole chunk, the cached spectra are read in
+        place, and a tile that owns its whole computed region skips the gather.
+        """
+        side = grid.tile_side
+        n_owned = int(tile.local.numel())
+        features = torch.empty(
+            (len(kernel_spectra), n_owned),
+            dtype=torch.complex64,
+            device=image_fft.device,
+        )
+        local = tile.local.to(image_fft.device)
+        full = n_owned == side * side and bool(
+            torch.equal(local, torch.arange(n_owned, device=local.device))
+        )
+        for i, spectrum in enumerate(kernel_spectra):
+            correlation = torch.fft.ifft2(image_fft * spectrum)[:side, :side]
+            flat = correlation.reshape(-1)
+            features[i] = flat if full else flat[local]
+        return features
 
 
 # --------------------------------------------------------------------------- #
@@ -476,10 +503,16 @@ class InnerProductFeaturizer:
         n_cells = int(cells.shape[0])
         with _stream_scope(stream):
             for plane in group.planes:
+                dtype = (
+                    torch.float16 if group.precision is Precision.FP16 else torch.float32
+                )
                 for batch in schedule.image_batches():
-                    boxes = self._centered_boxes(images, batch.images, plane)
+                    # one cast per image batch (8192 boxes x 512^2 is 8.6 GB in fp32)
+                    boxes = self._centered_boxes(images, batch.images, plane).to(dtype)
                     for cell_range in cell_chunks(n_cells, chunk):
-                        features = self._inner_products(cells[cell_range], boxes)
+                        features = self._inner_products(
+                            cells[cell_range], boxes, group.precision
+                        )
                         writer.write(
                             cell_range,
                             (batch.columns.start, batch.columns.stop),
@@ -507,12 +540,31 @@ class InnerProductFeaturizer:
             boxes.shape[0], k_h * k_w
         )
 
-    def _inner_products(self, cells: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
-        """``(n_cells, Bt)`` complex inner products of boxes with the cells' kernels."""
-        planar = self.bank.planar(
-            cells, torch.float32
-        )  # (2, n_cells, kH*kW): [Re K ; -Im K]
-        real_imag = planar @ boxes.T  # (2, n_cells, Bt)
+    def _inner_products(
+        self,
+        cells: torch.Tensor,
+        boxes: torch.Tensor,
+        precision: Precision = Precision.FP32,
+    ) -> torch.Tensor:
+        """``(n_cells, Bt)`` complex inner products of boxes with the cells' kernels.
+
+        The GEMM runs at the group's precision: fp32 (exact), tf32 (tensor cores,
+        ~5x faster, ~5e-4 relative error per product) or fp16 operands with fp32
+        accumulation.
+        """
+        dtype = torch.float16 if precision is Precision.FP16 else torch.float32
+        planar = self.bank.planar(cells, dtype)  # (2, n_cells, kH*kW): [Re K ; -Im K]
+        rhs = boxes.T.to(dtype)  # no copy when the caller already cast the boxes
+        if precision is Precision.TF32 and boxes.is_cuda:
+            prev = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = True
+            try:
+                real_imag = planar @ rhs
+            finally:
+                torch.backends.cuda.matmul.allow_tf32 = prev
+        else:
+            real_imag = planar @ rhs
+        real_imag = real_imag.to(torch.float32)  # (2, n_cells, Bt)
         return torch.complex(real_imag[0], real_imag[1])
 
 

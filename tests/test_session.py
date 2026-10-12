@@ -614,3 +614,24 @@ def test_cuda_pair_emission_matches_cpu(synthetic_result):
         got = gpu.pairs[0].to("cpu")
         assert set(got.key().tolist()) == set(ref.key().tolist())
         assert gpu.label.device.type == "cuda"
+
+
+def test_session_store_is_released_after_the_session(template):
+    """The searcher's cached loops must not retain a finished session's blocks."""
+    import gc
+    import weakref
+
+    stub = StubFeaturizer()
+    searcher = Searcher(
+        template,
+        SearchSchedule.single(StageSpec([(0, 0, 4, 5)], n_psi=16)),
+        execution=EXEC,
+        featurizer=stub,
+    )
+    session = searcher.session(ImageSet.single(torch.zeros(30, 30)))
+    session.run_all()
+    store_ref = weakref.ref(session.store)
+    del session
+    gc.collect()
+    assert store_ref() is None  # only the session owned the store
+    assert searcher.ctx.loops  # the loop cache itself survives for the next image set

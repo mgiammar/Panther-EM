@@ -11,7 +11,6 @@ from panther_em.inference.search.decisions import (
     ThresholdClassifier,
     TopFractionSelector,
 )
-from panther_em.inference.search.featurize import make_featurizer
 from panther_em.inference.search.hypotheses import HypothesisSubset
 from panther_em.inference.search.ledger import PixelLabel
 from panther_em.inference.search.pairs import PairEmissionSpec, PairList
@@ -91,7 +90,7 @@ def test_all_pairs_match_the_dense_correlogram(synthetic_result, n_defocus):
     spec = StageSpec(RECTS, n_psi=N_PSI)
     corr = _dense_corr(template, images, RECTS, N_PSI)  # (P, D, N, psi)
     pairs = _all_pairs(geo.n_pixels, 6)
-    evaluator = SparsePairEvaluator(template, make_featurizer(geo, template.kernels))
+    evaluator = SparsePairEvaluator(template)
     scores = evaluator.evaluate(images, pairs, spec)
     ref = corr.permute(0, 2, 1, 3).reshape(
         geo.n_pixels * 6, n_defocus * N_PSI
@@ -110,11 +109,21 @@ def test_all_pairs_match_the_dense_correlogram(synthetic_result, n_defocus):
         )
         assert torch.all(one.plane == 1)
 
-    # chunking is a pure implementation detail
-    small = SparsePairEvaluator(
-        template, make_featurizer(geo, template.kernels), pixel_chunk=5, pair_chunk=7
-    ).evaluate(images, pairs, spec)
-    assert torch.equal(small.value, scores.value) and torch.equal(small.psi, scores.psi)
+    # chunking only changes GEMM blocking (rounding), not the result
+    small = SparsePairEvaluator(template, pixel_chunk=5, pair_chunk=7).evaluate(
+        images, pairs, spec
+    )
+    torch.testing.assert_close(small.value, scores.value, rtol=1e-5, atol=1e-5)
+    assert (small.psi == scores.psi).float().mean() > 0.99
+    # the patch budget caps the pixels per chunk across planes (every plane of a
+    # chunk goes through the same GEMMs); a budget of three patches holds one pixel
+    # per chunk at two planes, and the result is unchanged
+    kh, kw = template.template_shape
+    tight = SparsePairEvaluator(template, pixel_chunk=5, patch_budget=3 * kh * kw * 4)
+    assert tight.chunk_pixels(n_defocus, torch.float32) == max(1, 3 // n_defocus)
+    tight_scores = tight.evaluate(images, pairs, spec)
+    torch.testing.assert_close(tight_scores.value, scores.value, rtol=1e-5, atol=1e-5)
+    assert torch.equal(tight_scores.plane[unique], scores.plane[unique])
 
     # best_per_pixel picks each pixel's maximum and encodes global ids
     pixel, best = scores.best_per_pixel()
@@ -233,12 +242,12 @@ def test_cuda_fp16_sparse_matches_cpu(synthetic_result):
     cpu = Template(result, device="cpu")
     geo = SearchGeometry.from_images(images, cpu.template_shape)
     pairs = _all_pairs(geo.n_pixels, 6)
-    ref = SparsePairEvaluator(cpu, make_featurizer(geo, cpu.kernels)).evaluate(
+    ref = SparsePairEvaluator(cpu).evaluate(
         images, pairs, StageSpec(RECTS, n_psi=N_PSI)
     )
     gpu = Template(result, device="cuda")
     for precision, tol in (("fp32", 1e-4), ("fp16", 5e-2)):
-        got = SparsePairEvaluator(gpu, make_featurizer(geo, gpu.kernels)).evaluate(
+        got = SparsePairEvaluator(gpu).evaluate(
             images, pairs, StageSpec(RECTS, precision=precision, n_psi=N_PSI)
         )
         torch.testing.assert_close(got.value.cpu(), ref.value, rtol=tol, atol=tol)

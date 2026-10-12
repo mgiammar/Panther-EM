@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import torch
 
 from panther_em.inference.search.context import (
+    Residency,
     LoopInputs,
     MemoryPlan,
     choose_stats_backend,
@@ -83,6 +84,7 @@ def plan_memory(
     use_fused_kernel: bool = True,
     store: FeatureStore | None = None,
     pair_dtype: torch.dtype | None = None,
+    residency: Residency | Literal["auto"] = "auto",
 ) -> tuple[MemoryPlan, StatsBackend, ContractionEngine, HypothesisPlan]:
     """Resolve batch shape, block size, engine, stats backend and hypothesis plan.
 
@@ -127,6 +129,7 @@ def plan_memory(
         block_pixels=block_pixels,
         use_cuda_graph=use_cuda_graph,
         pair_dtype=pair_dtype,
+        residency=residency,
     )
     hyp_plan = HypothesisPlan(
         space, subset, hyp_batch=memory.hyp_batch, n_psi=spec.n_psi
@@ -349,7 +352,6 @@ class StageExecutor:
         }
         inputs = LoopInputs(
             layout=plan.layout,
-            groups=plan.groups,
             plane_lookup=plan.plane_lookup,
             engine=plan.engine,
             hyp_plan=plan.hyp_plan,

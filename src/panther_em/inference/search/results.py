@@ -66,6 +66,8 @@ class StageResult:
     n_uncertain_after : int
         Pixels still eligible for the next stage (whole ledger).
     elapsed_s : float
+        Wall time of the stage; ``featurize_s`` (store preparation) and ``execute_s``
+        (block loop, or the sparse evaluation) split it for tuning.
     pairs : PairList, optional
         The ``(pixel, template)`` pairs an emitting stage produced (after dilation).
     scores : PairScores, optional
@@ -82,6 +84,8 @@ class StageResult:
     elapsed_s: float
     pairs: PairList | None = None
     scores: PairScores | None = None
+    featurize_s: float = 0.0
+    execute_s: float = 0.0
 
     @property
     def n_pixels(self) -> int:

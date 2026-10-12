@@ -53,12 +53,23 @@ class FusedPixelStats(PixelStats):
         # the last clear()/finalize().
         self._packed_num_psi: int | None = None
 
+    def _init_view_extras(self, parent: PixelStats, start: int, stop: int) -> None:
+        """Share the parent's packed-best buffer as a view too."""
+        assert isinstance(parent, FusedPixelStats)
+        self._lean_sentinel = parent._lean_sentinel
+        self.best_packed = parent.best_packed[start:stop]
+        self._packed_num_psi = None
+
+    def clear_bookkeeping(self) -> None:
+        """Reset the scalar state (the block cleared the shared buffers)."""
+        super().clear_bookkeeping()
+        self._packed_num_psi = None
+
     @torch.no_grad()
     def clear(self) -> None:
         super().clear()
         if self._lean_sentinel is not None:
             self.best_packed.fill_(self._lean_sentinel)
-        self._packed_num_psi = None
 
     @staticmethod
     def inkernel_supported(

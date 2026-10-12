@@ -29,7 +29,6 @@ if TYPE_CHECKING:
     from panther_em.inference.search.orientations import S2Neighborhood
     from panther_em.inference.search.types import SearchGeometry
 
-_ROW_CHUNK = 1024  # pixel rows thresholded per call (bounds the float32 temporary)
 
 
 @dataclass(frozen=True)
@@ -229,6 +228,7 @@ class PairCollector:
     ) -> None:
         self.spec = spec
         self.geometry = ledger.geometry
+        self.device = torch.device(device)
         self.column_index = column_index.to(device, torch.long)
         self.hyp_plan = hyp_plan
         self.n_templates = hyp_plan.space.n_templates
@@ -260,41 +260,39 @@ class PairCollector:
         mean: torch.Tensor,
         variance: torch.Tensor,
     ) -> None:
-        """Threshold and dilate one block."""
+        """Threshold one block (one rule call, one host sync); dilation waits for finish.
+
+        Per-block dilation and row chunking cost ~20 ms of GPU idle per block (the
+        ``nonzero``/``unique`` syncs stall the graph replays); the seeds of a whole
+        micrograph are small, so they are dilated once at the end.
+        """
+        spec = self.spec
         cols = self.column_index[col_start : col_start + n_valid]
-        found = []
-        for r0 in range(0, n_valid, _ROW_CHUNK):
-            sl = slice(r0, min(n_valid, r0 + _ROW_CHUNK))
-            passed = surpass_threshold(
-                pair_max[sl],
-                mean[sl],
-                variance[sl],
-                threshold=self.spec.threshold,
-                image_norm=self.image_norm[cols[sl]],
-                noise_variance=self.noise_variance[cols[sl]],
-                rank=self.rank,
-            )
-            rows, virtual = torch.nonzero(passed, as_tuple=True)
-            template = self.hyp_plan.decode(virtual) % self.n_templates
-            found.append(
-                PairList(
-                    cols[sl][rows],
-                    template,
-                    self.n_templates,
-                    pair_max[sl][rows, virtual],
-                )
-            )
-        pairs = PairList.concat(found)
-        self.n_raw += len(pairs)
-        if len(pairs):
-            pairs = dilate_pairs(
-                pairs, self.geometry, self.spec.pixel_radius, self.table
-            )
-            self._blocks.append(pairs.select(~self.masked[pairs.pixel]))
+        passed = surpass_threshold(
+            pair_max,
+            mean.to(self.device),
+            variance.to(self.device),
+            threshold=spec.threshold,
+            image_norm=self.image_norm[cols],
+            noise_variance=self.noise_variance[cols],
+            rank=self.rank,
+        )
+        rows, virtual = torch.nonzero(passed, as_tuple=True)
+        if rows.numel() == 0:
+            return
+        self.n_raw += int(rows.numel())
+        template = self.hyp_plan.decode(virtual) % self.n_templates
+        self._blocks.append(
+            PairList(cols[rows], template, self.n_templates, pair_max[rows, virtual])
+        )
 
     def finish(self) -> PairList:
-        """The stage's deduplicated pair list."""
+        """The stage's dilated, deduplicated pair list (masked pixels dropped)."""
         empty = torch.zeros(0, dtype=torch.long, device=self.column_index.device)
         blocks = self._blocks or [PairList(empty, empty, self.n_templates, empty)]
         self._blocks = []
-        return PairList.concat(blocks).unique()
+        pairs = PairList.concat(blocks).unique()
+        if len(pairs):
+            pairs = dilate_pairs(pairs, self.geometry, self.spec.pixel_radius, self.table)
+            pairs = pairs.select(~self.masked[pairs.pixel])
+        return pairs

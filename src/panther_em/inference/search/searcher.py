@@ -23,7 +23,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -55,6 +55,7 @@ if TYPE_CHECKING:
 
     from panther_em.inference.search.basis import Template
     from panther_em.inference.search.featurize import Featurizer, LoopOrder
+    from panther_em.inference.search.context import Residency
     from panther_em.inference.search.pairs import PairList
     from panther_em.inference.search.schedule import SearchSchedule
     from panther_em.inference.search.types import BatchShape, Rectangle
@@ -74,7 +75,11 @@ class ExecutionConfig:
     use_cuda_graph, use_fused_kernel : bool
         Allow the graphed hypothesis loop / the fused statistics kernel.
     tile : int
-        Featurizer output tile side (grid mode).
+        Featurizer output tile side (grid mode). Larger tiles waste less of each
+        overlap-save FFT but their kernel spectra are bigger (8 MiB per cell at
+        1024, 134 MiB at 4096), and once they no longer fit the template's
+        ``spectral_budget`` every plane re-FFTs every kernel, which costs as much as
+        the correlation itself. 1024 keeps a rank-1024 stage's spectra in 8 GiB.
     cell_chunk : int
         Kernels per featurization chunk.
     image_batch : int
@@ -87,9 +92,26 @@ class ExecutionConfig:
         Byte budget of the prepared-weight cache.
     show_progress : bool
         Print per-stage progress bars.
-    sparse_pixel_chunk, sparse_pair_chunk : int
-        Chunk sizes of the sparse pair evaluator (pixels featurized per chunk, pairs
-        contracted per call).
+    store_residency : {"auto", "device", "pinned_host"}
+        Where a stage's feature store lives; ``"auto"`` keeps it on the device when it
+        fits half the free memory and otherwise pins it on the host and streams blocks.
+    sparse_pixel_chunk, sparse_pair_chunk, sparse_cell_chunk : int
+        Chunk sizes of the sparse pair evaluator: pixels featurized per chunk, pairs
+        contracted per call, and kernels per inner-product GEMM. Each GEMM re-reads
+        the chunk's patches (``pixel_chunk x box x 4`` bytes), so ``sparse_cell_chunk``
+        sets that GEMM's arithmetic intensity; 512 cells (1 GiB of kernel rows) keep
+        it compute-bound.
+    sparse_patch_budget : int
+        Bytes of survivor patches held per sparse chunk across all defocus planes; it
+        caps ``sparse_pixel_chunk`` at ``budget / (n_planes * patch_bytes)`` so every
+        plane of a chunk is featurized by the same GEMMs.
+    clear_spectra_before_sparse : bool
+        Drop the kernel bank's cached spectra when the dense store is released ahead
+        of a sparse stage. Off by default so the next micrograph's dense stage finds
+        its spectra cached; turn on when the sparse stage would otherwise not fit.
+    trace : bool
+        Synchronise the device at every session mark (``SearchSession.marks``) so
+        the marks' wall-clock deltas are per-phase device times.
     """
 
     batch: BatchShape | None = None
@@ -103,8 +125,13 @@ class ExecutionConfig:
     ledger_device: torch.device | str | None = None
     prepared_budget: int | None = None
     show_progress: bool = False
+    store_residency: Residency | Literal["auto"] = "auto"
     sparse_pixel_chunk: int = 2048
-    sparse_pair_chunk: int = 1024
+    sparse_pair_chunk: int = 8192
+    sparse_cell_chunk: int = 512
+    sparse_patch_budget: int = 4 << 30
+    clear_spectra_before_sparse: bool = False
+    trace: bool = False
 
 
 class Searcher:
@@ -157,6 +184,13 @@ class Searcher:
             want_pairs=any(s.emit_pairs for s in schedule.stages),
         )
         self._validate()
+        # the sparse stage's GEMM operand (planar kernel rows) is shared by every
+        # session: reserve it before any session buffers exist
+        for spec in schedule.stages:
+            if spec.mode == "sparse_pairs":
+                template.kernels.reserve_planar(
+                    torch.float16 if spec.precision is Precision.FP16 else torch.float32
+                )
 
     @cached_property
     def s2(self) -> S2Neighborhood | None:
@@ -241,6 +275,17 @@ class SearchSession:
         self.stage_results: list[StageResult] = []
         self.elapsed_s = 0.0
         self._finished = False
+        self.marks: list[tuple[str, float, int]] = []
+        self._mark("session")
+
+    def _mark(self, name: str) -> None:
+        """Record ``(name, time, allocated_bytes)`` (synchronised under ``trace``)."""
+        allocated = 0
+        if self.searcher.ctx.caps.is_cuda:
+            if self.searcher.execution.trace:
+                torch.cuda.synchronize(self.searcher.device)
+            allocated = torch.cuda.memory_allocated(self.searcher.device)
+        self.marks.append((name, time.perf_counter(), allocated))
 
     # -- stage machinery ---------------------------------------------------------
 
@@ -250,6 +295,7 @@ class SearchSession:
         precision: Precision,
         spec_rects: Sequence[Rectangle],
         planes: Sequence[int],
+        residency: Residency = "device",
     ) -> FeatureStore:
         """Re-block / compact the store to the current pixels; featurize what is new."""
         exe = self.searcher.execution
@@ -264,7 +310,9 @@ class SearchSession:
                 block_pixels=block_pixels,
                 n_defocus=self.images.n_defocus,
                 device=self.searcher.device,
+                residency=residency,
             )
+            store.copy_stream = self.searcher.ctx.copy
         else:
             keep = torch.isin(
                 store.column_index, pixels.index.to(store.column_index.device)
@@ -277,6 +325,7 @@ class SearchSession:
                 store.column_index.to(schedule.column_index.device),
             ):
                 raise RuntimeError("featurizer column order diverged from the store's")
+        self._mark("store:ready")
         ctx = self.searcher.ctx
         missing = [
             (rect, mp)
@@ -288,6 +337,7 @@ class SearchSession:
             ctx.featurize.wait_stream(torch.cuda.current_stream(ctx.device))
         for rect, missing_planes in missing:
             group = store.add_group(rect, precision, missing_planes)
+            self._mark("store:group_allocated")
             self.featurizer.produce(
                 self.images,
                 group,
@@ -310,6 +360,7 @@ class SearchSession:
         t0 = time.perf_counter()
         if spec.mode == "sparse_pairs":
             return self._run_sparse_stage(index, t0)
+        self._mark(f"stage{index}:start")
         memory, backend, engine, hyp_plan = plan_memory(
             searcher.ctx,
             spec,
@@ -322,16 +373,23 @@ class SearchSession:
             use_fused_kernel=exe.use_fused_kernel,
             store=self.store,
             pair_dtype=spec.pairs.pair_dtype if spec.pairs is not None else None,
+            residency=exe.store_residency,
         )
         store = self._prepare_store(
             memory.block_pixels,
             spec.precision,
             spec.rectangles,
             hyp_plan.defocus_planes(),
+            memory.store_residency,
         )
+        if searcher.ctx.caps.is_cuda:
+            torch.cuda.synchronize(searcher.device)
+        t_featurized = time.perf_counter()
+        self._mark(f"stage{index}:featurized")
         plan = plan_stage(
             searcher.ctx, index, spec, store, memory, backend, engine, hyp_plan
         )
+        self._mark(f"stage{index}:planned")
         progress = None
         if exe.show_progress:
             from tqdm import tqdm  # type: ignore[import-untyped]
@@ -356,13 +414,20 @@ class SearchSession:
         )
         if exe.show_progress:
             bar.close()
+        if searcher.ctx.caps.is_cuda:
+            torch.cuda.synchronize(searcher.device)
+        t_executed = time.perf_counter()
+        self._mark(f"stage{index}:executed")
         column_index = store.column_index
         self.ledger.write(maps, column_index, index, hyp_plan)
+        self._mark(f"stage{index}:ledger")
         pairs = None
         if collector is not None:
             pairs = self.ledger.pairs[index] = collector.finish()
+            self._mark(f"stage{index}:pairs")
         searcher.schedule.decisions[index](self.ledger, column_index, spec, index)
         self.pixels = self.ledger.uncertain()
+        self._mark(f"stage{index}:decided")
         labels_after = self.ledger.label[column_index.to(self.ledger.device)].clone()
         elapsed = time.perf_counter() - t0
         self.elapsed_s += elapsed
@@ -376,6 +441,8 @@ class SearchSession:
             n_uncertain_after=len(self.pixels),
             elapsed_s=elapsed,
             pairs=pairs,
+            featurize_s=t_featurized - t0,
+            execute_s=t_executed - t_featurized,
         )
 
     def _run_sparse_stage(self, index: int, t0: float) -> StageResult:
@@ -384,6 +451,16 @@ class SearchSession:
         exe = searcher.execution
         spec = searcher.schedule.stages[index]
         ledger = self.ledger
+        # The dense store is not read again unless a later dense stage follows; drop
+        # it so the evaluator's kernels and patches get the memory (a 4k rank-1024
+        # fp16 store is 52 GB).
+        self._mark(f"stage{index}:start")
+        if not any(s.mode == "dense" for s in searcher.schedule.stages[index + 1 :]):
+            self.store = None
+            if exe.clear_spectra_before_sparse:
+                searcher.template.kernels.clear_spectra()
+            torch.cuda.empty_cache() if searcher.ctx.caps.is_cuda else None
+        self._mark(f"stage{index}:store_dropped")
         emitted = max(i for i in ledger.pairs if i < index)
         pairs = ledger.pairs[emitted].to(ledger.device)
         pairs = pairs.select(ledger.label[pairs.pixel] == int(PixelLabel.UNCERTAIN))
@@ -392,11 +469,12 @@ class SearchSession:
         ).defocus_planes()
         scores = SparsePairEvaluator(
             searcher.template,
-            self.featurizer,
             pixel_chunk=exe.sparse_pixel_chunk,
             pair_chunk=exe.sparse_pair_chunk,
-            cell_chunk=exe.cell_chunk,
-        ).evaluate(self.images, pairs, spec, planes=planes)
+            cell_chunk=exe.sparse_cell_chunk,
+            patch_budget=exe.sparse_patch_budget,
+        ).evaluate(self.images, pairs, spec, planes=planes, trace=self._mark)
+        self._mark(f"stage{index}:scored")
         pixel, best = scores.best_per_pixel()
         pixel_l = pixel.to(ledger.device)
         mean, variance = ledger.mean[pixel_l], ledger.variance[pixel_l]
@@ -415,6 +493,7 @@ class SearchSession:
         ledger.write(maps, pixel_l, index, full)
         searcher.schedule.decisions[index](ledger, pixel_l, spec, index)
         self.pixels = ledger.uncertain()
+        self._mark(f"stage{index}:decided")
         elapsed = time.perf_counter() - t0
         self.elapsed_s += elapsed
         return StageResult(
@@ -427,6 +506,7 @@ class SearchSession:
             n_uncertain_after=len(self.pixels),
             elapsed_s=elapsed,
             scores=scores,
+            execute_s=elapsed,  # featurization is interleaved per chunk
         )
 
     def set_pairs(self, stage_index: int, pairs: PairList) -> None:
@@ -494,4 +574,5 @@ class SearchSession:
             spec.precision,
             spec.rectangles,
             hyp_plan.defocus_planes(),
+            memory.store_residency,
         )

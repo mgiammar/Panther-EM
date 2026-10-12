@@ -266,10 +266,42 @@ class PixelStats:
             (num_pixels,), -1, device=device, dtype=torch.long
         )
 
+    BUFFERS: tuple[str, ...] = (
+        "corr_sum",
+        "corr_sum2",
+        "best_corr",
+        "best_hypothesis",
+        "best_psi_angle",
+    )
+
+    @classmethod
+    def view_of(cls, parent: PixelStats, start: int, stop: int) -> PixelStats:
+        """A tracker whose buffers are views ``[start:stop]`` of ``parent``'s.
+
+        Lets a block keep one set of buffers for all its GEMM sub-batches: the
+        sub-batches accumulate into their slices and the block finalizes once.
+        Scalar bookkeeping (``hypothesis_count``) is per view.
+        """
+        obj = cls.__new__(cls)
+        obj.hypothesis_count = 0
+        obj.num_pixels = stop - start
+        for name in cls.BUFFERS:
+            setattr(obj, name, getattr(parent, name)[start:stop])
+        obj._init_view_extras(parent, start, stop)
+        return obj
+
+    def _init_view_extras(self, parent: PixelStats, start: int, stop: int) -> None:
+        """Hook for subclasses with extra per-instance buffers (no-op here)."""
+        return None
+
+    def clear_bookkeeping(self) -> None:
+        """Reset the scalar state only (a view whose buffers the block cleared)."""
+        self.hypothesis_count = 0
+
     @torch.no_grad()
     def clear(self) -> None:
         """Clear all tracked statistics."""
-        self.hypothesis_count = 0
+        self.clear_bookkeeping()
         self.corr_sum.zero_()
         self.corr_sum2.zero_()
         self.best_corr.fill_(float("-inf"))
@@ -398,9 +430,12 @@ class PixelStats:
         else:
             psi = amax % num_psi
 
-        self.best_corr = torch.where(improved, vmax_cast, self.best_corr)
-        self.best_hypothesis = torch.where(improved, global_hyp, self.best_hypothesis)
-        self.best_psi_angle = torch.where(improved, psi, self.best_psi_angle)
+        # In place: a BlockStats sub-batch is a view of the block's buffers.
+        torch.where(improved, vmax_cast, self.best_corr, out=self.best_corr)
+        torch.where(
+            improved, global_hyp, self.best_hypothesis, out=self.best_hypothesis
+        )
+        torch.where(improved, psi, self.best_psi_angle, out=self.best_psi_angle)
 
         return None
 
@@ -651,7 +686,14 @@ class BlockStats:
         n_virtual: int = 0,
         pair_dtype: torch.dtype | None = None,
     ) -> None:
-        self.stats = [stats_cls(gemm_pixels, device=device) for _ in range(n_sub)]
+        # One tracker for the whole block; the sub-batches are views of its buffers,
+        # so finalization runs once per block instead of once per sub-batch (that
+        # was ~20 small launches x n_sub per block, the dominant loop overhead).
+        self.block = stats_cls(int(n_sub) * int(gemm_pixels), device=device)
+        self.stats = [
+            stats_cls.view_of(self.block, sub * gemm_pixels, (sub + 1) * gemm_pixels)
+            for sub in range(n_sub)
+        ]
         self.n_sub = int(n_sub)
         self.gemm_pixels = int(gemm_pixels)
         self.n_psi = int(n_psi)
@@ -670,9 +712,10 @@ class BlockStats:
 
     @torch.no_grad()
     def clear(self) -> None:
-        """Reset every sub-batch's state."""
+        """Reset the block's buffers (one pass) and every sub-batch's bookkeeping."""
+        self.block.clear()
         for st in self.stats:
-            st.clear()
+            st.clear_bookkeeping()
 
     @torch.no_grad()
     def consume(self, spectrum_pnf: torch.Tensor, batch: HypBatch, sub: int) -> None:
@@ -723,17 +766,17 @@ class BlockStats:
 
         Keys: ``mip``, ``mean``, ``variance``, ``zscore``, ``best_index``, ``best_psi``.
         """
-        for sub, st in enumerate(self.stats):
-            row0 = sub * self.gemm_pixels
-            if row0 >= n_valid:
-                break
-            n = min(self.gemm_pixels, n_valid - row0)
-            result = st.finalize()
-            for key, value in result.items():
-                target = outs[key]
-                target[start + row0 : start + row0 + n] = value[:n].to(
-                    target.device, target.dtype
-                )
+        for st in self.stats:  # fold any pending in-kernel best into the shared buffers
+            merge = getattr(st, "merge_packed", None)
+            if merge is not None:
+                merge()
+        self.block.hypothesis_count = self.stats[0].hypothesis_count
+        result = self.block.finalize()
+        for key, value in result.items():
+            target = outs[key]
+            target[start : start + n_valid] = value[:n_valid].to(
+                target.device, target.dtype
+            )
 
 
 @runtime_checkable

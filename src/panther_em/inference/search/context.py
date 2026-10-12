@@ -36,7 +36,6 @@ if TYPE_CHECKING:
     from panther_em.inference.search.basis import PreparedWeightCache, WeightSource
     from panther_em.inference.search.contraction import ContractionEngine
     from panther_em.inference.search.hypotheses import HypothesisPlan
-    from panther_em.inference.search.store import ColumnGroup
     from panther_em.inference.search.tiling import FeatureLayout
     from panther_em.inference.search.types import BatchShape, Precision
 
@@ -179,10 +178,14 @@ class Planner:
         *,
         l2_target: int | None = None,
         block_bytes_max: int = 256 * MIB,
+        device_store_fraction: float = 0.5,
         gemm_pixel_choices: Sequence[int] = (1024, 512),
     ) -> None:
         self.l2_target = l2_target
         self.block_bytes_max = int(block_bytes_max)
+        # a store larger than this fraction of the free device memory is pinned-host
+        # resident and streamed through device slots
+        self.device_store_fraction = float(device_store_fraction)
         self.gemm_pixel_choices = tuple(int(v) for v in gemm_pixel_choices)
 
     @staticmethod
@@ -289,7 +292,16 @@ class Planner:
             and stats_backend.name == "fused"
             else "eager"
         )
-        store_residency: Residency = "device" if residency == "auto" else residency
+        store_residency: Residency
+        if residency == "auto":
+            store_bytes = feature_bytes_per_pixel * max(1, n_pixels)
+            limit = int((caps.free_bytes or 0) * self.device_store_fraction)
+            if caps.is_cuda and store_bytes > limit:
+                store_residency = "pinned_host"
+            else:
+                store_residency = "device"
+        else:
+            store_residency = residency
         return MemoryPlan(
             gemm_pixels=gemm_pixels,
             hyp_batch=hyp_batch,
@@ -336,8 +348,6 @@ class LoopInputs:
     ----------
     layout : FeatureLayout
         The stage's rectangles.
-    groups : tuple[ColumnGroup, ...]
-        Every group the stage reads (any order; addressed by ``group.id``).
     plane_lookup : tuple[tuple[tuple[int, int], ...], ...]
         ``plane_lookup[rect_index][d_local] -> (group id, local plane index)``.
     engine : ContractionEngine
@@ -349,7 +359,6 @@ class LoopInputs:
     """
 
     layout: FeatureLayout
-    groups: tuple[ColumnGroup, ...]
     plane_lookup: tuple[tuple[tuple[int, int], ...], ...]
     engine: ContractionEngine
     hyp_plan: HypothesisPlan
@@ -425,7 +434,10 @@ def _loop_body(
                     weights = inputs.prepared[(run_index, batch_index)]
                     engine.contract(a_parts, [weights], run, spectrum)
                 stats.consume(spectrum.pnf(), batch, sub)
-            stats.end_epoch(epoch.base, sub)
+            if len(plan.epochs) > 1:
+                # a single epoch (base 0) is folded once per block in finalize_into;
+                # per-sub-batch merges here were ~6 small launches x n_sub per block
+                stats.end_epoch(epoch.base, sub)
 
 
 class EagerHypLoop:

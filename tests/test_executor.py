@@ -591,3 +591,51 @@ def test_planes_split_across_groups_match_dense_reference(synthetic_result):
         maps2, _reference(result, spec, features, plan2.hyp_plan, 16), plan2.hyp_plan
     )
     assert plan2.signature != plan.signature
+
+
+@pytest.mark.skipif(not CUDA, reason="needs CUDA")
+def test_cuda_pinned_host_store_streams_blocks_and_matches_device(synthetic_result):
+    """Blocks written through device staging, flushed to pinned memory and streamed
+    back through slots give the same maps and pair slab as a device-resident store."""
+    device = torch.device("cuda")
+    result = synthetic_result(n_orientations=8)
+    space = HypothesisSpace.from_result(result, n_defocus=2)
+    spec = StageSpec([(0, 0, 4, 3), (0, 3, 2, 2)], precision="fp16", n_psi=128)
+    ctx = SearchContext(device, WeightSource(result, device), want_pairs=True)
+    runs = {}
+    for residency in ("device", "pinned_host"):
+        geo = _geometry(1)
+        pixels = PixelSelection.all(geo)
+        store = FeatureStore(
+            geo, pixels, pixels.index, block_pixels=8, n_defocus=2, device=device,
+            residency=residency,
+        )
+        store.copy_stream = ctx.copy
+        gen = torch.Generator().manual_seed(0)
+        for rect in spec.rectangles:
+            group = store.add_group(rect, spec.precision)
+            n_cells = rect[2] * rect[3]
+            data = torch.complex(
+                torch.randn(2, n_cells, store.n_pixels, generator=gen),
+                torch.randn(2, n_cells, store.n_pixels, generator=gen),
+            )
+            w = store.writer(group)
+            # several writes so staging sees partial blocks before completion
+            for c0 in range(0, n_cells, 3):
+                w.write(slice(c0, min(n_cells, c0 + 3)), (0, store.n_pixels), data[:, c0 : c0 + 3])
+            w.close()
+            assert not store._staging
+        if residency == "pinned_host":
+            assert all(not b.is_cuda and b.is_pinned() for g in store.groups for b in g.blocks)
+        rec = _SlabRecorder(store.n_pixels, 2 * 8, torch.float32, device)
+        plan, maps = _run_stage(
+            ctx, result, spec, store, space, batch=BatchShape(4, 4),
+            use_cuda_graph=True, pair_dtype=torch.float32, collector=rec,
+        )
+        torch.cuda.synchronize()
+        runs[residency] = (maps, rec.pair_max.clone())
+    torch.testing.assert_close(runs["pinned_host"][0].mip, runs["device"][0].mip)
+    torch.testing.assert_close(runs["pinned_host"][0].mean, runs["device"][0].mean)
+    assert torch.equal(runs["pinned_host"][0].best_virtual, runs["device"][0].best_virtual)
+    torch.testing.assert_close(runs["pinned_host"][1], runs["device"][1])
+

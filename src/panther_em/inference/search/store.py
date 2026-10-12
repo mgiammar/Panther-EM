@@ -159,6 +159,67 @@ class _DirectBlockSource:
             )
 
 
+class _PinnedBlockSource:
+    """Pinned-host residency: blocks stream through ``n_slots`` device slots.
+
+    Block ``i`` is copied (on the store's copy stream) into slot ``i % n_slots`` as
+    soon as that slot's previous block has been released by the consumer; copies run
+    one block ahead of compute.
+    """
+
+    def __init__(self, store: FeatureStore, groups: Sequence[ColumnGroup]) -> None:
+        self._store = store
+        self._groups = list(groups)
+        n = store.n_slots
+        self._slots = {
+            g.id: [torch.empty_like(g.blocks[0], device=store.device) for _ in range(n)]
+            for g in self._groups
+        }
+        self._free: list[torch.cuda.Event | None] = [None] * n
+        self._stream = store.copy_stream or torch.cuda.current_stream(store.device)
+
+    def __len__(self) -> int:
+        return self._store.n_blocks
+
+    def _issue(self, i: int) -> torch.cuda.Event:
+        slot = i % self._store.n_slots
+        with torch.cuda.stream(self._stream):
+            if self._free[slot] is not None:
+                self._stream.wait_event(self._free[slot])
+            for g in self._groups:
+                self._slots[g.id][slot].copy_(g.blocks[i], non_blocking=True)
+            ready = torch.cuda.Event()  # type: ignore[no-untyped-call]
+            ready.record(self._stream)  # type: ignore[no-untyped-call]
+        return ready
+
+    def __iter__(self) -> Iterator[ReadyBlock]:
+        n_blocks, n_slots = self._store.n_blocks, self._store.n_slots
+        ready = {i: self._issue(i) for i in range(min(n_slots - 1, n_blocks))}
+        for i in range(n_blocks):
+            start, stop = self._store.block_range(i)
+            slot = i % n_slots
+
+            def release(done: torch.cuda.Event | None, slot: int = slot) -> None:
+                if done is None:
+                    done = torch.cuda.Event()  # type: ignore[no-untyped-call]
+                    done.record(  # type: ignore[no-untyped-call]
+                        torch.cuda.current_stream(self._store.device)
+                    )
+                self._free[slot] = done
+
+            yield ReadyBlock(
+                index=i,
+                col_range=(start, stop),
+                n_valid=stop - start,
+                operands={g.id: self._slots[g.id][slot] for g in self._groups},
+                ready=ready.pop(i),
+                _release=release,
+            )
+            nxt = i + n_slots - 1
+            if nxt < n_blocks:
+                ready[nxt] = self._issue(nxt)
+
+
 class BlockWriter:
     """Writes featurized columns of one group, splitting across block boundaries."""
 
@@ -216,7 +277,7 @@ class BlockWriter:
             b1 = min(stop, (b + 1) * bp)
             local = slice(b0 - b * bp, b1 - b * bp)
             chunk = data[..., b0 - start : b1 - start]
-            block = self.group.blocks[b]
+            block = self.store._write_target(self.group, b)
             if local_plane is None:
                 engine.write_block(block, cells, local, chunk.to(block.device))
             else:
@@ -226,6 +287,8 @@ class BlockWriter:
                     local,
                     chunk.to(block.device)[None],
                 )
+            planes_written = self.group.n_defocus if local_plane is None else 1
+            self.store._note_written(self.group, b, n_cells * (b1 - b0) * planes_written)
         written = n_cells * (stop - start)
         if local_plane is None:
             self._written = [w + written for w in self._written]
@@ -245,6 +308,7 @@ class BlockWriter:
                 f"group {self.group.id} incomplete: planes {short} have fewer than "
                 f"{expected} cell-columns written"
             )
+        self.store.flush_staging()
         self.group.complete = True
 
 
@@ -282,7 +346,7 @@ class FeatureStore:
         device: torch.device | str,
         residency: Residency = "device",
     ) -> None:
-        if residency != "device":
+        if residency not in ("device", "pinned_host"):
             raise NotImplementedError(f"residency {residency!r} not implemented yet")
         if column_index.dim() != 1 or int(column_index.numel()) != len(pixels):
             raise ValueError("column_index must be a (P,) permutation of pixels.index")
@@ -296,6 +360,15 @@ class FeatureStore:
         self.device = torch.device(device)
         self.residency: Residency = residency
         self.groups: list[ColumnGroup] = []
+        # pinned_host: blocks live in pinned host memory; writes land in device
+        # staging blocks that are copied out once every cell x plane of a block has
+        # been written (pixel-major featurization completes blocks tile by tile), and
+        # the executor streams blocks back through a few device slots.
+        self.copy_stream: torch.cuda.Stream | None = None
+        self.staging_bytes = 8 << 30  # device memory for partially written blocks
+        self.n_slots = 3  # device slots the executor streams through
+        self._staging: dict[tuple[int, int], torch.Tensor] = {}
+        self._staged_written: dict[tuple[int, int], int] = {}
 
     # -- geometry of the pixel axis -------------------------------------------
 
@@ -412,10 +485,16 @@ class FeatureStore:
             engine=engine,
         )
         shape = engine.block_shape(len(ids), rect[2], rect[3], self.block_pixels)
-        group.blocks = [
-            torch.zeros(shape, dtype=engine.block_dtype, device=self.device)
-            for _ in range(self.n_blocks)
-        ]
+        if self.residency == "pinned_host":
+            group.blocks = [
+                torch.empty(shape, dtype=engine.block_dtype, pin_memory=True)
+                for _ in range(self.n_blocks)
+            ]
+        else:
+            group.blocks = [
+                torch.zeros(shape, dtype=engine.block_dtype, device=self.device)
+                for _ in range(self.n_blocks)
+            ]
         self.groups.append(group)
         return group
 
@@ -430,7 +509,57 @@ class FeatureStore:
                 raise ValueError("group does not belong to this store")
             if not g.complete:
                 raise ValueError(f"group {g.id} is not complete")
+        if self.residency == "pinned_host":
+            return _PinnedBlockSource(self, groups)
         return _DirectBlockSource(self, groups)
+
+    # -- pinned-host staging (write side) ----------------------------------------
+
+    def _write_target(self, group: ColumnGroup, b: int) -> torch.Tensor:
+        """The device tensor a writer fills for block ``b`` of ``group``."""
+        if self.residency != "pinned_host":
+            return group.blocks[b]
+        key = (group.id, b)
+        staged = self._staging.get(key)
+        if staged is None:
+            block_bytes = group.blocks[b].numel() * group.blocks[b].element_size()
+            if (len(self._staging) + 1) * block_bytes > self.staging_bytes:
+                raise RuntimeError(
+                    f"{len(self._staging)} partially written blocks staged on the "
+                    f"device ({self.staging_bytes >> 30} GiB): pinned_host residency "
+                    "needs a featurization order that completes blocks tile by tile "
+                    "(pixel_major) and a tile that fits the staging budget"
+                )
+            staged = torch.zeros_like(group.blocks[b], device=self.device)
+            self._staging[key] = staged
+            self._staged_written[key] = 0
+        return staged
+
+    def _note_written(self, group: ColumnGroup, b: int, cell_columns: int) -> None:
+        """Count writes into a staged block; flush it to the host when complete."""
+        if self.residency != "pinned_host":
+            return
+        key = (group.id, b)
+        self._staged_written[key] += cell_columns
+        start, stop = self.block_range(b)
+        expected = group.num_cells * group.n_defocus * (stop - start)
+        if self._staged_written[key] >= expected:
+            self._flush(key, group)
+
+    def _flush(self, key: tuple[int, int], group: ColumnGroup) -> None:
+        staged = self._staging.pop(key)
+        self._staged_written.pop(key)
+        # same stream as the writes, so the copy follows them and the staging memory
+        # may be recycled stream-ordered
+        group.blocks[key[1]].copy_(staged, non_blocking=True)
+
+    def flush_staging(self) -> None:
+        """Copy out whatever is still staged (e.g. the tail block) and wait."""
+        for key in list(self._staging):
+            group = self.groups[key[0]]
+            self._flush(key, group)
+        if self.device.type == "cuda":
+            torch.cuda.current_stream(self.device).synchronize()
 
     def nbytes(self) -> int:
         """Bytes across all groups."""
@@ -500,7 +629,9 @@ class FeatureStore:
         )
         for b in torch.unique(block_of).tolist():
             where = torch.nonzero(block_of == b, as_tuple=False).squeeze(-1)
-            out[:, :, where, :] = group.blocks[b].index_select(2, within[where])
+            blk = group.blocks[b]
+            idx = within[where].to(blk.device)
+            out[:, :, where, :] = blk.index_select(2, idx).to(self.device)
         return out
 
 
