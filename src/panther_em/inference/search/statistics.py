@@ -591,7 +591,7 @@ class PixelStats:
         vmax_cast = vmax.to(self.best_corr.dtype)
         improved = vmax_cast > self.best_corr
         # In place (`out=`), never rebinding the attributes: a captured CUDA graph
-        # (context.GraphedHypLoop) holds these exact buffers, and its captured clear()
+        # (executor.HypLoop) holds these exact buffers, and its captured clear()
         # must keep resetting the tensors finalize() reads.
         torch.where(improved, vmax_cast, self.best_corr, out=self.best_corr)
         torch.where(

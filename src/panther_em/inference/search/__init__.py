@@ -26,7 +26,7 @@ Objects, by lifetime
 
 Pipeline of one stage
 ---------------------
-1. **Plan** (:mod:`.executor`, :mod:`.context`): batch shape, block size, contraction
+1. **Plan** (:mod:`.executor`): batch shape, block size, contraction
    engine (:mod:`.contraction`: fp32 / tf32 complex GEMM or the fp16 "4M" GEMM),
    statistics (:mod:`.statistics`: pure torch or
    the fused CUDA iRFFT+statistics kernel) and the :class:`~.hypotheses.HypothesisSet`
@@ -99,11 +99,9 @@ from __future__ import annotations
 
 from panther_em.inference.search.basis import (
     KernelBank,
-    PreparedWeightCache,
     Template,
     WeightSource,
 )
-from panther_em.inference.search.context import DeviceCaps, MemoryPlan, Planner
 from panther_em.inference.search.decisions import (
     Decision,
     DecisionChain,
@@ -115,6 +113,7 @@ from panther_em.inference.search.decisions import (
     classify_zscore_interval,
     zscore_error_intervals,
 )
+from panther_em.inference.search.executor import Executor, MemoryPlan, StagePlan
 from panther_em.inference.search.featurize import (
     Featurizer,
     FFTCorrelationFeaturizer,
@@ -160,10 +159,10 @@ __all__ = [
     "Decision",
     "DecisionChain",
     "DecodedMaps",
-    "DeviceCaps",
     "DilationAbsorb",
     "ErrorModel",
     "ExecutionConfig",
+    "Executor",
     "FFTCorrelationFeaturizer",
     "FeatureLayout",
     "FeatureStore",
@@ -180,14 +179,13 @@ __all__ = [
     "PixelLabel",
     "PixelLedger",
     "PixelSelection",
-    "Planner",
     "Precision",
-    "PreparedWeightCache",
     "Rectangle",
     "SearchGeometry",
     "SearchResult",
     "SearchSchedule",
     "SearchSession",
+    "StagePlan",
     "Searcher",
     "StageResult",
     "StageSpec",

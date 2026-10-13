@@ -278,7 +278,7 @@ def test_center_mode_defocus_subset_and_run_many(template):
     assert dec.phi is not None and torch.isfinite(dec.phi).all()
     torch.testing.assert_close(results[0].mip, results[1].mip)
     assert (
-        len(searcher.ctx.loops) == 1
+        len(searcher.executor.loops) == 1
     )  # the captured/eager loop was reused across images
 
 
@@ -365,8 +365,7 @@ def test_cuda_mixed_precision_session_matches_cpu(synthetic_result):
     )
     gpu = gpu_searcher.run(ImageSet.single(image)).to("cpu")
     assert any(
-        type(loop).__name__ == "GraphedHypLoop"
-        for loop in gpu_searcher.ctx.loops.values()
+        loop.graph is not None for loop in gpu_searcher.executor.loops.values()
     )
     # stage 0 ran in fp16 on the GPU: the follow-up set may differ at near-ties, so
     # compare the final maps only where both searched the pixel in the same stage
@@ -450,4 +449,4 @@ def test_session_store_is_released_after_the_session(template):
     del session
     gc.collect()
     assert store_ref() is None  # only the session owned the store
-    assert searcher.ctx.loops  # the loop cache itself survives for the next image set
+    assert searcher.executor.loops  # the loop cache survives for the next image set

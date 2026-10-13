@@ -1,4 +1,4 @@
-"""KernelBank / WeightSource / PreparedWeightCache / Template."""
+"""KernelBank / WeightSource / Template."""
 
 from __future__ import annotations
 
@@ -9,12 +9,9 @@ from conftest import count_kernel_builds
 from panther_em.inference.projection_reconstruction import ProjectionReconstructor
 from panther_em.inference.search.basis import (
     KernelBank,
-    PreparedWeightCache,
     Template,
     WeightSource,
 )
-from panther_em.inference.search.contraction import ComplexGemmEngine
-from panther_em.inference.search.hypotheses import HypBatch
 from panther_em.inference.search.tiling import FeatureLayout
 from panther_em.inference.search.types import KernelConfig
 
@@ -170,45 +167,6 @@ def test_weight_source_bounding_box_and_sparse(recon):
         keep[int(k), int(m)] = True
     dense[:, ~keep] = 0
     torch.testing.assert_close(sparse_src.us, dense)
-
-
-def test_prepared_weight_cache_hits_evicts_and_pins(recon):
-    layout = FeatureLayout([(0, 0, 3, 2), (0, 2, 3, 3), (3, 0, 1, 5)])
-    src = WeightSource(recon.result, "cpu")
-    engine = ComplexGemmEngine()
-    run = layout.k_runs[0]  # k in [0, 3): both first rectangles
-    batch = HypBatch(0, 1, 5, 1)
-
-    cache = PreparedWeightCache(src)
-    got = cache.get(layout, run, batch, engine)
-    manual = engine.prepare_weights(
-        torch.cat([src.block((0, 0, 3, 2))[1:5], src.block((0, 2, 3, 3))[1:5]], dim=-1)
-    )
-    torch.testing.assert_close(got, manual)
-    assert got.shape == (3, 5, 4)
-    assert cache.get(layout, run, batch, engine) is got
-
-    rows = torch.tensor([0, 2, 4, 5])
-    sub = cache.get(layout, run, HypBatch(0, 0, 2, 0), engine, rows, rows_key="r")
-    torch.testing.assert_close(
-        sub,
-        engine.prepare_weights(
-            torch.cat(
-                [src.block((0, 0, 3, 2))[[0, 2]], src.block((0, 2, 3, 3))[[0, 2]]],
-                dim=-1,
-            )
-        ),
-    )
-
-    tiny = PreparedWeightCache(src, byte_budget=got.numel() * got.element_size())
-    a = tiny.get(layout, run, batch, engine)
-    tiny.pin("graph", [PreparedWeightCache.key(layout, run, batch, engine, None)])
-    b = tiny.get(layout, layout.k_runs[1], batch, engine)  # over budget, newest: kept
-    assert tiny.get(layout, layout.k_runs[1], batch, engine) is b
-    tiny.get(layout, run, HypBatch(0, 0, 1, 0), engine)  # third entry evicts b
-    assert tiny.get(layout, run, batch, engine) is a  # pinned survived
-    assert tiny.get(layout, layout.k_runs[1], batch, engine) is not b
-    tiny.unpin("graph")
 
 
 def test_template_bundle_and_hdf5_round_trip(synthetic_result, tmp_path):

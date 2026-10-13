@@ -19,7 +19,7 @@ if TYPE_CHECKING:
         SearchGeometry,
     )
 
-Residency = Literal["device", "pinned_host", "transient"]
+Residency = Literal["device", "pinned_host"]
 
 
 @dataclass(eq=False)
@@ -348,7 +348,7 @@ class FeatureStore:
         residency: Residency = "device",
     ) -> None:
         if residency not in ("device", "pinned_host"):
-            raise NotImplementedError(f"residency {residency!r} not implemented yet")
+            raise ValueError(f"residency must be 'device' or 'pinned_host', got {residency!r}")
         if column_index.dim() != 1 or int(column_index.numel()) != len(pixels):
             raise ValueError("column_index must be a (P,) permutation of pixels.index")
         if block_pixels < 1:

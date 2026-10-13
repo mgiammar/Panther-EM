@@ -17,9 +17,13 @@ import torch
 from panther_em.inference.search import fused_kernel_loader
 from panther_em.inference.search.statistics import _reduce_stats
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires a CUDA device"
-)
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device"),
+    # the torch reference compiles _reduce_stats; under Python 3.13 triton's AST
+    # building emits a DeprecationWarning that warnings-as-errors would turn into an
+    # inductor CompilationError on the first compile of a shape
+    pytest.mark.filterwarnings("ignore::DeprecationWarning"),
+]
 
 
 @pytest.fixture(scope="module", autouse=True)

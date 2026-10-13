@@ -6,8 +6,6 @@ Everything here is built once per decomposition and reused across stages and ima
   ``V[k, m]`` (spatial, spectral or planar form) under a byte budget.
 * :class:`WeightSource` -- holds ``U * S`` device-resident once and serves rectangular
   ``(N, num_k, num_m)`` blocks.
-* :class:`PreparedWeightCache` -- caches the engine-specific B operands per
-  ``(k-run, hypothesis batch, precision)``.
 * :class:`Template` -- the bundle a
   :class:`~panther_em.inference.search.searcher.Searcher` is built from.
 """
@@ -32,9 +30,7 @@ if TYPE_CHECKING:
     from collections.abc import Hashable, Iterable, Sequence
     from pathlib import Path
 
-    from panther_em.inference.search.contraction import ContractionEngine
-    from panther_em.inference.search.hypotheses import HypBatch
-    from panther_em.inference.search.tiling import FeatureLayout, KRun
+    from panther_em.inference.search.tiling import FeatureLayout
 
 Cell = tuple[int, int]
 
@@ -650,90 +646,6 @@ class WeightSource:
             for rect in layout.rectangles
         ]
         return torch.cat(blocks, dim=1)
-
-
-class PreparedWeightCache:
-    """Engine-specific B operands per ``(k-run, hypothesis batch, precision)``.
-
-    Entries are shared across defocus planes (weights do not depend on the image),
-    across stages that reuse a run, and across images. Entries referenced by a
-    captured CUDA graph are pinned via :meth:`pin` and never evicted.
-    """
-
-    def __init__(self, source: WeightSource, byte_budget: int | None = None) -> None:
-        self.source = source
-        self._cache = _ByteLRU(byte_budget)
-
-    @staticmethod
-    def key(
-        layout: FeatureLayout,
-        run: KRun,
-        batch: HypBatch,
-        engine: ContractionEngine,
-        rows_key: Hashable,
-    ) -> tuple:
-        """Cache key for one prepared operand."""
-        parts = tuple(
-            (layout.rectangles[p.rect], p.m_start, p.m_stop) for p in run.parts
-        )
-        return (
-            parts,
-            run.k_start,
-            run.k_stop,
-            engine.precision,
-            rows_key,
-            batch.j0,
-            batch.j1,
-        )
-
-    def get(
-        self,
-        layout: FeatureLayout,
-        run: KRun,
-        batch: HypBatch,
-        engine: ContractionEngine,
-        template_rows: torch.Tensor | None = None,
-        rows_key: Hashable = None,
-    ) -> torch.Tensor:
-        """Concatenated B operand for ``run`` and hypotheses ``batch.j0:batch.j1``."""
-        key = self.key(layout, run, batch, engine, rows_key)
-        cached = self._cache.get(key)
-        if cached is not None:
-            return cached
-        rows = (
-            torch.arange(batch.j0, batch.j1, device=self.source.device)
-            if template_rows is None
-            else template_rows.to(self.source.device)[batch.j0 : batch.j1]
-        )
-        parts = []
-        for part in run.parts:
-            sub = (
-                run.k_start,
-                part.m_start,
-                run.k_stop - run.k_start,
-                part.m_stop - part.m_start,
-            )
-            parts.append(engine.prepare_weights(self.source.block(sub, rows)))
-        prepared = parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
-        self._cache.put(key, prepared)
-        return prepared
-
-    def pin(self, tag: Hashable, keys: Iterable[Hashable]) -> None:
-        """Protect ``keys`` from eviction while ``tag`` (e.g. a graph) is alive."""
-        self._cache.pin(tag, keys)
-
-    def unpin(self, tag: Hashable) -> None:
-        """Release a pin."""
-        self._cache.unpin(tag)
-
-    @property
-    def nbytes(self) -> int:
-        """Cached bytes."""
-        return self._cache.nbytes
-
-    def clear(self) -> None:
-        """Drop every entry (including pinned ones; only call with no live graphs)."""
-        self._cache.clear()
 
 
 class Template:

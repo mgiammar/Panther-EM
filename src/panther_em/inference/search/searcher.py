@@ -26,12 +26,7 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
-from panther_em.inference.search.context import Planner, SearchContext
-from panther_em.inference.search.executor import (
-    StageExecutor,
-    plan_memory,
-    plan_stage,
-)
+from panther_em.inference.search.executor import Executor, plan_memory, plan_stage
 from panther_em.inference.search.featurize import make_featurizer
 from panther_em.inference.search.hypotheses import HypothesisSpace, healpix_ipix
 from panther_em.inference.search.ledger import PixelLedger
@@ -49,7 +44,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
 
     from panther_em.inference.search.basis import Template
-    from panther_em.inference.search.context import Residency
+    from panther_em.inference.search.store import Residency
     from panther_em.inference.search.featurize import Featurizer, LoopOrder
     from panther_em.inference.search.schedule import SearchSchedule
     from panther_em.inference.search.types import BatchShape, Rectangle
@@ -89,6 +84,14 @@ class ExecutionConfig:
     store_residency : {"auto", "device", "pinned_host"}
         Where a stage's feature store lives; ``"auto"`` keeps it on the device when it
         fits half the free memory and otherwise pins it on the host and streams blocks.
+    l2_target : int, optional
+        Bytes of spectrum per contraction to keep L2-resident (the hypothesis batch
+        follows from it); defaults to two thirds of the device's L2.
+    block_bytes_max : int
+        Byte budget of one feature-store block (256 MiB).
+    device_store_fraction : float
+        With ``store_residency="auto"``, a store larger than this fraction of the free
+        device memory is pinned on the host and streamed.
     trace : bool
         Synchronise the device at every session mark (``SearchSession.marks``) so
         the marks' wall-clock deltas are per-phase device times.
@@ -106,6 +109,9 @@ class ExecutionConfig:
     prepared_budget: int | None = None
     show_progress: bool = False
     store_residency: Residency | Literal["auto"] = "auto"
+    l2_target: int | None = None
+    block_bytes_max: int = 256 << 20
+    device_store_fraction: float = 0.5
     trace: bool = False
 
 
@@ -126,7 +132,6 @@ class Searcher:
     error_model : ErrorModel, optional
     featurizer : Featurizer, optional
         Override the featurizer (tests inject a stub); otherwise chosen per geometry.
-    planner : Planner, optional
     """
 
     def __init__(
@@ -139,7 +144,6 @@ class Searcher:
         defocus_values: torch.Tensor | None = None,
         error_model: ErrorModel | None = None,
         featurizer: Featurizer | None = None,
-        planner: Planner | None = None,
     ) -> None:
         self.template = template
         self.execution = execution or ExecutionConfig()
@@ -157,11 +161,8 @@ class Searcher:
         if any(isinstance(s.orientations, int) for s in schedule.stages):
             found = healpix_ipix(self.space)
             self.ipix = None if found is None else found[1]
-        self.ctx = SearchContext(
-            template.device,
-            template.weights,
-            prepared_budget=self.execution.prepared_budget,
-            planner=planner,
+        self.executor = Executor(
+            template.device, template.weights, prepared_budget=self.execution.prepared_budget
         )
         self._validate()
 
@@ -174,7 +175,7 @@ class Searcher:
                         f"stage {i}: rectangle {(k0, m0, ke, me)} exceeds the stored "
                         f"(k_max={k_max}, eig_max={eig_max}) feature space"
                     )
-            if spec.precision is Precision.FP16 and not self.ctx.caps.is_cuda:
+            if spec.precision is Precision.FP16 and not self.executor.is_cuda:
                 raise ValueError(f"stage {i}: fp16 needs a CUDA device")
             template_ids, defocus_ids = spec.hypothesis_ids(self.space, self.ipix)
             if defocus_ids is not None and int(defocus_ids.max()) >= self.space.n_defocus:
@@ -205,7 +206,7 @@ class Searcher:
 
     def release(self) -> None:
         """Drop cached loops and prepared weights (kernels stay with the template)."""
-        self.ctx.release()
+        self.executor.release()
 
 
 class SearchSession:
@@ -247,7 +248,7 @@ class SearchSession:
     def _mark(self, name: str) -> None:
         """Record ``(name, time, allocated_bytes)`` (synchronised under ``trace``)."""
         allocated = 0
-        if self.searcher.ctx.caps.is_cuda:
+        if self.searcher.executor.is_cuda:
             if self.searcher.execution.trace:
                 torch.cuda.synchronize(self.searcher.device)
             allocated = torch.cuda.memory_allocated(self.searcher.device)
@@ -278,7 +279,7 @@ class SearchSession:
                 device=self.searcher.device,
                 residency=residency,
             )
-            store.copy_stream = self.searcher.ctx.copy
+            store.copy_stream = self.searcher.executor.copy
         else:
             keep = torch.isin(
                 store.column_index, pixels.index.to(store.column_index.device)
@@ -292,7 +293,7 @@ class SearchSession:
             ):
                 raise RuntimeError("featurizer column order diverged from the store's")
         self._mark("store:ready")
-        ctx = self.searcher.ctx
+        ctx = self.searcher.executor
         missing = [
             (rect, mp)
             for rect in spec_rects
@@ -326,8 +327,8 @@ class SearchSession:
         t0 = time.perf_counter()
         self._mark(f"stage{index}:start")
         template_ids, defocus_ids = spec.hypothesis_ids(searcher.space, searcher.ipix)
-        memory, fused, engine, hyp_plan = plan_memory(
-            searcher.ctx,
+        memory = plan_memory(
+            searcher.executor,
             spec,
             n_pixels=len(self.pixels),
             space=searcher.space,
@@ -339,21 +340,23 @@ class SearchSession:
             use_fused_kernel=exe.use_fused_kernel,
             store=self.store,
             residency=exe.store_residency,
+            l2_target=exe.l2_target,
+            block_bytes_max=exe.block_bytes_max,
+            device_store_fraction=exe.device_store_fraction,
         )
+        hyps = memory.hyps
         store = self._prepare_store(
             memory.block_pixels,
             spec.precision,
             spec.rectangles,
-            hyp_plan.defocus_planes(),
-            memory.store_residency,
+            hyps.defocus_planes(),
+            memory.residency,
         )
-        if searcher.ctx.caps.is_cuda:
+        if searcher.executor.is_cuda:
             torch.cuda.synchronize(searcher.device)
         t_featurized = time.perf_counter()
         self._mark(f"stage{index}:featurized")
-        plan = plan_stage(
-            searcher.ctx, index, spec, store, memory, fused, engine, hyp_plan
-        )
+        plan = plan_stage(searcher.executor, index, spec, store, memory)
         self._mark(f"stage{index}:planned")
         progress = None
         if exe.show_progress:
@@ -363,15 +366,15 @@ class SearchSession:
                 total=store.n_pixels, desc=f"stage {index}", unit="px", unit_scale=True
             )
             progress = bar.update
-        maps = StageExecutor(searcher.ctx).run(store, plan, progress=progress)
+        maps = searcher.executor.run(store, plan, progress=progress)
         if exe.show_progress:
             bar.close()
-        if searcher.ctx.caps.is_cuda:
+        if searcher.executor.is_cuda:
             torch.cuda.synchronize(searcher.device)
         t_executed = time.perf_counter()
         self._mark(f"stage{index}:executed")
         column_index = store.column_index
-        self.ledger.write(maps, column_index, index, hyp_plan)
+        self.ledger.write(maps, column_index, index, hyps)
         self._mark(f"stage{index}:ledger")
         searcher.schedule.decisions[index](self.ledger, column_index, spec, index)
         self.pixels = self.ledger.uncertain()
@@ -384,7 +387,7 @@ class SearchSession:
             spec=spec,
             pixel_index=column_index.clone(),
             maps=maps,
-            best_index=hyp_plan.decode(maps.best_virtual),
+            best_index=hyps.decode(maps.best_virtual),
             labels_after=labels_after,
             n_uncertain_after=len(self.pixels),
             elapsed_s=elapsed,
