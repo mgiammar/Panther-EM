@@ -208,7 +208,7 @@ class ComplexGemmEngine:
             raise ValueError(
                 f"ComplexGemmEngine handles fp32/tf32, not {precision.value}"
             )
-        self.precision = precision
+        self.precision: Precision = precision
 
     def block_shape(
         self, n_defocus: int, num_k: int, num_m: int, n_pixels: int
@@ -271,7 +271,7 @@ class ComplexGemmEngine:
 class Fp16GemmEngine:
     """fp16 tensor-core "4M" contraction; complex32 spectrum."""
 
-    precision = Precision.FP16
+    precision: Precision = Precision.FP16
     block_dtype = torch.float16
     spectrum_dtype = torch.complex32
 

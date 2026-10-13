@@ -20,7 +20,7 @@ from panther_em.inference.search.types import Precision
 
 
 def test_stage_spec_validation():
-    spec = StageSpec([(0, 0, 8, 4), (8, 0, 4, 4)], precision="fp16", n_psi=32)
+    spec = StageSpec.create([(0, 0, 8, 4), (8, 0, 4, 4)], precision="fp16", n_psi=32)
     assert (
         spec.precision is Precision.FP16
         and spec.k_stop == 12
@@ -28,23 +28,23 @@ def test_stage_spec_validation():
     )
     assert spec.layout().num_features == 48
     with pytest.raises(ValueError):
-        StageSpec([])
+        StageSpec.create([])
     with pytest.raises(ValueError):
-        StageSpec([(0, 0, 8, 4), (4, 2, 8, 4)])  # overlap
+        StageSpec.create([(0, 0, 8, 4), (4, 2, 8, 4)])  # overlap
     with pytest.raises(ValueError):
-        StageSpec([(0, 0, 20, 4)], n_psi=32)  # k_stop 20 > 17
+        StageSpec.create([(0, 0, 20, 4)], n_psi=32)  # k_stop 20 > 17
     with pytest.raises(ValueError):
-        StageSpec([(0, 0, 4, 4)], error=1.5)
+        StageSpec.create([(0, 0, 4, 4)], error=1.5)
     with pytest.raises(ValueError):
-        StageSpec([(0, 0, 0, 4)])
+        StageSpec.create([(0, 0, 0, 4)])
 
 
 def test_schedule_defaults_and_length_check():
-    s = SearchSchedule((StageSpec([(0, 0, 4, 4)]), StageSpec([(0, 0, 8, 8)])))
+    s = SearchSchedule((StageSpec.create([(0, 0, 4, 4)]), StageSpec.create([(0, 0, 8, 8)])))
     assert len(s) == 2 and all(isinstance(d, NoDecision) for d in s.decisions)
     assert not s.requires_errors()
     with pytest.raises(ValueError):
-        SearchSchedule((StageSpec([(0, 0, 4, 4)]),), (NoDecision(), NoDecision()))
+        SearchSchedule((StageSpec.create([(0, 0, 4, 4)]),), (NoDecision(), NoDecision()))
     with pytest.raises(ValueError):
         SearchSchedule(())
 
@@ -86,7 +86,7 @@ def test_error_model_spectral_matches_brute_force_and_composes_in_quadrature():
         assert rho**2 == pytest.approx(rho_k**2 + rho_m**2, abs=1e-12)
     assert model.rho((0, 0, 6, 5)) == pytest.approx(0.0, abs=1e-12)
     # multi-rectangle stage and StageSpec input agree
-    spec = StageSpec([(0, 0, 3, 5), (3, 0, 3, 2)])
+    spec = StageSpec.create([(0, 0, 3, 5), (3, 0, 3, 2)])
     e_sel = float((S2[:3, :] * w[:3, None]).sum() + (S2[3:6, :2] * w[3:6, None]).sum())
     assert model.rho(spec) == pytest.approx(math.sqrt(1 - e_sel / e_all), abs=1e-12)
 
@@ -110,7 +110,7 @@ def test_error_model_table_lookup(tmp_path):
     model = ErrorModel.from_table(csv_path)
     assert model.rho((0, 0, 16, 16)) == pytest.approx(0.52)
     assert ErrorModel.from_table(csv_path, column="recon_error_mean").rho(
-        StageSpec([(0, 0, 8, 8)])
+        StageSpec.create([(0, 0, 8, 8)])
     ) == pytest.approx(0.71)
     with pytest.raises(KeyError):
         model.rho((0, 0, 4, 4))
@@ -136,7 +136,7 @@ def test_nested_schedule_broadcasts_and_fills_errors():
     assert sched.stages[0].error == 0.3  # explicit error kept
     assert sched.stages[1].error == pytest.approx(model.rho((0, 0, 4, 3)))
     assert sched.stages[2].error == pytest.approx(0.0, abs=1e-12)
-    assert sched.stages[0].hypotheses is None
+    assert sched.stages[0].orientations is None and sched.stages[0].planes is None
     with pytest.raises(ValueError):
         nested_schedule([(2, 2), (4, 4)], precision=["fp16"])
     with pytest.raises(ValueError):

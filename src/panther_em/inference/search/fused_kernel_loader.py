@@ -201,11 +201,19 @@ def lean_supported(n_psi: int, n_freq: int) -> bool:
 
 @overload
 def lean_irfft_stats_transposed(
-    c: torch.Tensor, n_psi: int, decode: Literal[True] = True
+    c: torch.Tensor,
+    n_psi: int,
+    decode: Literal[True] = True,
+    hyp_offset: int = 0,
+    outs: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None: ...
 @overload
 def lean_irfft_stats_transposed(
-    c: torch.Tensor, n_psi: int, decode: Literal[False]
+    c: torch.Tensor,
+    n_psi: int,
+    decode: Literal[False],
+    hyp_offset: int = 0,
+    outs: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None: ...
 def lean_irfft_stats_transposed(
     c: torch.Tensor,

@@ -127,24 +127,18 @@ class FusedPixelStats(PixelStats):
         return super().update_graphed(spectrum, hyp_offset, num_psi, reverse_psi_axis)
 
     @torch.no_grad()
-    def merge_packed(self, hyp_base: int = 0) -> None:
+    def merge_packed(self) -> None:
         """Fold the in-kernel packed best into ``best_corr`` / ``_hypothesis`` / ``_psi``.
 
         Idempotent; a no-op when the in-kernel path was not used since the last
         :meth:`clear`. Uses ``reverse_psi_axis=True`` decoding, the only mode routed
         through the in-kernel path.
-
-        Parameters
-        ----------
-        hyp_base : int, optional
-            Added to the decoded hypothesis ids. Lets a caller split a hypothesis space
-            wider than the kernel's 32-bit packed index into *epochs*.
         """
         if self._packed_num_psi is None:
             return
         num_psi = self._packed_num_psi
         vmax, flat = decode_argmax_packed(self.best_packed)
-        global_hyp = torch.div(flat, num_psi, rounding_mode="floor") + int(hyp_base)
+        global_hyp = torch.div(flat, num_psi, rounding_mode="floor")
         psi = (num_psi - flat % num_psi) % num_psi
         vmax_cast = vmax.to(self.best_corr.dtype)
         improved = vmax_cast > self.best_corr

@@ -18,7 +18,7 @@ from panther_em.inference.search.decisions import (
     zscore_error_intervals,
 )
 from panther_em.inference.search.executor import StageMaps
-from panther_em.inference.search.hypotheses import HypothesisPlan, HypothesisSpace
+from panther_em.inference.search.hypotheses import HypothesisSet, HypothesisSpace
 from panther_em.inference.search.ledger import PixelLabel, PixelLedger
 from panther_em.inference.search.schedule import StageSpec
 from panther_em.inference.search.types import ImageSet, PixelSelection, SearchGeometry
@@ -51,7 +51,7 @@ def _maps(n, *, mip=None, zscore=None, seed=0):
 
 
 def _plan(n_psi=16):
-    return HypothesisPlan(HypothesisSpace(1, 1, 6), None, hyp_batch=6, n_psi=n_psi)
+    return HypothesisSet.create(HypothesisSpace(1, 1, 6), None, None, hyp_batch=6, n_psi=n_psi)
 
 
 def test_ledger_write_masks_and_overwrite():
@@ -124,7 +124,7 @@ def test_zscore_interval_classifier_relative_units_and_vacuous_guard():
     idx = torch.arange(geo.n_pixels)
     z = torch.linspace(-2.0, 12.0, geo.n_pixels)
     ledger.write(_maps(geo.n_pixels, zscore=z), idx, 0, _plan())
-    spec = StageSpec([(0, 0, 4, 4)], n_psi=16, error=0.05)
+    spec = StageSpec.create([(0, 0, 4, 4)], n_psi=16, error=0.05)
 
     ZScoreIntervalClassifier(7.0)(ledger, idx, spec, 0)
     expected = classify_zscore_interval(
@@ -146,7 +146,7 @@ def test_zscore_interval_classifier_relative_units_and_vacuous_guard():
 
     with pytest.raises(ValueError):
         ZScoreIntervalClassifier(7.0)(
-            ledger, idx, StageSpec([(0, 0, 4, 4)], n_psi=16), 0
+            ledger, idx, StageSpec.create([(0, 0, 4, 4)], n_psi=16), 0
         )
     with pytest.raises(ValueError):
         ZScoreIntervalClassifier(7.0, units="bogus")  # type: ignore[arg-type]
@@ -160,7 +160,7 @@ def test_absolute_units_reproduce_legacy_tracker_math():
     maps.mean = torch.full((geo.n_pixels,), 0.1)
     maps.variance = torch.full((geo.n_pixels,), 0.25)
     ledger.write(maps, idx, 0, _plan())
-    spec = StageSpec([(0, 0, 4, 4)], n_psi=16, error=0.02)
+    spec = StageSpec.create([(0, 0, 4, 4)], n_psi=16, error=0.02)
     ZScoreIntervalClassifier(1.0, units="absolute")(ledger, idx, spec, 0)
     expected = classify_zscore_interval(
         zscore_error_intervals(0.02, maps.mip, maps.mean, maps.variance.sqrt()), 1.0
@@ -174,7 +174,7 @@ def test_threshold_top_fraction_chain_and_no_decision():
     idx = torch.arange(geo.n_pixels)
     z = torch.arange(geo.n_pixels, dtype=torch.float32)
     ledger.write(_maps(geo.n_pixels, zscore=z), idx, 0, _plan())
-    spec = StageSpec([(0, 0, 4, 4)], n_psi=16)
+    spec = StageSpec.create([(0, 0, 4, 4)], n_psi=16)
 
     NoDecision()(ledger, idx, spec, 0)
     assert torch.all(ledger.label == int(PixelLabel.UNCERTAIN))
@@ -208,7 +208,7 @@ def test_threshold_top_fraction_chain_and_no_decision():
     assert chain.pointwise is False and chain.requires_error is True
     assert DecisionChain(ThresholdClassifier(1.0)).pointwise is True
     ledger.label[:] = int(PixelLabel.UNCERTAIN)
-    chain(ledger, idx, StageSpec([(0, 0, 4, 4)], n_psi=16, error=0.01), 0)
+    chain(ledger, idx, StageSpec.create([(0, 0, 4, 4)], n_psi=16, error=0.01), 0)
     assert (ledger.label == int(PixelLabel.ABSORBED)).any()
     with pytest.raises(ValueError):
         TopFractionSelector()

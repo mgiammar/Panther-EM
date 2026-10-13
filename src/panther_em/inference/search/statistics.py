@@ -641,10 +641,8 @@ class BlockStats:
     n_psi : int
         In-plane samples.
     inkernel : bool
-        ``True`` when every batch takes the fused in-kernel accumulate path. Batches
-        are then fed the kernel-relative ``HypBatch.kernel_offset`` and epochs are
-        merged with their base (:meth:`FusedPixelStats.merge_packed`); otherwise the
-        full ``virtual_offset`` is used directly (int64, no epoch bookkeeping).
+        ``True`` when every batch takes the fused in-kernel accumulate path (the
+        packed best is folded once per block in :meth:`finalize_into`).
     """
 
     def __init__(
@@ -681,18 +679,9 @@ class BlockStats:
     @torch.no_grad()
     def consume(self, spectrum_pnf: torch.Tensor, batch: HypBatch, sub: int) -> None:
         """Accumulate one batch's spectrum ``(P_g, N_b, F)`` into sub-batch ``sub``."""
-        offset = batch.kernel_offset if self.inkernel else batch.virtual_offset
         self.stats[sub].update_graphed(
-            spectrum_pnf, offset, num_psi=self.n_psi, reverse_psi_axis=True
+            spectrum_pnf, batch.virtual_offset, num_psi=self.n_psi, reverse_psi_axis=True
         )
-
-    @torch.no_grad()
-    def end_epoch(self, base: int, sub: int) -> None:
-        """Fold an epoch's in-kernel packed best into the running best (fused only)."""
-        if self.inkernel:
-            merge = getattr(self.stats[sub], "merge_packed", None)
-            if merge is not None:
-                merge(hyp_base=base)
 
     def note_replayed(self, n_evaluated: int) -> None:
         """Set the per-pixel evaluation count after a CUDA-graph replay.

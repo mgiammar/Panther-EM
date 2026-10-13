@@ -7,22 +7,15 @@ here, only of the *decoding* of a best index.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple
+from dataclasses import dataclass
+from functools import cached_property
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 if TYPE_CHECKING:
     from panther_em.decomposition.result import DecompositionResult
-
-
-class HypothesisIndex(NamedTuple):
-    """Decoded components of a global hypothesis id (``-1`` passes through)."""
-
-    defocus: torch.Tensor
-    filter: torch.Tensor
-    orientation: torch.Tensor
 
 
 def psi_degrees(n_psi: int, device: torch.device | str = "cpu") -> torch.Tensor:
@@ -94,22 +87,10 @@ class HypothesisSpace:
         """``FF * O``: template rows of the weight matrix."""
         return self.n_filters * self.n_orientations
 
-    @property
-    def global_size(self) -> int:
-        """``D * FF * O``."""
-        return self.n_defocus * self.n_templates
-
-    def encode(
-        self, defocus: torch.Tensor, filter: torch.Tensor, orientation: torch.Tensor
-    ) -> torch.Tensor:
-        """Global ids from component indices (broadcasting, int64)."""
-        d = torch.as_tensor(defocus, dtype=torch.long)
-        f = torch.as_tensor(filter, dtype=torch.long)
-        o = torch.as_tensor(orientation, dtype=torch.long)
-        return (d * self.n_filters + f) * self.n_orientations + o
-
-    def decode(self, global_id: torch.Tensor) -> HypothesisIndex:
-        """Component indices of global ids; ``-1`` decodes to ``(-1, -1, -1)``."""
+    def decode(
+        self, global_id: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(defocus, filter, orientation)`` of global ids; ``-1`` stays ``-1``."""
         g = torch.as_tensor(global_id, dtype=torch.long)
         valid = g >= 0
         safe = torch.where(valid, g, torch.zeros_like(g))
@@ -118,35 +99,11 @@ class HypothesisSpace:
         f = rest % self.n_filters
         d = rest // self.n_filters
         neg = torch.full_like(g, -1)
-        return HypothesisIndex(
+        return (
             torch.where(valid, d, neg),
             torch.where(valid, f, neg),
             torch.where(valid, o, neg),
         )
-
-    def psi_degrees(
-        self, n_psi: int, device: torch.device | str = "cpu"
-    ) -> torch.Tensor:
-        """See :func:`psi_degrees`."""
-        return psi_degrees(n_psi, device)
-
-    def angles(
-        self, global_id: torch.Tensor, best_psi: torch.Tensor, n_psi: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``(phi, theta, psi)`` in degrees for decoded hypotheses; NaN for id -1."""
-        if self.phi_deg is None or self.theta_deg is None:
-            raise ValueError("this HypothesisSpace carries no phi/theta tables")
-        idx = self.decode(global_id)
-        valid = idx.orientation >= 0
-        o = torch.where(valid, idx.orientation, torch.zeros_like(idx.orientation))
-        psi_tab = self.psi_degrees(n_psi, device=torch.as_tensor(best_psi).device)
-        p = torch.as_tensor(best_psi, dtype=torch.long)
-        p_safe = torch.where(p >= 0, p, torch.zeros_like(p))
-        nan = torch.full(o.shape, float("nan"), dtype=torch.float32)
-        phi = torch.where(valid, self.phi_deg.to(o.device)[o], nan.to(o.device))
-        theta = torch.where(valid, self.theta_deg.to(o.device)[o], nan.to(o.device))
-        psi = torch.where(p >= 0, psi_tab[p_safe], nan.to(p.device))
-        return phi, theta, psi
 
 
 def _sorted_unique_ids(
@@ -167,68 +124,19 @@ def _sorted_unique_ids(
     return t
 
 
-@dataclass(frozen=True, eq=False)
-class HypothesisSubset:
-    """Restriction of a :class:`HypothesisSpace` to some templates/defocus planes.
-
-    ``None`` on either axis means "all". Ids are kept sorted-unique on the CPU.
-    """
-
-    template_ids: torch.Tensor | None = None
-    defocus_ids: torch.Tensor | None = None
-
-    @classmethod
-    def strided(
-        cls, space: HypothesisSpace, stride: int, phase: int = 0
-    ) -> HypothesisSubset:
-        """Every ``stride``-th template row (a scout pass), all defocus planes."""
-        if stride < 1:
-            raise ValueError("stride must be >= 1")
-        return cls(template_ids=torch.arange(phase, space.n_templates, stride))
-
-    @classmethod
-    def orientations(
-        cls,
-        space: HypothesisSpace,
-        orientation_ids: torch.Tensor,
-        filter_ids: torch.Tensor | None = None,
-    ) -> HypothesisSubset:
-        """Product of the given orientations with the given (default: all) filters."""
-        o = torch.as_tensor(orientation_ids, dtype=torch.long).reshape(-1)
-        f = (
-            torch.arange(space.n_filters)
-            if filter_ids is None
-            else torch.as_tensor(filter_ids, dtype=torch.long).reshape(-1)
-        )
-        rows = (f[:, None] * space.n_orientations + o[None, :]).reshape(-1)
-        return cls(template_ids=rows)
-
-    @classmethod
-    def from_mask(cls, space: HypothesisSpace, mask: torch.Tensor) -> HypothesisSubset:
-        """Templates where an ``(FF, O)`` bool mask is True."""
-        if tuple(mask.shape) != (space.n_filters, space.n_orientations):
-            raise ValueError(
-                "mask must have shape (FF, O) = "
-                f"{(space.n_filters, space.n_orientations)}"
-            )
-        rows = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(-1)
-        return cls(template_ids=rows)
-
-    @classmethod
-    def defocus(
-        cls, space: HypothesisSpace, defocus_ids: torch.Tensor
-    ) -> HypothesisSubset:
-        """A subset of the defocus planes, all templates."""
-        return cls(defocus_ids=torch.as_tensor(defocus_ids, dtype=torch.long))
-
-    def resolve(
-        self, space: HypothesisSpace
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Validated ``(template_ids, defocus_ids)`` against ``space`` (None = all)."""
-        return (
-            _sorted_unique_ids(self.template_ids, space.n_templates, "template_ids"),
-            _sorted_unique_ids(self.defocus_ids, space.n_defocus, "defocus_ids"),
-        )
+def template_rows_for(
+    space: HypothesisSpace,
+    orientation_ids: torch.Tensor,
+    filter_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Template rows ``f * O + o`` of the given orientations x (default: all) filters."""
+    o = torch.as_tensor(orientation_ids, dtype=torch.long).reshape(-1)
+    f = (
+        torch.arange(space.n_filters)
+        if filter_ids is None
+        else torch.as_tensor(filter_ids, dtype=torch.long).reshape(-1)
+    )
+    return (f[:, None] * space.n_orientations + o[None, :]).reshape(-1)
 
 
 @dataclass(frozen=True)
@@ -242,21 +150,14 @@ class HypBatch:
     j0, j1 : int
         Half-open range of selected-template positions.
     virtual_offset : int
-        ``d_local * N_sel + j0``: the batch's first virtual id.
-    kernel_offset : int
-        ``virtual_offset - epoch_base``: the offset actually handed to the fused
-        kernel, kept small enough that ``(kernel_offset + N_b) * n_psi`` fits the
-        kernel's 32-bit packed index.
-    epoch : int
-        Index of the epoch this batch belongs to (see :class:`HypothesisPlan`).
+        ``d_local * N_sel + j0``: the batch's first virtual id, handed to the
+        statistics kernels as the hypothesis offset of the batch.
     """
 
     d_local: int
     j0: int
     j1: int
     virtual_offset: int
-    kernel_offset: int
-    epoch: int
 
     @property
     def size(self) -> int:
@@ -264,82 +165,103 @@ class HypBatch:
         return self.j1 - self.j0
 
 
-@dataclass(frozen=True)
-class Epoch:
-    """A run of batches sharing a base virtual offset for the packed index."""
-
-    base: int
-    batches: slice  # into HypothesisPlan.batches
-
-
 @dataclass(frozen=True, eq=False)
-class HypothesisPlan:
-    """Enumeration of one stage's hypotheses into kernel-ready batches.
+class HypothesisSet:
+    """One stage's hypotheses, enumerated into kernel-ready batches.
+
+    Virtual ids run ``d_local * N_sel + j`` over the selected defocus planes (outer)
+    and selected template rows (inner); :meth:`decode` maps them back to global ids
+    ``d * FF * O + template``.
 
     Parameters
     ----------
     space : HypothesisSpace
         The full space.
-    subset : HypothesisSubset, optional
-        Restriction for this stage (``None`` = everything).
+    template_ids : torch.Tensor, optional
+        Rows of the ``FF * O`` weight matrix to search (``None`` = all); kept
+        sorted-unique on the CPU.
+    defocus_ids : torch.Tensor, optional
+        Defocus planes to search (``None`` = all); sorted-unique on the CPU.
     hyp_batch : int
         Hypotheses per contraction.
     n_psi : int
-        In-plane samples; sets the packed-index budget per epoch.
+        In-plane samples recovered per hypothesis.
     packed_index_bits : int, optional
-        Width of the kernel's packed ``(hyp, psi)`` index. Defaults to 32.
+        Width of the fused kernel's packed ``(hypothesis, psi)`` index. Every
+        ``(virtual id, psi)`` of the stage must fit it, so
+        ``n_virtual * n_psi < 2 ** packed_index_bits`` (8.4M hypotheses at
+        ``n_psi = 512`` for the default 32); split the CTF planes across stages
+        when a stage would exceed it. Defaults to 32.
     """
 
     space: HypothesisSpace
-    subset: HypothesisSubset | None
+    template_ids: torch.Tensor | None
+    defocus_ids: torch.Tensor | None
     hyp_batch: int
     n_psi: int
     packed_index_bits: int = 32
-    template_ids: torch.Tensor | None = field(init=False, default=None)
-    defocus_ids: torch.Tensor | None = field(init=False, default=None)
-    batches: tuple[HypBatch, ...] = field(init=False, default=())
-    epochs: tuple[Epoch, ...] = field(init=False, default=())
+
+    @classmethod
+    def create(
+        cls,
+        space: HypothesisSpace,
+        template_ids: torch.Tensor | None = None,
+        defocus_ids: torch.Tensor | None = None,
+        *,
+        hyp_batch: int,
+        n_psi: int,
+        packed_index_bits: int = 32,
+    ) -> HypothesisSet:
+        """Build a set from raw ids: any int tensor, any device, unsorted, repeated."""
+        return cls(
+            space,
+            _sorted_unique_ids(template_ids, space.n_templates, "template_ids"),
+            _sorted_unique_ids(defocus_ids, space.n_defocus, "defocus_ids"),
+            int(hyp_batch),
+            int(n_psi),
+            int(packed_index_bits),
+        )
 
     def __post_init__(self) -> None:
-        """Enumerate batches and epochs."""
+        """Validate (never coerce): ids sorted-unique CPU int64, budget respected."""
         if self.hyp_batch < 1:
             raise ValueError("hyp_batch must be >= 1")
         if self.n_psi < 2:
             raise ValueError("n_psi must be >= 2")
-        t_ids, d_ids = (
-            (None, None) if self.subset is None else self.subset.resolve(self.space)
-        )
-        object.__setattr__(self, "template_ids", t_ids)
-        object.__setattr__(self, "defocus_ids", d_ids)
-
-        n_sel = self.n_selected
-        limit = 1 << self.packed_index_bits
-        batches: list[HypBatch] = []
-        epochs: list[Epoch] = []
-        epoch_base = 0
-        epoch_start = 0
-        for d_local in range(self.n_defocus_selected):
-            for j0 in range(0, n_sel, self.hyp_batch):
-                j1 = min(j0 + self.hyp_batch, n_sel)
-                v = d_local * n_sel + j0
-                if (v - epoch_base + (j1 - j0)) * self.n_psi >= limit:
-                    if len(batches) > epoch_start:
-                        epochs.append(
-                            Epoch(epoch_base, slice(epoch_start, len(batches)))
-                        )
-                        epoch_start = len(batches)
-                    epoch_base = v
-                if (j1 - j0) * self.n_psi >= limit:
-                    raise ValueError(
-                        f"hyp_batch * n_psi = {(j1 - j0) * self.n_psi} exceeds the "
-                        f"{self.packed_index_bits}-bit packed index; reduce hyp_batch"
-                    )
-                batches.append(
-                    HypBatch(d_local, j0, j1, v, v - epoch_base, len(epochs))
+        for name, ids, upper in (
+            ("template_ids", self.template_ids, self.space.n_templates),
+            ("defocus_ids", self.defocus_ids, self.space.n_defocus),
+        ):
+            if ids is None:
+                continue
+            normalised = _sorted_unique_ids(ids, upper, name)
+            if (
+                normalised is None
+                or ids.device.type != "cpu"
+                or ids.dtype is not torch.long
+                or not torch.equal(ids, normalised)
+            ):
+                raise ValueError(
+                    f"{name} must be a sorted, unique CPU int64 tensor; build the set "
+                    "with HypothesisSet.create() to normalise raw ids"
                 )
-        epochs.append(Epoch(epoch_base, slice(epoch_start, len(batches))))
-        object.__setattr__(self, "batches", tuple(batches))
-        object.__setattr__(self, "epochs", tuple(epochs))
+        limit = 1 << self.packed_index_bits
+        if self.n_virtual * self.n_psi >= limit:
+            raise ValueError(
+                f"{self.n_virtual} hypotheses x {self.n_psi} in-plane angles exceed "
+                f"the kernel's {self.packed_index_bits}-bit packed index; split the "
+                "CTF planes (or the orientations) across stages"
+            )
+
+    @cached_property
+    def batches(self) -> tuple[HypBatch, ...]:
+        """Kernel-ready batches: selected planes outer, template rows inner."""
+        n_sel = self.n_selected
+        return tuple(
+            HypBatch(d_local, j0, min(j0 + self.hyp_batch, n_sel), d_local * n_sel + j0)
+            for d_local in range(self.n_defocus_selected)
+            for j0 in range(0, n_sel, self.hyp_batch)
+        )
 
     # -- sizes ---------------------------------------------------------------
 

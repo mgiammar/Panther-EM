@@ -12,7 +12,7 @@ from panther_em.inference.search.types import PixelSelection
 
 if TYPE_CHECKING:
     from panther_em.inference.search.executor import StageMaps
-    from panther_em.inference.search.hypotheses import HypothesisPlan
+    from panther_em.inference.search.hypotheses import HypothesisSet
     from panther_em.inference.search.types import SearchGeometry
 
 
@@ -102,7 +102,7 @@ class PixelLedger:
         maps: StageMaps,
         pixel_index: torch.Tensor,
         stage_index: int,
-        hyp_plan: HypothesisPlan,
+        hyp_plan: HypothesisSet,
     ) -> None:
         """Record a stage's maps at ``pixel_index`` (same order as the maps)."""
         idx = pixel_index.to(self.device, torch.long)

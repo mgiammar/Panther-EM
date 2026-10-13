@@ -29,7 +29,7 @@ Pipeline of one stage
 1. **Plan** (:mod:`.executor`, :mod:`.context`): batch shape, block size, contraction
    engine (:mod:`.contraction`: fp32 / tf32 complex GEMM or the fp16 "4M" GEMM),
    statistics backend (:mod:`.statistics`, :mod:`.fused_statistics`: pure torch or
-   the fused CUDA iRFFT+statistics kernel) and the :class:`~.hypotheses.HypothesisPlan`
+   the fused CUDA iRFFT+statistics kernel) and the :class:`~.hypotheses.HypothesisSet`
    (contiguous *virtual* ids over selected templates and defocus planes).
 2. **Featurize** (:mod:`.featurize`, :mod:`.store`): the pixels that survived the
    previous stage are cross-correlated with the kernels of every new rectangle, by
@@ -48,7 +48,7 @@ The two search types, as schedules
 1. **Single rank**: one dense stage::
 
        SearchSchedule.single(
-           StageSpec([(0, 0, 128, 64)], n_psi=256), ThresholdClassifier(7.8)
+           StageSpec.create([(0, 0, 128, 64)], n_psi=256), ThresholdClassifier(7.8)
        )
 
 2. **Pixel rejection**: a low-rank dense stage on one defocus plane rejects pixels; the
@@ -56,12 +56,12 @@ The two search types, as schedules
 
        SearchSchedule(
            (
-               StageSpec(
+               StageSpec.create(
                    [(0, 0, 32, 16)],
                    precision="fp16",
-                   hypotheses=HypothesisSubset(defocus_ids=torch.tensor([D // 2])),
+                   orientations=1, planes=(D // 2,)),
                ),
-               StageSpec([(0, 0, 128, 64)]),
+               StageSpec.create([(0, 0, 128, 64)]),
            ),
            (ZScoreIntervalClassifier(7.8), ThresholdClassifier(7.8)),
        )
@@ -122,9 +122,9 @@ from panther_em.inference.search.featurize import (
     make_featurizer,
 )
 from panther_em.inference.search.hypotheses import (
-    HypothesisPlan,
+    HypBatch,
+    HypothesisSet,
     HypothesisSpace,
-    HypothesisSubset,
     healpix_ipix,
     healpix_level_ids,
     healpix_orientations,
@@ -168,9 +168,9 @@ __all__ = [
     "FeatureLayout",
     "FeatureStore",
     "Featurizer",
-    "HypothesisPlan",
+    "HypBatch",
+    "HypothesisSet",
     "HypothesisSpace",
-    "HypothesisSubset",
     "ImageSet",
     "InnerProductFeaturizer",
     "KernelBank",

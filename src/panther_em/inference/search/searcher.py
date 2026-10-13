@@ -33,7 +33,7 @@ from panther_em.inference.search.executor import (
     plan_stage,
 )
 from panther_em.inference.search.featurize import make_featurizer
-from panther_em.inference.search.hypotheses import HypothesisSpace
+from panther_em.inference.search.hypotheses import HypothesisSpace, healpix_ipix
 from panther_em.inference.search.ledger import PixelLedger
 from panther_em.inference.search.results import SearchResult, StageResult
 from panther_em.inference.search.schedule import ErrorModel
@@ -151,6 +151,12 @@ class Searcher:
             schedule = schedule.with_errors(model)
         self.schedule = schedule
         self._featurizer = featurizer
+        # NESTED HEALPix ids of the template's orientations, when a stage samples
+        # orientations by HEALPix level (None otherwise, or when not HEALPix)
+        self.ipix = None
+        if any(isinstance(s.orientations, int) for s in schedule.stages):
+            found = healpix_ipix(self.space)
+            self.ipix = None if found is None else found[1]
         self.ctx = SearchContext(
             template.device,
             template.weights,
@@ -170,8 +176,14 @@ class Searcher:
                     )
             if spec.precision is Precision.FP16 and not self.ctx.caps.is_cuda:
                 raise ValueError(f"stage {i}: fp16 needs a CUDA device")
-            if spec.hypotheses is not None:
-                spec.hypotheses.resolve(self.space)
+            template_ids, defocus_ids = spec.hypothesis_ids(self.space, self.ipix)
+            if defocus_ids is not None and int(defocus_ids.max()) >= self.space.n_defocus:
+                raise ValueError(
+                    f"stage {i}: planes {spec.planes} exceed the {self.space.n_defocus} "
+                    "defocus plane(s) of the searcher"
+                )
+            if template_ids is not None and int(template_ids.max()) >= self.space.n_templates:
+                raise ValueError(f"stage {i}: orientation ids exceed the template's")
 
     @property
     def device(self) -> torch.device:
@@ -313,12 +325,14 @@ class SearchSession:
         spec = searcher.schedule.stages[index]
         t0 = time.perf_counter()
         self._mark(f"stage{index}:start")
+        template_ids, defocus_ids = spec.hypothesis_ids(searcher.space, searcher.ipix)
         memory, backend, engine, hyp_plan = plan_memory(
             searcher.ctx,
             spec,
             n_pixels=len(self.pixels),
             space=searcher.space,
-            subset=spec.hypotheses,
+            template_ids=template_ids,
+            defocus_ids=defocus_ids,
             batch=exe.batch,
             block_pixels=exe.block_pixels,
             use_cuda_graph=exe.use_cuda_graph,

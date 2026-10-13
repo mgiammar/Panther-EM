@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
     from panther_em.inference.search.basis import PreparedWeightCache, WeightSource
     from panther_em.inference.search.contraction import ContractionEngine
-    from panther_em.inference.search.hypotheses import HypothesisPlan
+    from panther_em.inference.search.hypotheses import HypothesisSet
     from panther_em.inference.search.tiling import FeatureLayout
     from panther_em.inference.search.types import BatchShape, Precision
 
@@ -303,7 +303,7 @@ class LoopInputs:
     plane_lookup : tuple[tuple[tuple[int, int], ...], ...]
         ``plane_lookup[rect_index][d_local] -> (group id, local plane index)``.
     engine : ContractionEngine
-    hyp_plan : HypothesisPlan
+    hyp_plan : HypothesisSet
     prepared : Mapping[tuple[int, int], torch.Tensor]
         ``(k_run index, batch index) -> B operand``.
     memory : MemoryPlan
@@ -313,7 +313,7 @@ class LoopInputs:
     layout: FeatureLayout
     plane_lookup: tuple[tuple[tuple[int, int], ...], ...]
     engine: ContractionEngine
-    hyp_plan: HypothesisPlan
+    hyp_plan: HypothesisSet
     prepared: Mapping[tuple[int, int], torch.Tensor]
     memory: MemoryPlan
     n_freq: int
@@ -364,32 +364,26 @@ def _loop_body(
         if n_valid is not None and p0 >= n_valid:
             break
         p1 = p0 + memory.gemm_pixels
-        for epoch in plan.epochs:
-            for batch_index in range(epoch.batches.start, epoch.batches.stop):
-                batch = plan.batches[batch_index]
-                spectrum = spectra[batch.size]
-                for run_index, run in enumerate(inputs.layout.k_runs):
-                    a_parts = []
-                    for part in run.parts:
-                        gid, local_plane = inputs.plane_lookup[part.rect][batch.d_local]
-                        k_start = inputs.layout.rectangles[part.rect][0]
-                        a_parts.append(
-                            engine.operand(
-                                operands[gid],
-                                local_plane,
-                                run.k_start - k_start,
-                                run.k_stop - k_start,
-                                p0,
-                                p1,
-                            )
+        for batch_index, batch in enumerate(plan.batches):
+            spectrum = spectra[batch.size]
+            for run_index, run in enumerate(inputs.layout.k_runs):
+                a_parts = []
+                for part in run.parts:
+                    gid, local_plane = inputs.plane_lookup[part.rect][batch.d_local]
+                    k_start = inputs.layout.rectangles[part.rect][0]
+                    a_parts.append(
+                        engine.operand(
+                            operands[gid],
+                            local_plane,
+                            run.k_start - k_start,
+                            run.k_stop - k_start,
+                            p0,
+                            p1,
                         )
-                    weights = inputs.prepared[(run_index, batch_index)]
-                    engine.contract(a_parts, [weights], run, spectrum)
-                stats.consume(spectrum.pnf(), batch, sub)
-            if len(plan.epochs) > 1:
-                # a single epoch (base 0) is folded once per block in finalize_into;
-                # per-sub-batch merges here were ~6 small launches x n_sub per block
-                stats.end_epoch(epoch.base, sub)
+                    )
+                weights = inputs.prepared[(run_index, batch_index)]
+                engine.contract(a_parts, [weights], run, spectrum)
+            stats.consume(spectrum.pnf(), batch, sub)
 
 
 class EagerHypLoop:

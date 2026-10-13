@@ -18,11 +18,7 @@ from panther_em.inference.search.executor import (
     plan_memory,
     plan_stage,
 )
-from panther_em.inference.search.hypotheses import (
-    HypothesisPlan,
-    HypothesisSpace,
-    HypothesisSubset,
-)
+from panther_em.inference.search.hypotheses import HypothesisSet, HypothesisSpace
 from panther_em.inference.search.schedule import StageSpec
 from panther_em.inference.search.store import FeatureStore
 from panther_em.inference.search.types import (
@@ -110,7 +106,8 @@ def _run_stage(
     store,
     space,
     *,
-    subset=None,
+    template_ids=None,
+    defocus_ids=None,
     batch=None,
     use_cuda_graph=False,
     use_fused_kernel=True,
@@ -120,7 +117,8 @@ def _run_stage(
         spec,
         n_pixels=store.n_pixels,
         space=space,
-        subset=subset,
+        template_ids=template_ids,
+        defocus_ids=defocus_ids,
         batch=batch,
         block_pixels=store.block_pixels,
         use_cuda_graph=use_cuda_graph,
@@ -146,7 +144,7 @@ def _assert_matches(maps, ref, hyp_plan, *, rtol=1e-4, atol=1e-4):
 def test_cpu_eager_matches_reference_any_block_size(synthetic_result, block_pixels):
     result = synthetic_result()
     space = HypothesisSpace.from_result(result)
-    spec = StageSpec([(0, 0, 4, 3), (0, 3, 2, 2)], precision="fp32", n_psi=16)
+    spec = StageSpec.create([(0, 0, 4, 3), (0, 3, 2, 2)], precision="fp32", n_psi=16)
     store, features = _fill_store(result, spec, 1, block_pixels, "cpu")
     ctx = SearchContext("cpu", WeightSource(result, "cpu"))
     plan, maps = _run_stage(ctx, result, spec, store, space, batch=BatchShape(4, 4))
@@ -160,15 +158,15 @@ def test_cpu_eager_matches_reference_any_block_size(synthetic_result, block_pixe
 def test_defocus_axis_reduces_over_planes(synthetic_result):
     result = synthetic_result()
     space = HypothesisSpace.from_result(result, n_defocus=3)
-    spec = StageSpec([(0, 0, 4, 5)], n_psi=16)
+    spec = StageSpec.create([(0, 0, 4, 5)], n_psi=16)
     store, features = _fill_store(result, spec, 3, 8, "cpu")
     ctx = SearchContext("cpu", WeightSource(result, "cpu"))
     plan, maps = _run_stage(ctx, result, spec, store, space, batch=BatchShape(4, 6))
     ref = _reference(result, spec, features, plan.hyp_plan, 16)
     _assert_matches(maps, ref, plan.hyp_plan)
     # the best virtual id decodes to a (defocus, filter, orientation) triple
-    decoded = space.decode(plan.hyp_plan.decode(maps.best_virtual))
-    assert decoded.defocus.max() <= 2 and decoded.orientation.max() <= 5
+    decoded_d, _, decoded_o = space.decode(plan.hyp_plan.decode(maps.best_virtual))
+    assert decoded_d.max() <= 2 and decoded_o.max() <= 5
     # equals the plane-wise maximum of three single-plane searches
     per_plane = []
     for d in range(3):
@@ -191,21 +189,25 @@ def test_strided_subset_matches_restricted_reference_and_decodes_globally(
 ):
     result = synthetic_result(n_filters=2, n_orientations=5)
     space = HypothesisSpace.from_result(result, n_defocus=2)
-    spec = StageSpec([(0, 0, 3, 4)], n_psi=16)
+    spec = StageSpec.create([(0, 0, 3, 4)], n_psi=16)
     store, features = _fill_store(result, spec, 2, 25, "cpu")
     ctx = SearchContext("cpu", WeightSource(result, "cpu"))
-    subset = HypothesisSubset(
-        template_ids=torch.arange(1, 10, 3), defocus_ids=torch.tensor([1])
-    )
     plan, maps = _run_stage(
-        ctx, result, spec, store, space, subset=subset, batch=BatchShape(5, 2)
+        ctx,
+        result,
+        spec,
+        store,
+        space,
+        template_ids=torch.arange(1, 10, 3),
+        defocus_ids=torch.tensor([1]),
+        batch=BatchShape(5, 2),
     )
     assert plan.hyp_plan.n_virtual == 3 and not plan.hyp_plan.is_contiguous
     ref = _reference(result, spec, features, plan.hyp_plan, 16)
     _assert_matches(maps, ref, plan.hyp_plan)
     global_ids = plan.hyp_plan.decode(maps.best_virtual)
-    decoded = space.decode(global_ids)
-    assert torch.all(decoded.defocus == 1)
+    decoded_d, _, _ = space.decode(global_ids)
+    assert torch.all(decoded_d == 1)
     assert set(global_ids.tolist()) <= {1 * 10 + t for t in (1, 4, 7)}
 
 
@@ -258,7 +260,7 @@ def test_cuda_fused_eager_and_graph_match_reference(synthetic_result, precision)
     device = torch.device("cuda")
     result = synthetic_result(n_orientations=8)
     space = HypothesisSpace.from_result(result, n_defocus=2)
-    spec = StageSpec([(0, 0, 4, 3), (0, 3, 2, 2)], precision=precision, n_psi=128)
+    spec = StageSpec.create([(0, 0, 4, 3), (0, 3, 2, 2)], precision=precision, n_psi=128)
     store, features = _fill_store(result, spec, 2, 8, device)
     ctx = SearchContext(device, WeightSource(result, device))
     tol = (
@@ -290,35 +292,6 @@ def test_cuda_fused_eager_and_graph_match_reference(synthetic_result, precision)
         ctx, result, spec, store, space, batch=BatchShape(4, 4), use_cuda_graph=True
     )
     assert len(ctx.loops) == n_loops
-
-
-@pytest.mark.skipif(not CUDA, reason="needs CUDA")
-def test_cuda_epochs_merge_with_base(synthetic_result, monkeypatch):
-    """Force several epochs through a narrow packed-index budget on the fused path."""
-    device = torch.device("cuda")
-    result = synthetic_result(n_orientations=12)
-    space = HypothesisSpace.from_result(result, n_defocus=2)
-    spec = StageSpec([(0, 0, 4, 5)], n_psi=128)
-    store, features = _fill_store(result, spec, 2, 8, device)
-    ctx = SearchContext(device, WeightSource(result, device))
-    import panther_em.inference.search.executor as executor_mod
-
-    original = executor_mod.HypothesisPlan
-
-    def narrow(space, subset, hyp_batch, n_psi):
-        return original(
-            space, subset, hyp_batch=hyp_batch, n_psi=n_psi, packed_index_bits=10
-        )
-
-    monkeypatch.setattr(executor_mod, "HypothesisPlan", narrow)
-    plan, maps = _run_stage(
-        ctx, result, spec, store, space, batch=BatchShape(4, 2), use_cuda_graph=True
-    )
-    assert len(plan.hyp_plan.epochs) > 1
-    ref = _reference(
-        result, spec, features, HypothesisPlan(space, None, hyp_batch=2, n_psi=128), 128
-    )
-    _assert_matches(maps, ref, plan.hyp_plan)
 
 
 def _fill_store_split(result, spec, plane_groups, block_pixels, device, seed=0):
@@ -356,7 +329,7 @@ def _fill_store_split(result, spec, plane_groups, block_pixels, device, seed=0):
 def test_planes_split_across_groups_match_dense_reference(synthetic_result):
     result = synthetic_result()
     space = HypothesisSpace.from_result(result, n_defocus=3)
-    spec = StageSpec([(0, 0, 4, 3), (0, 3, 2, 2)], n_psi=16)
+    spec = StageSpec.create([(0, 0, 4, 3), (0, 3, 2, 2)], n_psi=16)
     store, features = _fill_store_split(result, spec, ((0, 2), (1,)), 8, "cpu")
     assert [g.planes for g in store.groups] == [(0, 2), (1,), (0, 2), (1,)]
     ctx = SearchContext("cpu", WeightSource(result, "cpu"))
@@ -370,9 +343,8 @@ def test_planes_split_across_groups_match_dense_reference(synthetic_result):
     )
 
     # a stage restricted to plane 2 reads only the first group's local slab 1
-    subset = HypothesisSubset.defocus(space, torch.tensor([2]))
     plan2, maps2 = _run_stage(
-        ctx, result, spec, store, space, subset=subset, batch=BatchShape(4, 6)
+        ctx, result, spec, store, space, defocus_ids=torch.tensor([2]), batch=BatchShape(4, 6)
     )
     assert plan2.plane_lookup[0] == ((0, 1),) and len(plan2.groups) == 2
     _assert_matches(
@@ -388,7 +360,7 @@ def test_cuda_pinned_host_store_streams_blocks_and_matches_device(synthetic_resu
     device = torch.device("cuda")
     result = synthetic_result(n_orientations=8)
     space = HypothesisSpace.from_result(result, n_defocus=2)
-    spec = StageSpec([(0, 0, 4, 3), (0, 3, 2, 2)], precision="fp16", n_psi=128)
+    spec = StageSpec.create([(0, 0, 4, 3), (0, 3, 2, 2)], precision="fp16", n_psi=128)
     ctx = SearchContext(device, WeightSource(result, device))
     runs = {}
     for residency in ("device", "pinned_host"):

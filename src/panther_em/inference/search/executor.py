@@ -21,7 +21,7 @@ from panther_em.inference.search.context import (
     choose_stats_backend,
 )
 from panther_em.inference.search.contraction import make_engine
-from panther_em.inference.search.hypotheses import HypothesisPlan
+from panther_em.inference.search.hypotheses import HypothesisSet
 from panther_em.inference.search.statistics import SpectrumSpec
 
 if TYPE_CHECKING:
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
     from panther_em.inference.search.context import SearchContext
     from panther_em.inference.search.contraction import ContractionEngine
-    from panther_em.inference.search.hypotheses import HypothesisSpace, HypothesisSubset
+    from panther_em.inference.search.hypotheses import HypothesisSpace
     from panther_em.inference.search.schedule import StageSpec
     from panther_em.inference.search.statistics import StatsBackend
     from panther_em.inference.search.store import ColumnGroup, FeatureStore
@@ -77,14 +77,15 @@ def plan_memory(
     *,
     n_pixels: int,
     space: HypothesisSpace,
-    subset: HypothesisSubset | None = None,
+    template_ids: torch.Tensor | None = None,
+    defocus_ids: torch.Tensor | None = None,
     batch: BatchShape | None = None,
     block_pixels: int | None = None,
     use_cuda_graph: bool = True,
     use_fused_kernel: bool = True,
     store: FeatureStore | None = None,
     residency: Residency | Literal["auto"] = "auto",
-) -> tuple[MemoryPlan, StatsBackend, ContractionEngine, HypothesisPlan]:
+) -> tuple[MemoryPlan, StatsBackend, ContractionEngine, HypothesisSet]:
     """Resolve batch shape, block size, engine, stats backend and hypothesis plan.
 
     Notes
@@ -93,7 +94,9 @@ def plan_memory(
     will actually be resident, including planes held beyond the stage's own.
     """
     engine = make_engine(spec.precision)
-    provisional = HypothesisPlan(space, subset, hyp_batch=1, n_psi=spec.n_psi)
+    provisional = HypothesisSet.create(
+        space, template_ids, defocus_ids, hyp_batch=1, n_psi=spec.n_psi
+    )
     n_virtual = provisional.n_virtual
     planes = provisional.defocus_planes()
     per_pixel = feature_bytes_per_pixel(resident_groups(spec, planes, store))
@@ -126,8 +129,8 @@ def plan_memory(
         use_cuda_graph=use_cuda_graph,
         residency=residency,
     )
-    hyp_plan = HypothesisPlan(
-        space, subset, hyp_batch=memory.hyp_batch, n_psi=spec.n_psi
+    hyp_plan = HypothesisSet.create(
+        space, template_ids, defocus_ids, hyp_batch=memory.hyp_batch, n_psi=spec.n_psi
     )
     return memory, backend, engine, hyp_plan
 
@@ -150,7 +153,7 @@ class StagePlan:
     stats_backend : StatsBackend
     spectrum : SpectrumSpec
     memory : MemoryPlan
-    hyp_plan : HypothesisPlan
+    hyp_plan : HypothesisSet
     signature : tuple
         Cache identity of the hypothesis loop (layout, precision, shapes, hypotheses).
     """
@@ -164,7 +167,7 @@ class StagePlan:
     stats_backend: StatsBackend
     spectrum: SpectrumSpec
     memory: MemoryPlan
-    hyp_plan: HypothesisPlan
+    hyp_plan: HypothesisSet
     signature: tuple
 
     @property
@@ -181,7 +184,7 @@ def plan_stage(
     memory: MemoryPlan,
     backend: StatsBackend,
     engine: ContractionEngine,
-    hyp_plan: HypothesisPlan,
+    hyp_plan: HypothesisSet,
 ) -> StagePlan:
     """Freeze a stage plan against a store whose groups already exist."""
     layout = spec.layout()

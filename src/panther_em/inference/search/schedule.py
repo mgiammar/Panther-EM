@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from panther_em.decomposition.result import DecompositionResult
-    from panther_em.inference.search.hypotheses import HypothesisSubset
+    from panther_em.inference.search.hypotheses import HypothesisSpace
 
 
 def _as_rectangles(rectangles: Sequence[Sequence[int]]) -> tuple[Rectangle, ...]:
@@ -67,8 +67,14 @@ class StageSpec:
     error : float, optional
         **Relative** L2 reconstruction error ``rho`` of the templates from this
         stage's features. ``None`` means "derive from an :class:`ErrorModel`".
-    hypotheses : HypothesisSubset, optional
-        Restrict this stage to a subset of the hypothesis space (e.g. a scout pass).
+    orientations : int or torch.Tensor, optional
+        Orientation sampling of the stage: ``None`` searches every orientation; an
+        int ``L`` keeps one orientation per HEALPix pixel ``L`` levels coarser than
+        the template's sampling (the template's Euler angles must be HEALPix pixel
+        centers, see :func:`~.hypotheses.healpix_orientations`); a tensor lists
+        explicit orientation ids. Every Fourier filter is searched either way.
+    planes : sequence of int, optional
+        CTF (defocus) planes searched in this stage; ``None`` = all.
     name : str, optional
         Free-form label.
     """
@@ -77,12 +83,46 @@ class StageSpec:
     precision: Precision = Precision.FP32
     n_psi: int = 256
     error: float | None = None
-    hypotheses: HypothesisSubset | None = None
+    orientations: int | torch.Tensor | None = None
+    planes: tuple[int, ...] | None = None
     name: str = ""
 
+    @classmethod
+    def create(
+        cls,
+        rectangles: Rectangle | Sequence[Rectangle],
+        *,
+        precision: Precision | str = Precision.FP32,
+        n_psi: int = 256,
+        error: float | None = None,
+        orientations: int | Sequence[int] | torch.Tensor | None = None,
+        planes: Sequence[int] | None = None,
+        name: str = "",
+    ) -> StageSpec:
+        """Build a stage from loose inputs: one rectangle or many, precision by name,
+        planes in any order, orientation ids as any int sequence or tensor."""
+        if orientations is not None and not isinstance(orientations, int):
+            orientations = (
+                torch.as_tensor(orientations, dtype=torch.long).reshape(-1).cpu()
+            )
+        return cls(
+            rectangles=_normalize_rectangles(rectangles),
+            precision=Precision.coerce(precision),
+            n_psi=int(n_psi),
+            error=None if error is None else float(error),
+            orientations=orientations,
+            planes=None if planes is None else tuple(sorted({int(p) for p in planes})),
+            name=str(name),
+        )
+
     def __post_init__(self) -> None:
-        """Normalise rectangles/precision and validate the psi cap."""
-        rects = _as_rectangles(self.rectangles)
+        """Validate (never coerce); :meth:`create` normalises loose inputs."""
+        rects = self.rectangles
+        if not isinstance(rects, tuple) or rects != _as_rectangles(rects):
+            raise ValueError(
+                "rectangles must be a tuple of (k_start, m_start, k_extent, m_extent) "
+                "int tuples; build the stage with StageSpec.create()"
+            )
         if not rects:
             raise ValueError("a stage needs at least one rectangle")
         if not rectangles_disjoint(rects):
@@ -90,10 +130,9 @@ class StageSpec:
                 "rectangles within a stage must be pairwise cell-disjoint or the "
                 "contraction would double count"
             )
-        object.__setattr__(self, "rectangles", rects)
-        object.__setattr__(self, "precision", Precision.coerce(self.precision))
-        n_psi = int(self.n_psi)
-        object.__setattr__(self, "n_psi", n_psi)
+        if not isinstance(self.precision, Precision):
+            raise ValueError("precision must be a Precision; see StageSpec.create()")
+        n_psi = self.n_psi
         k_stop = self.k_stop
         if k_stop > n_psi // 2 + 1:
             raise ValueError(
@@ -106,6 +145,59 @@ class StageSpec:
             raise ValueError(
                 f"error must be a relative error in [0, 1), got {self.error}"
             )
+        if self.planes is not None:
+            if (
+                not isinstance(self.planes, tuple)
+                or not self.planes
+                or self.planes != tuple(sorted(set(self.planes)))
+                or self.planes[0] < 0
+            ):
+                raise ValueError(
+                    "planes must be a sorted tuple of distinct plane ids >= 0; see "
+                    "StageSpec.create()"
+                )
+        if isinstance(self.orientations, int):
+            if self.orientations < 0:
+                raise ValueError("orientations level must be >= 0")
+        elif self.orientations is not None and (
+            not isinstance(self.orientations, torch.Tensor)
+            or self.orientations.dtype is not torch.long
+            or self.orientations.dim() != 1
+        ):
+            raise ValueError(
+                "orientations must be None, a HEALPix level or a 1-D int64 tensor of "
+                "orientation ids; see StageSpec.create()"
+            )
+
+    def hypothesis_ids(
+        self, space: HypothesisSpace, ipix: np.ndarray | None = None
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """``(template_ids, defocus_ids)`` of this stage (``None`` = all).
+
+        ``ipix`` are the template's NESTED HEALPix pixel ids
+        (:func:`~.hypotheses.healpix_ipix`), needed when ``orientations`` is a level.
+        """
+        from panther_em.inference.search.hypotheses import (
+            healpix_level_ids,
+            template_rows_for,
+        )
+
+        planes = None if self.planes is None else torch.tensor(self.planes)
+        if self.orientations is None or (
+            isinstance(self.orientations, int) and self.orientations == 0
+        ):
+            return None, planes
+        if isinstance(self.orientations, int):
+            if ipix is None:
+                raise ValueError(
+                    f"stage {self.name!r}: orientations={self.orientations} needs a "
+                    "template whose Euler angles are HEALPix pixel centers (see "
+                    "healpix_orientations); pass explicit orientation ids otherwise"
+                )
+            ids = healpix_level_ids(ipix, self.orientations)
+        else:
+            ids = self.orientations
+        return template_rows_for(space, ids), planes
 
     @property
     def k_stop(self) -> int:
@@ -339,7 +431,8 @@ def nested_schedule(
     errors: Sequence[float | None] | None = None,
     error_model: ErrorModel | None = None,
     decision: Decision | Sequence[Decision] | None = None,
-    scout: HypothesisSubset | None = None,
+    orientations: int | torch.Tensor | None = None,
+    planes: Sequence[int] | None = None,
     stop_when_empty: bool = True,
     keep_stage_results: bool = False,
 ) -> SearchSchedule:
@@ -357,8 +450,9 @@ def nested_schedule(
         Fills any missing errors.
     decision : Decision or per-stage sequence, optional
         Defaults to :class:`NoDecision` everywhere.
-    scout : HypothesisSubset, optional
-        Applied to the first stage only.
+    orientations, planes : optional
+        Orientation sampling and CTF planes of the **first** stage only (see
+        :class:`StageSpec`); later stages search everything.
     stop_when_empty, keep_stage_results : bool, optional
         Forwarded to :class:`SearchSchedule`.
     """
@@ -375,12 +469,13 @@ def nested_schedule(
     )
 
     stages = tuple(
-        StageSpec(
+        StageSpec.create(
             ((0, 0, int(k_ext), int(m_ext)),),
             precision=Precision.coerce(p),
             n_psi=int(ps),
             error=e,
-            hypotheses=scout if i == 0 else None,
+            orientations=orientations if i == 0 else None,
+            planes=tuple(planes) if (i == 0 and planes is not None) else None,
             name=f"stage{i}",
         )
         for i, ((k_ext, m_ext), p, ps, e) in enumerate(

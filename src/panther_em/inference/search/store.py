@@ -184,12 +184,13 @@ class _PinnedBlockSource:
     def _issue(self, i: int) -> torch.cuda.Event:
         slot = i % self._store.n_slots
         with torch.cuda.stream(self._stream):
-            if self._free[slot] is not None:
-                self._stream.wait_event(self._free[slot])
+            free = self._free[slot]
+            if free is not None:
+                self._stream.wait_event(free)
             for g in self._groups:
                 self._slots[g.id][slot].copy_(g.blocks[i], non_blocking=True)
             ready = torch.cuda.Event()  # type: ignore[no-untyped-call]
-            ready.record(self._stream)  # type: ignore[no-untyped-call]
+            ready.record(self._stream)
         return ready
 
     def __iter__(self) -> Iterator[ReadyBlock]:
@@ -202,7 +203,7 @@ class _PinnedBlockSource:
             def release(done: torch.cuda.Event | None, slot: int = slot) -> None:
                 if done is None:
                     done = torch.cuda.Event()  # type: ignore[no-untyped-call]
-                    done.record(  # type: ignore[no-untyped-call]
+                    done.record(
                         torch.cuda.current_stream(self._store.device)
                     )
                 self._free[slot] = done

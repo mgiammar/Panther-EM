@@ -16,7 +16,6 @@ from panther_em.inference.search.decisions import (
     ZScoreIntervalClassifier,
 )
 from panther_em.inference.search.featurize import ImageBatch, TileSchedule
-from panther_em.inference.search.hypotheses import HypothesisSubset
 from panther_em.inference.search.ledger import PixelLabel
 from panther_em.inference.search.results import SearchResult, StageResult
 from panther_em.inference.search.schedule import (
@@ -129,7 +128,7 @@ def test_single_stage_matches_dense_reference(template):
     rects = [(0, 0, 4, 3), (0, 3, 2, 2)]
     mip, mean, var, best, psi, unique = _dense_reference(template, image, rects, 16)
     searcher = Searcher(
-        template, SearchSchedule.single(StageSpec(rects, n_psi=16)), execution=EXEC
+        template, SearchSchedule.single(StageSpec.create(rects, n_psi=16)), execution=EXEC
     )
     res = searcher.run(ImageSet.single(image))
     assert res.mip.shape == (1, 11, 11)
@@ -148,7 +147,7 @@ def test_multi_stage_reuses_features_and_matches_single_stage_runs(template):
     image = _image(seed=3)
     stage_rects = [[(0, 0, 2, 2)], [(0, 0, 2, 2), (0, 2, 4, 3)], [(0, 0, 4, 5)]]
     schedule = SearchSchedule(
-        tuple(StageSpec(r, n_psi=16) for r in stage_rects),
+        tuple(StageSpec.create(r, n_psi=16) for r in stage_rects),
         (
             TopFractionSelector(fraction=0.5),
             TopFractionSelector(fraction=0.5),
@@ -224,15 +223,15 @@ def test_fp32_after_fp16_needs_cuda_and_validation(template):
         Searcher(
             template,
             SearchSchedule.single(
-                StageSpec([(0, 0, 2, 2)], precision="fp16", n_psi=16)
+                StageSpec.create([(0, 0, 2, 2)], precision="fp16", n_psi=16)
             ),
         )
     with pytest.raises(ValueError, match="exceeds"):
-        Searcher(template, SearchSchedule.single(StageSpec([(0, 0, 8, 2)], n_psi=32)))
+        Searcher(template, SearchSchedule.single(StageSpec.create([(0, 0, 8, 2)], n_psi=32)))
     with pytest.raises(ValueError, match="defocus"):
         Searcher(
             template,
-            SearchSchedule.single(StageSpec([(0, 0, 2, 2)], n_psi=16)),
+            SearchSchedule.single(StageSpec.create([(0, 0, 2, 2)], n_psi=16)),
             n_defocus=2,
         ).session(ImageSet.single(_image()))
 
@@ -255,8 +254,8 @@ def test_error_model_fills_missing_errors_and_decision_uses_them(template):
 
 def test_center_mode_defocus_subset_and_run_many(template):
     stub = StubFeaturizer()
-    scout = HypothesisSubset.strided(template.space, 2)
-    schedule = nested_schedule([(3, 3)], n_psi=16, scout=scout)
+    coarse = torch.arange(0, template.space.n_orientations, 2)
+    schedule = nested_schedule([(3, 3)], n_psi=16, orientations=coarse)
     searcher = Searcher(
         template,
         schedule,
@@ -387,12 +386,12 @@ def test_stage_planes_are_featurized_only_where_needed(template):
     rect = (0, 0, 3, 3)
     schedule = SearchSchedule(
         (
-            StageSpec(
+            StageSpec.create(
                 [rect],
                 n_psi=16,
-                hypotheses=HypothesisSubset(defocus_ids=torch.tensor([1])),
+                planes=(1,),
             ),
-            StageSpec([rect], n_psi=16),
+            StageSpec.create([rect], n_psi=16),
         ),
         (TopFractionSelector(fraction=0.5), NoDecision()),
         keep_stage_results=True,
@@ -414,7 +413,7 @@ def test_stage_planes_are_featurized_only_where_needed(template):
     mask.reshape(-1)[stages[1].pixel_index] = True
     fresh = Searcher(
         template,
-        SearchSchedule.single(StageSpec([rect], n_psi=16)),
+        SearchSchedule.single(StageSpec.create([rect], n_psi=16)),
         execution=EXEC,
         featurizer=StubFeaturizer(),
         n_defocus=space_planes,
@@ -441,7 +440,7 @@ def test_session_store_is_released_after_the_session(template):
     stub = StubFeaturizer()
     searcher = Searcher(
         template,
-        SearchSchedule.single(StageSpec([(0, 0, 4, 5)], n_psi=16)),
+        SearchSchedule.single(StageSpec.create([(0, 0, 4, 5)], n_psi=16)),
         execution=EXEC,
         featurizer=stub,
     )

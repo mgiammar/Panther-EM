@@ -177,7 +177,7 @@ def test_prepared_weight_cache_hits_evicts_and_pins(recon):
     src = WeightSource(recon.result, "cpu")
     engine = ComplexGemmEngine()
     run = layout.k_runs[0]  # k in [0, 3): both first rectangles
-    batch = HypBatch(0, 1, 5, 1, 1, 0)
+    batch = HypBatch(0, 1, 5, 1)
 
     cache = PreparedWeightCache(src)
     got = cache.get(layout, run, batch, engine)
@@ -189,7 +189,7 @@ def test_prepared_weight_cache_hits_evicts_and_pins(recon):
     assert cache.get(layout, run, batch, engine) is got
 
     rows = torch.tensor([0, 2, 4, 5])
-    sub = cache.get(layout, run, HypBatch(0, 0, 2, 0, 0, 0), engine, rows, rows_key="r")
+    sub = cache.get(layout, run, HypBatch(0, 0, 2, 0), engine, rows, rows_key="r")
     torch.testing.assert_close(
         sub,
         engine.prepare_weights(
@@ -205,7 +205,7 @@ def test_prepared_weight_cache_hits_evicts_and_pins(recon):
     tiny.pin("graph", [PreparedWeightCache.key(layout, run, batch, engine, None)])
     b = tiny.get(layout, layout.k_runs[1], batch, engine)  # over budget, newest: kept
     assert tiny.get(layout, layout.k_runs[1], batch, engine) is b
-    tiny.get(layout, run, HypBatch(0, 0, 1, 0, 0, 0), engine)  # third entry evicts b
+    tiny.get(layout, run, HypBatch(0, 0, 1, 0), engine)  # third entry evicts b
     assert tiny.get(layout, run, batch, engine) is a  # pinned survived
     assert tiny.get(layout, layout.k_runs[1], batch, engine) is not b
     tiny.unpin("graph")

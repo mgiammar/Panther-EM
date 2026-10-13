@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import h5py  # type: ignore[import-untyped]
 import numpy as np
@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 
     from panther_em.inference.search.executor import StageMaps
     from panther_em.inference.search.ledger import PixelLedger
-    from panther_em.inference.search.types import Rectangle
 
 MAP_NAMES = (
     "mip",
@@ -181,13 +180,11 @@ class SearchResult:
 
     def decode(self) -> DecodedMaps:
         """Decode ``best_index`` into defocus / filter / orientation (and angles)."""
-        idx = self.space.decode(self.best_index)
-        valid = idx.orientation >= 0
+        d_idx, f_idx, o_idx = self.space.decode(self.best_index)
+        valid = o_idx >= 0
         phi = theta = None
         if self.space.phi_deg is not None and self.space.theta_deg is not None:
-            safe = torch.where(
-                valid, idx.orientation, torch.zeros_like(idx.orientation)
-            )
+            safe = torch.where(valid, o_idx, torch.zeros_like(o_idx))
             nan = torch.full(
                 safe.shape, float("nan"), dtype=torch.float32, device=safe.device
             )
@@ -195,7 +192,7 @@ class SearchResult:
             theta = torch.where(valid, self.space.theta_deg.to(safe.device)[safe], nan)
         defocus = None
         if self.space.defocus_values is not None:
-            safe_d = torch.where(valid, idx.defocus, torch.zeros_like(idx.defocus))
+            safe_d = torch.where(valid, d_idx, torch.zeros_like(d_idx))
             nan = torch.full(
                 safe_d.shape, float("nan"), dtype=torch.float32, device=safe_d.device
             )
@@ -203,9 +200,9 @@ class SearchResult:
                 valid, self.space.defocus_values.to(safe_d.device)[safe_d], nan
             )
         return DecodedMaps(
-            defocus_index=idx.defocus,
-            filter_index=idx.filter,
-            orientation_index=idx.orientation,
+            defocus_index=d_idx,
+            filter_index=f_idx,
+            orientation_index=o_idx,
             phi=phi,
             theta=theta,
             psi=self.psi_degrees(),
@@ -320,11 +317,8 @@ class SearchResult:
                 defocus_values=table("defocus_values"),
             )
             stages = tuple(
-                StageSpec(
-                    cast(
-                        "tuple[Rectangle, ...]",
-                        tuple(tuple(r) for r in s["rectangles"]),
-                    ),
+                StageSpec.create(
+                    [tuple(r) for r in s["rectangles"]],
                     precision=s["precision"],
                     n_psi=int(s["n_psi"]),
                     error=s["error"],
