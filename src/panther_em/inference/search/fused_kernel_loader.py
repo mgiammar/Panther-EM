@@ -23,10 +23,11 @@ from typing import TYPE_CHECKING, Any, Literal, overload
 
 import torch
 
+from panther_em.inference.search.packed import decode_argmax_packed
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-from panther_em.inference.search.statistics import decode_argmax_packed
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _CSRC_DIR = os.path.join(_THIS_DIR, "csrc")
@@ -420,7 +421,7 @@ def fused_irfft_stats(
         ``(vmax, amax)`` before returning. Pass ``False`` to skip that decode and get
         the raw packed value back instead -- useful when a caller wants to batch
         several calls' raw outputs together and decode the whole batch once (see
-        :func:`panther_em.inference.search.statistics.decode_argmax_packed`).
+        :func:`panther_em.inference.search.packed.decode_argmax_packed`).
 
     Returns
     -------

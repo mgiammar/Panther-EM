@@ -149,7 +149,7 @@ def test_cpu_eager_matches_reference_any_block_size(synthetic_result, block_pixe
     ctx = SearchContext("cpu", WeightSource(result, "cpu"))
     plan, maps = _run_stage(ctx, result, spec, store, space, batch=BatchShape(4, 4))
     assert plan.memory.block_pixels == block_pixels and plan.memory.loop == "eager"
-    assert plan.stats_backend.name == "torch"
+    assert plan.fused is False
     _assert_matches(
         maps, _reference(result, spec, features, plan.hyp_plan, 16), plan.hyp_plan
     )
@@ -214,8 +214,6 @@ def test_strided_subset_matches_restricted_reference_and_decodes_globally(
 def test_planner_defaults_and_overrides():
     caps = DeviceCaps.probe("cpu")
     planner = Planner(l2_target=64 * 1024**2, block_bytes_max=1024)
-    from panther_em.inference.search.statistics import TorchStatsBackend
-
     plan = planner.plan(
         caps,
         n_pixels=1000,
@@ -226,7 +224,7 @@ def test_planner_defaults_and_overrides():
         feature_bytes_per_pixel=16,
         spectrum_dtype=torch.complex64,
         precision="fp32",
-        stats_backend=TorchStatsBackend(),
+        fused=False,
     )
     assert plan.hyp_batch % 64 == 0 and plan.block_pixels % plan.gemm_pixels == 0
     assert plan.loop == "eager" and plan.n_sub >= 1
@@ -240,7 +238,7 @@ def test_planner_defaults_and_overrides():
         feature_bytes_per_pixel=16,
         spectrum_dtype=torch.complex64,
         precision="fp32",
-        stats_backend=TorchStatsBackend(),
+        fused=False,
         batch=BatchShape(4, 3),
         block_pixels=9,
     )
@@ -272,7 +270,7 @@ def test_cuda_fused_eager_and_graph_match_reference(synthetic_result, precision)
     plan_e, eager = _run_stage(
         ctx, result, spec, store, space, batch=BatchShape(4, 4), use_cuda_graph=False
     )
-    assert plan_e.stats_backend.name == "fused" and plan_e.memory.loop == "eager"
+    assert plan_e.fused and plan_e.memory.loop == "eager"
     assert isinstance(ctx.loops[plan_e.signature], EagerHypLoop)
     ref = _reference(result, spec, features, plan_e.hyp_plan, 128)
     _assert_matches(eager, ref, plan_e.hyp_plan, **tol)

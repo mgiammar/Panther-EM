@@ -21,13 +21,12 @@ import torch
 
 from panther_em.inference.search import fused_kernel_loader
 from panther_em.inference.search.contraction import Spectrum
-from panther_em.inference.search.fused_statistics import FusedStatsBackend
 from panther_em.inference.search.statistics import (
     BlockStats,
     SpectrumSpec,
-    StatsBackend,
-    TorchStatsBackend,
     _cuda_graph_capture_supported,
+    fused_stats_supported,
+    make_block_stats,
 )
 
 if TYPE_CHECKING:
@@ -187,7 +186,7 @@ class Planner:
         feature_bytes_per_pixel: int,
         spectrum_dtype: torch.dtype,
         precision: Precision,
-        stats_backend: StatsBackend,
+        fused: bool,
         batch: BatchShape | None = None,
         block_pixels: int | None = None,
         use_cuda_graph: bool = True,
@@ -209,8 +208,8 @@ class Planner:
             The engine's spectrum dtype.
         precision : Precision
             Stage precision (also the layout of newly featurized groups).
-        stats_backend : StatsBackend
-            Chosen backend; graphs need the fused one.
+        fused : bool
+            Whether the stage reduces with the fused CUDA kernels; graphs need it.
         batch, block_pixels : optional
             Explicit overrides.
         use_cuda_graph : bool, optional
@@ -248,7 +247,7 @@ class Planner:
             if use_cuda_graph
             and caps.is_cuda
             and caps.cuda_graphs
-            and stats_backend.name == "fused"
+            and fused
             else "eager"
         )
         store_residency: Residency
@@ -271,20 +270,13 @@ class Planner:
         )
 
 
-def choose_stats_backend(
-    spec: SpectrumSpec,
-    caps: DeviceCaps,
-    *,
-    use_fused_kernel: bool = True,
-    backends: Sequence[StatsBackend] = (FusedStatsBackend(), TorchStatsBackend()),
-) -> StatsBackend:
-    """First backend supporting ``spec`` (fused only when allowed and available)."""
-    for backend in backends:
-        if backend.name == "fused" and not (use_fused_kernel and caps.fused_kernel):
-            continue
-        if backend.supports(spec):
-            return backend
-    raise RuntimeError("no statistics backend supports this stage")
+def choose_fused(
+    spec: SpectrumSpec, caps: DeviceCaps, *, use_fused_kernel: bool = True
+) -> bool:
+    """Whether a stage with ``spec`` runs on the fused CUDA kernels."""
+    return bool(
+        use_fused_kernel and caps.fused_kernel and fused_stats_supported(spec)
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -433,7 +425,7 @@ class GraphedHypLoop:
         pool: Any = None,
     ) -> GraphedHypLoop | None:
         """Capture, or return ``None`` when this device/backend cannot capture it."""
-        if not stats.inkernel or stats.device.type != "cuda":
+        if not stats.fused or stats.device.type != "cuda":
             return None
         device = stats.device
         statics = {gid: t.detach().clone().contiguous() for gid, t in example.items()}
@@ -517,7 +509,7 @@ class SearchContext:
         self,
         key: tuple,
         inputs: LoopInputs,
-        stats_backend: StatsBackend,
+        fused: bool,
         spec: SpectrumSpec,
         example: Mapping[int, torch.Tensor],
     ) -> HypLoop:
@@ -525,7 +517,7 @@ class SearchContext:
         loop = self.loops.get(key)
         if loop is not None:
             return loop
-        stats = stats_backend.make(spec)
+        stats = make_block_stats(spec, fused=fused)
         if inputs.memory.loop == "graph":
             graphed = GraphedHypLoop.try_capture(
                 inputs, stats, example, pool=self.graph_pool

@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, overload
 
 import torch
+
+from panther_em.inference.search import fused_kernel_loader
+from panther_em.inference.search.packed import decode_argmax_packed
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -66,77 +69,6 @@ def _cuda_graph_capture_supported(device_index: int) -> bool:
         return bool(x.item() == 2.0)
     except Exception:
         return False
-
-
-# --------------------------------------------------------------------------- #
-# Sortable-float <-> packed (float, index) encoding, mirroring the CUDA
-# kernel's atomicMax-friendly (float_to_sortable_u32 / pack_val_idx) trick in
-# fused_irfft_and_stats_kernel.cuh.
-# --------------------------------------------------------------------------- #
-def encode_argmax_packed(val: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    """Pack ``(val, idx)`` into a single sortable ``int64``.
-
-    Parameters
-    ----------
-    val : torch.Tensor
-        float32 tensor of values to pack.
-    idx : torch.Tensor
-        Integer tensor of indices to pack (must fit in 32 bits), same shape as ``val``.
-
-    Returns
-    -------
-    torch.Tensor
-        int64 tensor, same shape as ``val``. Comparing two packed values via ordinary
-        *unsigned* 64-bit comparison recovers the ``(val, idx)`` lexicographic order --
-        see the module-level note on :func:`decode_argmax_packed` about why a plain
-        ``torch.max`` on this tensor (a signed int64 view of what is conceptually
-        unsigned data) is unsafe.
-    """
-    bits = val.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
-    sign_set = (bits & 0x80000000) != 0
-    mask = torch.where(
-        sign_set, torch.full_like(bits, 0xFFFFFFFF), torch.full_like(bits, 0x80000000)
-    )
-    sortable = (bits ^ mask) & 0xFFFFFFFF
-    return (sortable << 32) | (idx.to(torch.int64) & 0xFFFFFFFF)
-
-
-def decode_argmax_packed(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Inverse of :func:`encode_argmax_packed`; also decodes the fused kernel's output.
-
-    Parameters
-    ----------
-    packed : torch.Tensor
-        int64 tensor produced by :func:`encode_argmax_packed`, or the fused kernel's raw
-        ``argmax_packed`` output.
-
-    Returns
-    -------
-    tuple[torch.Tensor, torch.Tensor]
-        ``(val, idx)``, dtypes ``(float32, int64)``, same shape as ``packed``.
-
-    Notes
-    -----
-    Never reduce (``.max()``/``>``/etc.) a **packed** tensor directly: the encoding's
-    order-preserving trick assumes *unsigned* 64-bit comparison, which is what CUDA's
-    ``atomicMax`` on ``unsigned long long`` performs, but PyTorch has no native uint64
-    dtype -- comparing the raw ``int64`` view as *signed* silently inverts the ordering
-    whenever the packed value's top bit is set. Always decode first (elementwise, safe
-    regardless of tensor shape), then reduce the decoded float ``val`` in ordinary
-    floating-point comparison space.
-    """
-    idx = (packed & 0xFFFFFFFF).to(torch.int64)
-    sortable = ((packed >> 32) & 0xFFFFFFFF).to(torch.int64)
-
-    sign_set = (sortable & 0x80000000) != 0
-    mask = torch.where(
-        sign_set,
-        torch.full_like(sortable, 0x80000000),
-        torch.full_like(sortable, 0xFFFFFFFF),
-    )
-    bits = (sortable ^ mask) & 0xFFFFFFFF
-    val = bits.to(torch.int32).view(torch.float32)
-    return val, idx
 
 
 @torch.compile
@@ -229,12 +161,20 @@ class PixelStats:
 
     Notes
     -----
-    :meth:`update` delegates the "reduce one hypothesis batch's spectrum to
-    ``(s1, s2, vmax, amax)``" step to the overridable :meth:`_reduce` method, so a
-    subclass can substitute a faster reduction (e.g. a fused CUDA kernel) without
-    duplicating the accumulate / branchless-best-update / psi-axis-decode logic in
-    :meth:`_accumulate`. See
-    :class:`panther_em.inference.search.fused_statistics.FusedPixelStats`.
+    With ``fused=True`` (CUDA) the tracker uses the fused CUDA kernels. Two fast
+    paths, tried in order:
+
+    1. **In-kernel accumulation** (:meth:`update_graphed`): for the register-resident
+       kernel's domain (``n_psi`` in ``{128, 256, 512}``, ``NumFreq <= n_psi/2 + 1``,
+       spectrum in the GEMM's native ``(NumFreq, P, N)`` layout, complex64 or
+       complex32) the kernel adds the batch's moments straight into :attr:`corr_sum`
+       / :attr:`corr_sum2` and merges a packed ``(value, (hyp, psi) index)`` maximum
+       into :attr:`best_packed`; the packed best is decoded into ``best_corr`` /
+       ``best_hypothesis`` / ``best_psi_angle`` once, in :meth:`merge_packed`.
+    2. **Fused reduce** (:meth:`_reduce`): the lean kernel or, failing that, the
+       cuFFTDx block-FFT kernel, feeding the ordinary accumulate.
+
+    Everything falls back to the pure-torch reduction when a kernel does not apply.
     """
 
     hypothesis_count: int
@@ -250,10 +190,31 @@ class PixelStats:
         num_pixels: int,
         device: torch.device,
         accumulate_dtype: torch.dtype = torch.float32,
+        *,
+        fused: bool = False,
     ):
-        """Initialize a new pixel statistics tracker."""
+        """Initialize a new pixel statistics tracker (``fused``: use the CUDA kernels)."""
         self.hypothesis_count = 0
         self.num_pixels = num_pixels
+        self.fused = bool(fused)
+        self._lean_sentinel: int | None = (
+            fused_kernel_loader.lean_sentinel_packed() if self.fused else None
+        )
+        # in-kernel packed best (fused only); the num_psi it was accumulated with, or
+        # None if untouched since the last clear()/merge_packed()
+        self.best_packed: torch.Tensor | None = None
+        if self.fused:
+            self.best_packed = torch.full(
+                (num_pixels,),
+                self._lean_sentinel if self._lean_sentinel is not None else 0,
+                device=device,
+                dtype=torch.int64,
+            )
+        self._packed_num_psi: int | None = None
+        # the streaming-accumulate CUDA graph, captured on first use
+        self._graph: torch.cuda.CUDAGraph | None = None
+        self._graph_num_psi: int | None = None
+        self._graph_reverse_psi_axis: bool | None = None
         self.corr_sum = torch.zeros(num_pixels, device=device, dtype=accumulate_dtype)
         self.corr_sum2 = torch.zeros(num_pixels, device=device, dtype=accumulate_dtype)
         self.best_corr = torch.full(
@@ -287,16 +248,21 @@ class PixelStats:
         obj.num_pixels = stop - start
         for name in cls.BUFFERS:
             setattr(obj, name, getattr(parent, name)[start:stop])
-        obj._init_view_extras(parent, start, stop)
+        obj.fused = parent.fused
+        obj._lean_sentinel = parent._lean_sentinel
+        obj.best_packed = (
+            None if parent.best_packed is None else parent.best_packed[start:stop]
+        )
+        obj._packed_num_psi = None
+        obj._graph = None
+        obj._graph_num_psi = None
+        obj._graph_reverse_psi_axis = None
         return obj
-
-    def _init_view_extras(self, parent: PixelStats, start: int, stop: int) -> None:
-        """Hook for subclasses with extra per-instance buffers (no-op here)."""
-        return None
 
     def clear_bookkeeping(self) -> None:
         """Reset the scalar state only (a view whose buffers the block cleared)."""
         self.hypothesis_count = 0
+        self._packed_num_psi = None
 
     @torch.no_grad()
     def clear(self) -> None:
@@ -307,11 +273,15 @@ class PixelStats:
         self.best_corr.fill_(float("-inf"))
         self.best_hypothesis.fill_(-1)
         self.best_psi_angle.fill_(-1)
+        if self.best_packed is not None and self._lean_sentinel is not None:
+            self.best_packed.fill_(self._lean_sentinel)
 
     def _reduce(
         self, spectrum: torch.Tensor, num_psi: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reduce one hypothesis batch's spectrum to ``(s1, s2, vmax, amax)``.
+
+        With ``fused`` the CUDA kernels are tried first (:meth:`_try_fused_reduce`).
 
         Parameters
         ----------
@@ -326,6 +296,10 @@ class PixelStats:
             ``(s1, s2, vmax, amax)``, each shape (num_pixels,). See
             :func:`_reduce_stats`.
         """
+        if self.fused:
+            result = self._try_fused_reduce(spectrum, num_psi, decode=True)
+            if result is not None:
+                return result
         corr = torch.fft.irfft(spectrum, n=num_psi, dim=-1, norm="forward")
         return _reduce_stats(  # type: ignore[no-any-return]
             corr.to(self.best_corr.dtype), torch.view_as_real(spectrum)
@@ -506,7 +480,7 @@ class PixelStats:
             If called with a different ``(num_psi, reverse_psi_axis)`` than the one
             this instance's graph was captured with -- use a fresh instance instead.
         """
-        if not hasattr(self, "_graph"):
+        if self._graph is None:
             self._build_graphed_accumulate(num_psi, reverse_psi_axis)
         elif (
             num_psi != self._graph_num_psi
@@ -526,6 +500,7 @@ class PixelStats:
         self._graph_vmax.copy_(vmax, non_blocking=True)
         self._graph_amax.copy_(amax, non_blocking=True)
         self._graph_h0.fill_(hyp_offset)
+        assert self._graph is not None
         self._graph.replay()
 
     @torch.no_grad()
@@ -544,6 +519,28 @@ class PixelStats:
         when CUDA graph capture isn't supported on this device (checked once per device
         via :func:`_cuda_graph_capture_supported`), so this is always safe to call.
         """
+        if (
+            self.fused
+            and reverse_psi_axis
+            and self._lean_sentinel is not None
+            and self.best_packed is not None
+            and self.corr_sum.dtype == torch.float32
+            and self.inkernel_supported(spectrum, num_psi, hyp_offset)
+        ):
+            ran = (
+                fused_kernel_loader.lean_irfft_stats_transposed(
+                    spectrum.permute(2, 0, 1),
+                    num_psi,
+                    decode=False,
+                    hyp_offset=hyp_offset,
+                    outs=[self.corr_sum, self.corr_sum2, self.best_packed],
+                )
+                is not None
+            )
+            if ran:
+                self.hypothesis_count += spectrum.shape[1] * num_psi
+                self._packed_num_psi = num_psi
+                return None
         if not (
             spectrum.is_cuda and _cuda_graph_capture_supported(spectrum.device.index)
         ):
@@ -559,6 +556,126 @@ class PixelStats:
         self.hypothesis_count += spectrum.shape[1] * num_psi
         return None
 
+    @staticmethod
+    def inkernel_supported(
+        spectrum: torch.Tensor, num_psi: int, hyp_offset: int
+    ) -> bool:
+        """Whether :meth:`update_graphed` can accumulate ``spectrum`` in-kernel."""
+        if not (
+            spectrum.is_cuda
+            and spectrum.dtype in (torch.complex64, torch.complex32)
+            and spectrum.dim() == 3
+        ):
+            return False
+        transposed = spectrum.permute(2, 0, 1)
+        return bool(
+            transposed.is_contiguous()
+            and fused_kernel_loader.lean_supported(num_psi, transposed.shape[0])
+            and (hyp_offset + transposed.shape[2]) * num_psi < 2**32
+        )
+
+    @torch.no_grad()
+    def merge_packed(self) -> None:
+        """Fold the in-kernel packed best into ``best_corr`` / ``_hypothesis`` / ``_psi``.
+
+        Idempotent; a no-op unless the in-kernel path ran since the last
+        :meth:`clear`. Uses ``reverse_psi_axis=True`` decoding, the only mode routed
+        through the in-kernel path.
+        """
+        if self._packed_num_psi is None or self.best_packed is None:
+            return
+        num_psi = self._packed_num_psi
+        vmax, flat = decode_argmax_packed(self.best_packed)
+        global_hyp = torch.div(flat, num_psi, rounding_mode="floor")
+        psi = (num_psi - flat % num_psi) % num_psi
+        vmax_cast = vmax.to(self.best_corr.dtype)
+        improved = vmax_cast > self.best_corr
+        # In place (`out=`), never rebinding the attributes: a captured CUDA graph
+        # (context.GraphedHypLoop) holds these exact buffers, and its captured clear()
+        # must keep resetting the tensors finalize() reads.
+        torch.where(improved, vmax_cast, self.best_corr, out=self.best_corr)
+        torch.where(
+            improved, global_hyp, self.best_hypothesis, out=self.best_hypothesis
+        )
+        torch.where(improved, psi, self.best_psi_angle, out=self.best_psi_angle)
+        if self._lean_sentinel is not None:
+            self.best_packed.fill_(self._lean_sentinel)
+        self._packed_num_psi = None
+
+    @overload
+    def _try_fused_reduce(
+        self, spectrum: torch.Tensor, num_psi: int, decode: Literal[True]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None: ...
+    @overload
+    def _try_fused_reduce(
+        self, spectrum: torch.Tensor, num_psi: int, decode: Literal[False]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None: ...
+    def _try_fused_reduce(
+        self, spectrum: torch.Tensor, num_psi: int, decode: bool
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | None
+    ):
+        """Fast-path selection for :meth:`_reduce`.
+
+        Returns ``None`` (rather than raising) whenever the fused kernel can't handle
+        this call -- spectrum isn't CUDA complex64, the kernel failed to compile, or
+        ``(num_psi, NumFreq)`` isn't a supported config -- signaling the caller to fall
+        back to the parent's pure-torch reduction.
+        """
+        if not (
+            spectrum.is_cuda and spectrum.dtype in (torch.complex64, torch.complex32)
+        ):
+            return None
+
+        # Zero-copy fast path for internal transpose.
+        # Triggers when `spectrum` is (P, N, NumFreq) view of a (NumFreq, P, N)
+        # contiguous tensor (layout torch.bmm produces natively, in either precision).
+        # `decode` is branched on explicitly (rather than forwarded as a plain bool)
+        # so each call below keeps its `Literal[True]`/`Literal[False]` overload.
+        transposed = spectrum.permute(2, 0, 1)
+        if transposed.is_contiguous():
+            # 1. Register-resident kernel: n_psi in {128, 256, 512}, NumFreq <= n_psi/2+1, both
+            #    complex dtypes. ~6x faster than the cuFFTDx kernel at n_psi=256.
+            result = (
+                fused_kernel_loader.lean_irfft_stats_transposed(
+                    transposed, num_psi, decode=True
+                )
+                if decode
+                else fused_kernel_loader.lean_irfft_stats_transposed(
+                    transposed, num_psi, decode=False
+                )
+            )
+            if result is not None:
+                return result
+            # 2. cuFFTDx block-FFT kernel (complex64 only): a complex32 spectrum
+            #    (fp16 contraction, n_psi = 64) is converted once, in place of
+            #    layout, rather than converted and then copied again below.
+            transposed64 = (
+                transposed
+                if spectrum.dtype == torch.complex64
+                else transposed.to(torch.complex64)
+            )
+            result = (
+                fused_kernel_loader.fused_irfft_stats_transposed(
+                    transposed64, num_psi, decode=True
+                )
+                if decode
+                else fused_kernel_loader.fused_irfft_stats_transposed(
+                    transposed64, num_psi, decode=False
+                )
+            )
+            if result is not None:
+                return result
+
+        # 3. Non-native layout: cuFFTDx kernel with an explicit .contiguous() copy.
+        if spectrum.dtype != torch.complex64:
+            spectrum = spectrum.to(torch.complex64)
+        if decode:
+            return fused_kernel_loader.fused_irfft_stats(spectrum, num_psi, decode=True)
+        return fused_kernel_loader.fused_irfft_stats(spectrum, num_psi, decode=False)
+
     @torch.no_grad()
     def finalize(self) -> dict[str, torch.Tensor]:
         """Finalize tracked statistics into summary dictionary.
@@ -569,6 +686,7 @@ class PixelStats:
             Dictionary containing the final tracked statistics. Tensors exists on device
             used to initialize the PixelStats object.
         """
+        self.merge_packed()
         mean = self.corr_sum / self.hypothesis_count
         variance = (self.corr_sum2 / self.hypothesis_count) - (mean**2)
         variance.clamp_min_(0.0)
@@ -630,8 +748,6 @@ class BlockStats:
 
     Parameters
     ----------
-    stats_cls : type
-        :class:`PixelStats` or a subclass (the fused specialization).
     n_sub : int
         Sub-batches per block.
     gemm_pixels : int
@@ -640,33 +756,32 @@ class BlockStats:
         Where the state lives.
     n_psi : int
         In-plane samples.
-    inkernel : bool
+    fused : bool
         ``True`` when every batch takes the fused in-kernel accumulate path (the
         packed best is folded once per block in :meth:`finalize_into`).
     """
 
     def __init__(
         self,
-        stats_cls: type[PixelStats],
         *,
         n_sub: int,
         gemm_pixels: int,
         device: torch.device,
         n_psi: int,
-        inkernel: bool,
+        fused: bool,
     ) -> None:
         # One tracker for the whole block; the sub-batches are views of its buffers,
         # so finalization runs once per block instead of once per sub-batch (that
         # was ~20 small launches x n_sub per block, the dominant loop overhead).
-        self.block = stats_cls(int(n_sub) * int(gemm_pixels), device=device)
+        self.block = PixelStats(int(n_sub) * int(gemm_pixels), device=device, fused=fused)
         self.stats = [
-            stats_cls.view_of(self.block, sub * gemm_pixels, (sub + 1) * gemm_pixels)
+            PixelStats.view_of(self.block, sub * gemm_pixels, (sub + 1) * gemm_pixels)
             for sub in range(n_sub)
         ]
         self.n_sub = int(n_sub)
         self.gemm_pixels = int(gemm_pixels)
         self.n_psi = int(n_psi)
-        self.inkernel = bool(inkernel)
+        self.fused = bool(fused)
         self.device = device
 
     @torch.no_grad()
@@ -691,7 +806,7 @@ class BlockStats:
         """
         for st in self.stats:
             st.hypothesis_count = int(n_evaluated)
-            if hasattr(st, "_packed_num_psi"):
+            if st.fused:
                 st._packed_num_psi = self.n_psi
 
     @torch.no_grad()
@@ -703,9 +818,7 @@ class BlockStats:
         Keys: ``mip``, ``mean``, ``variance``, ``zscore``, ``best_index``, ``best_psi``.
         """
         for st in self.stats:  # fold any pending in-kernel best into the shared buffers
-            merge = getattr(st, "merge_packed", None)
-            if merge is not None:
-                merge()
+            st.merge_packed()
         self.block.hypothesis_count = self.stats[0].hypothesis_count
         result = self.block.finalize()
         for key, value in result.items():
@@ -715,39 +828,27 @@ class BlockStats:
             )
 
 
-@runtime_checkable
-class StatsBackend(Protocol):
-    """Chooses and builds the block accumulator for a stage."""
+def fused_stats_supported(spec: SpectrumSpec) -> bool:
+    """Whether every batch of a stage with ``spec`` takes the in-kernel path.
 
-    name: str
+    True when the spectrum is a CUDA complex64/complex32 tensor in the kernel-native
+    layout, ``(n_psi, n_freq)`` is covered by the register-resident kernel and the
+    fused extension compiled; the hypothesis loop is then CUDA-graph capturable.
+    """
+    return bool(
+        spec.device.type == "cuda"
+        and spec.dtype in (torch.complex64, torch.complex32)
+        and fused_kernel_loader.lean_supported(spec.n_psi, spec.n_freq)
+        and fused_kernel_loader.lean_sentinel_packed() is not None
+    )
 
-    @staticmethod
-    def supports(spec: SpectrumSpec) -> bool:
-        """Whether this backend can reduce spectra of ``spec``."""
 
-    @staticmethod
-    def make(spec: SpectrumSpec) -> BlockStats:
-        """A fresh block accumulator for ``spec``."""
-
-
-class TorchStatsBackend:
-    """Pure-torch reduction (``irfft`` + compiled moments); works on any device."""
-
-    name = "torch"
-
-    @staticmethod
-    def supports(spec: SpectrumSpec) -> bool:
-        """Always."""
-        return True
-
-    @staticmethod
-    def make(spec: SpectrumSpec) -> BlockStats:
-        """Block accumulator backed by plain :class:`PixelStats`."""
-        return BlockStats(
-            PixelStats,
-            n_sub=spec.n_sub,
-            gemm_pixels=spec.gemm_pixels,
-            device=spec.device,
-            n_psi=spec.n_psi,
-            inkernel=False,
-        )
+def make_block_stats(spec: SpectrumSpec, *, fused: bool) -> BlockStats:
+    """A fresh block accumulator for ``spec`` (fused kernels when ``fused``)."""
+    return BlockStats(
+        n_sub=spec.n_sub,
+        gemm_pixels=spec.gemm_pixels,
+        device=spec.device,
+        n_psi=spec.n_psi,
+        fused=fused,
+    )

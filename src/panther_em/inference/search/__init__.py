@@ -28,7 +28,7 @@ Pipeline of one stage
 ---------------------
 1. **Plan** (:mod:`.executor`, :mod:`.context`): batch shape, block size, contraction
    engine (:mod:`.contraction`: fp32 / tf32 complex GEMM or the fp16 "4M" GEMM),
-   statistics backend (:mod:`.statistics`, :mod:`.fused_statistics`: pure torch or
+   statistics (:mod:`.statistics`: pure torch or
    the fused CUDA iRFFT+statistics kernel) and the :class:`~.hypotheses.HypothesisSet`
    (contiguous *virtual* ids over selected templates and defocus planes).
 2. **Featurize** (:mod:`.featurize`, :mod:`.store`): the pixels that survived the

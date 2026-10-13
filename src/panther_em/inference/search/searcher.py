@@ -326,7 +326,7 @@ class SearchSession:
         t0 = time.perf_counter()
         self._mark(f"stage{index}:start")
         template_ids, defocus_ids = spec.hypothesis_ids(searcher.space, searcher.ipix)
-        memory, backend, engine, hyp_plan = plan_memory(
+        memory, fused, engine, hyp_plan = plan_memory(
             searcher.ctx,
             spec,
             n_pixels=len(self.pixels),
@@ -352,7 +352,7 @@ class SearchSession:
         t_featurized = time.perf_counter()
         self._mark(f"stage{index}:featurized")
         plan = plan_stage(
-            searcher.ctx, index, spec, store, memory, backend, engine, hyp_plan
+            searcher.ctx, index, spec, store, memory, fused, engine, hyp_plan
         )
         self._mark(f"stage{index}:planned")
         progress = None

@@ -18,7 +18,7 @@ from panther_em.inference.search.context import (
     LoopInputs,
     MemoryPlan,
     Residency,
-    choose_stats_backend,
+    choose_fused,
 )
 from panther_em.inference.search.contraction import make_engine
 from panther_em.inference.search.hypotheses import HypothesisSet
@@ -31,7 +31,6 @@ if TYPE_CHECKING:
     from panther_em.inference.search.contraction import ContractionEngine
     from panther_em.inference.search.hypotheses import HypothesisSpace
     from panther_em.inference.search.schedule import StageSpec
-    from panther_em.inference.search.statistics import StatsBackend
     from panther_em.inference.search.store import ColumnGroup, FeatureStore
     from panther_em.inference.search.tiling import FeatureLayout
     from panther_em.inference.search.types import BatchShape, Precision
@@ -85,8 +84,8 @@ def plan_memory(
     use_fused_kernel: bool = True,
     store: FeatureStore | None = None,
     residency: Residency | Literal["auto"] = "auto",
-) -> tuple[MemoryPlan, StatsBackend, ContractionEngine, HypothesisSet]:
-    """Resolve batch shape, block size, engine, stats backend and hypothesis plan.
+) -> tuple[MemoryPlan, bool, ContractionEngine, HypothesisSet]:
+    """Resolve batch shape, block size, engine, fused flag and hypothesis set.
 
     Notes
     -----
@@ -112,7 +111,7 @@ def plan_memory(
         n_virtual=n_virtual,
         device=ctx.device,
     )
-    backend = choose_stats_backend(probe, ctx.caps, use_fused_kernel=use_fused_kernel)
+    fused = choose_fused(probe, ctx.caps, use_fused_kernel=use_fused_kernel)
     memory = ctx.planner.plan(
         ctx.caps,
         n_pixels=n_pixels,
@@ -123,7 +122,7 @@ def plan_memory(
         feature_bytes_per_pixel=per_pixel,
         spectrum_dtype=engine.spectrum_dtype,
         precision=spec.precision,
-        stats_backend=backend,
+        fused=fused,
         batch=batch,
         block_pixels=block_pixels,
         use_cuda_graph=use_cuda_graph,
@@ -132,7 +131,7 @@ def plan_memory(
     hyp_plan = HypothesisSet.create(
         space, template_ids, defocus_ids, hyp_batch=memory.hyp_batch, n_psi=spec.n_psi
     )
-    return memory, backend, engine, hyp_plan
+    return memory, fused, engine, hyp_plan
 
 
 @dataclass(frozen=True, eq=False)
@@ -150,7 +149,8 @@ class StagePlan:
     plane_lookup : tuple[tuple[tuple[int, int], ...], ...]
         ``[rect_index][d_local] -> (group id, local plane index)``.
     engine : ContractionEngine
-    stats_backend : StatsBackend
+    fused : bool
+        Whether the statistics run on the fused CUDA kernels.
     spectrum : SpectrumSpec
     memory : MemoryPlan
     hyp_plan : HypothesisSet
@@ -164,7 +164,7 @@ class StagePlan:
     groups: tuple[ColumnGroup, ...]
     plane_lookup: tuple[tuple[tuple[int, int], ...], ...]
     engine: ContractionEngine
-    stats_backend: StatsBackend
+    fused: bool
     spectrum: SpectrumSpec
     memory: MemoryPlan
     hyp_plan: HypothesisSet
@@ -182,7 +182,7 @@ def plan_stage(
     spec: StageSpec,
     store: FeatureStore,
     memory: MemoryPlan,
-    backend: StatsBackend,
+    fused: bool,
     engine: ContractionEngine,
     hyp_plan: HypothesisSet,
 ) -> StagePlan:
@@ -225,7 +225,7 @@ def plan_stage(
         memory.hyp_batch,
         spec.n_psi,
         hyp_plan.signature,
-        backend.name,
+        fused,
         memory.loop,
     )
     return StagePlan(
@@ -235,7 +235,7 @@ def plan_stage(
         groups=tuple(groups),
         plane_lookup=tuple(lookup),
         engine=engine,
-        stats_backend=backend,
+        fused=fused,
         spectrum=spectrum,
         memory=memory,
         hyp_plan=hyp_plan,
@@ -343,7 +343,7 @@ class StageExecutor:
                     loop = ctx.loop_for(
                         plan.signature,
                         inputs,
-                        plan.stats_backend,
+                        plan.fused,
                         plan.spectrum,
                         block.operands,
                     )
