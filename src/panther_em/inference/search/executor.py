@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from panther_em.inference.search.template import WeightSource
     from panther_em.inference.search.features import ContractionEngine
     from panther_em.inference.search.hypotheses import HypBatch, HypothesisSpace
-    from panther_em.inference.search.schedule import StageSpec
+    from panther_em.inference.search.stage import Stage
     from panther_em.inference.search.statistics import BlockStats
     from panther_em.inference.search.features import ColumnGroup, FeatureStore
     from panther_em.inference.search.features import FeatureLayout, KRun
@@ -78,7 +78,7 @@ def feature_bytes_per_pixel(
 
 
 def resident_groups(
-    spec: StageSpec, planes: Sequence[int], store: FeatureStore | None
+    spec: Stage, planes: Sequence[int], store: FeatureStore | None
 ) -> list[tuple[tuple[int, int, int, int], Precision, int]]:
     """``(rect, precision, n_planes)`` per group the stage will have resident."""
     out: list[tuple[tuple[int, int, int, int], Precision, int]] = []
@@ -147,7 +147,7 @@ class MemoryPlan:
 
 def plan_memory(
     executor: Executor,
-    spec: StageSpec,
+    spec: Stage,
     *,
     n_pixels: int,
     space: HypothesisSpace,
@@ -170,13 +170,13 @@ def plan_memory(
     ----------
     executor : Executor
         Supplies the device capabilities.
-    spec : StageSpec
+    spec : Stage
     n_pixels : int
         Pixels the stage searches.
     space : HypothesisSpace
     template_ids, defocus_ids : torch.Tensor, optional
         The stage's hypothesis restriction (``None`` = all), already normalised by
-        ``StageSpec.hypothesis_ids``.
+        ``Stage.hypothesis_ids``.
     batch, block_pixels : optional
         Explicit overrides of the L2-residency rule and the block budget.
     use_cuda_graph, use_fused_kernel : bool, optional
@@ -278,7 +278,7 @@ class StagePlan:
     Attributes
     ----------
     index : int
-    spec : StageSpec
+    spec : Stage
     layout : FeatureLayout
         The stage's rectangles.
     groups : tuple[ColumnGroup, ...]
@@ -291,7 +291,7 @@ class StagePlan:
     """
 
     index: int
-    spec: StageSpec
+    spec: Stage
     layout: FeatureLayout
     groups: tuple[ColumnGroup, ...]
     plane_lookup: tuple[tuple[tuple[int, int], ...], ...]
@@ -336,7 +336,7 @@ class StagePlan:
 def plan_stage(
     executor: Executor,
     index: int,
-    spec: StageSpec,
+    spec: Stage,
     store: FeatureStore,
     memory: MemoryPlan,
 ) -> StagePlan:

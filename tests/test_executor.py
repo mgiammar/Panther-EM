@@ -16,7 +16,7 @@ from panther_em.inference.search.executor import (
 from panther_em.inference.search.hypotheses import HypBatch
 from panther_em.inference.search.features import FeatureLayout
 from panther_em.inference.search.hypotheses import HypothesisSet, HypothesisSpace
-from panther_em.inference.search.schedule import StageSpec
+from panther_em.inference.search.stage import Stage
 from panther_em.inference.search.features import FeatureStore
 from panther_em.inference.search.types import (
     BatchShape,
@@ -141,7 +141,7 @@ def _assert_matches(maps, ref, hyp_plan, *, rtol=1e-4, atol=1e-4):
 def test_cpu_eager_matches_reference_any_block_size(synthetic_result, block_pixels):
     result = synthetic_result()
     space = HypothesisSpace.from_result(result)
-    spec = StageSpec.create([(0, 0, 4, 3), (0, 3, 2, 2)], precision="fp32", n_psi=16)
+    spec = Stage.create([(0, 0, 4, 3), (0, 3, 2, 2)], precision="fp32", n_psi=16)
     store, features = _fill_store(result, spec, 1, block_pixels, "cpu")
     ctx = Executor("cpu", WeightSource(result, "cpu"))
     plan, maps = _run_stage(ctx, result, spec, store, space, batch=BatchShape(4, 4))
@@ -155,7 +155,7 @@ def test_cpu_eager_matches_reference_any_block_size(synthetic_result, block_pixe
 def test_defocus_axis_reduces_over_planes(synthetic_result):
     result = synthetic_result()
     space = HypothesisSpace.from_result(result, n_defocus=3)
-    spec = StageSpec.create([(0, 0, 4, 5)], n_psi=16)
+    spec = Stage.create([(0, 0, 4, 5)], n_psi=16)
     store, features = _fill_store(result, spec, 3, 8, "cpu")
     ctx = Executor("cpu", WeightSource(result, "cpu"))
     plan, maps = _run_stage(ctx, result, spec, store, space, batch=BatchShape(4, 6))
@@ -186,7 +186,7 @@ def test_strided_subset_matches_restricted_reference_and_decodes_globally(
 ):
     result = synthetic_result(n_filters=2, n_orientations=5)
     space = HypothesisSpace.from_result(result, n_defocus=2)
-    spec = StageSpec.create([(0, 0, 3, 4)], n_psi=16)
+    spec = Stage.create([(0, 0, 3, 4)], n_psi=16)
     store, features = _fill_store(result, spec, 2, 25, "cpu")
     ctx = Executor("cpu", WeightSource(result, "cpu"))
     plan, maps = _run_stage(
@@ -212,7 +212,7 @@ def test_plan_memory_defaults_and_overrides(synthetic_result):
     result = synthetic_result(n_orientations=40)
     space = HypothesisSpace.from_result(result, n_defocus=3)
     ctx = Executor("cpu", WeightSource(result, "cpu"))
-    spec = StageSpec.create([(0, 0, 4, 5)], n_psi=256)
+    spec = Stage.create([(0, 0, 4, 5)], n_psi=256)
     plan = plan_memory(
         ctx, spec, n_pixels=1000, space=space, l2_target=64 * 1024**2, block_bytes_max=1024
     )
@@ -280,7 +280,7 @@ def test_cuda_fused_eager_and_graph_match_reference(synthetic_result, precision)
     device = torch.device("cuda")
     result = synthetic_result(n_orientations=8)
     space = HypothesisSpace.from_result(result, n_defocus=2)
-    spec = StageSpec.create([(0, 0, 4, 3), (0, 3, 2, 2)], precision=precision, n_psi=128)
+    spec = Stage.create([(0, 0, 4, 3), (0, 3, 2, 2)], precision=precision, n_psi=128)
     store, features = _fill_store(result, spec, 2, 8, device)
     ctx = Executor(device, WeightSource(result, device))
     tol = (
@@ -349,7 +349,7 @@ def _fill_store_split(result, spec, plane_groups, block_pixels, device, seed=0):
 def test_planes_split_across_groups_match_dense_reference(synthetic_result):
     result = synthetic_result()
     space = HypothesisSpace.from_result(result, n_defocus=3)
-    spec = StageSpec.create([(0, 0, 4, 3), (0, 3, 2, 2)], n_psi=16)
+    spec = Stage.create([(0, 0, 4, 3), (0, 3, 2, 2)], n_psi=16)
     store, features = _fill_store_split(result, spec, ((0, 2), (1,)), 8, "cpu")
     assert [g.planes for g in store.groups] == [(0, 2), (1,), (0, 2), (1,)]
     ctx = Executor("cpu", WeightSource(result, "cpu"))
@@ -380,7 +380,7 @@ def test_cuda_pinned_host_store_streams_blocks_and_matches_device(synthetic_resu
     device = torch.device("cuda")
     result = synthetic_result(n_orientations=8)
     space = HypothesisSpace.from_result(result, n_defocus=2)
-    spec = StageSpec.create([(0, 0, 4, 3), (0, 3, 2, 2)], precision="fp16", n_psi=128)
+    spec = Stage.create([(0, 0, 4, 3), (0, 3, 2, 2)], precision="fp16", n_psi=128)
     ctx = Executor(device, WeightSource(result, device))
     runs = {}
     for residency in ("device", "pinned_host"):

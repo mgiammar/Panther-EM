@@ -7,7 +7,7 @@ Everything here is built once per decomposition and reused across stages and ima
 * :class:`WeightSource` -- holds ``U * S`` device-resident once and serves rectangular
   ``(N, num_k, num_m)`` blocks.
 * :class:`Template` -- the bundle a
-  :class:`~panther_em.inference.search.searcher.Searcher` is built from.
+  :class:`~panther_em.inference.search.search.Searcher` is built from.
 """
 
 from __future__ import annotations
