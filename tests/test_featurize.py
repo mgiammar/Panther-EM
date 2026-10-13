@@ -1,4 +1,4 @@
-"""Featurizers vs the dense FFT reference ``compute_feature_stack``."""
+"""Featurization functions vs the dense FFT reference ``compute_feature_stack``."""
 
 from __future__ import annotations
 
@@ -8,15 +8,14 @@ from conftest import read_group
 
 from panther_em.inference.correlation import compute_feature_stack
 from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-from panther_em.inference.search.basis import KernelBank
+from panther_em.inference.search.template import KernelBank
 from panther_em.inference.search.featurize import (
-    FFTCorrelationFeaturizer,
-    ImageBatch,
-    InnerProductFeaturizer,
-    Tile,
-    make_featurizer,
+    featurize,
+    featurize_center,
+    featurize_grid,
+    schedule_tiles,
 )
-from panther_em.inference.search.store import FeatureStore
+from panther_em.inference.search.features import FeatureStore
 from panther_em.inference.search.types import ImageSet, PixelSelection, SearchGeometry
 
 pytestmark = pytest.mark.filterwarnings(
@@ -55,7 +54,7 @@ def _reference(bank, images_bhw, rect):
 
 
 def _run(
-    featurizer,
+    bank,
     images,
     geo,
     pixels,
@@ -64,8 +63,10 @@ def _run(
     block_pixels=7,
     chunk=4,
     order="pixel_major",
+    tile=1024,
+    image_batch=1024,
 ):
-    sched = featurizer.schedule(geo, pixels)
+    sched = schedule_tiles(geo, pixels, tile=tile, image_batch=image_batch)
     store = FeatureStore(
         geo,
         pixels,
@@ -75,9 +76,7 @@ def _run(
         device="cpu",
     )
     group = store.add_group(rect, "fp32")
-    featurizer.produce(
-        images, group, store.writer(group), sched, chunk=chunk, order=order
-    )
+    featurize(bank, images, group, store.writer(group), sched, chunk=chunk, order=order)
     return sched, store, group
 
 
@@ -92,8 +91,7 @@ def test_single_tile_matches_reference_all_pixels(bank):
     images = ImageSet.from_stack(_images())
     geo = SearchGeometry.from_images(images, bank.template_shape)
     pixels = PixelSelection.all(geo)
-    feat = FFTCorrelationFeaturizer(bank, tile=1024)
-    sched, store, group = _run(feat, images, geo, pixels, RECT)
+    sched, store, group = _run(bank, images, geo, pixels, RECT, tile=1024)
     # tile side is clamped to min(out_h, out_w) = 9 on an 11 x 9 grid -> 2 tiles/image,
     # whose owned rows stay row-major, so the compact order equals the sorted order
     assert sched.tile == 9 and len(sched.items) == 4
@@ -114,14 +112,12 @@ def test_tiled_masked_selection_matches_reference(bank, order):
     mask[1, 5:9, 3:8] = True
     mask[1, 11, 9] = True  # last pixel: lives in a clamped edge tile
     pixels = PixelSelection.from_mask(geo, mask)
-    feat = FFTCorrelationFeaturizer(bank, tile=5)
     sched, store, group = _run(
-        feat, images, geo, pixels, RECT, block_pixels=6, chunk=5, order=order
+        bank, images, geo, pixels, RECT, block_pixels=6, chunk=5, order=order, tile=5
     )
     assert sched.tile == 5 and sched.fft_shape == (24, 24)
     assert torch.equal(torch.sort(sched.column_index).values, pixels.index)
-    for item in sched.items:
-        assert isinstance(item, Tile) and item.row0 <= geo.grid[0] - 5
+    assert sched.mode == "grid" and all(item.row0 <= geo.grid[0] - 5 for item in sched.items)
     ref = _reference(bank, images.images, RECT)
     expected = _expected_columns(ref, geo, sched.column_index).reshape(-1, 2, 3)
     torch.testing.assert_close(
@@ -135,8 +131,7 @@ def test_filter_planes_match_prefiltered_reference(bank):
     images = ImageSet.from_stack(raw, filters=filters)
     geo = SearchGeometry.from_images(images, bank.template_shape)
     pixels = PixelSelection.all(geo)
-    feat = FFTCorrelationFeaturizer(bank, tile=6)
-    sched, store, group = _run(feat, images, geo, pixels, RECT)
+    sched, store, group = _run(bank, images, geo, pixels, RECT, tile=6)
     for d in range(3):
         pre = torch.fft.irfft2(torch.fft.rfft2(raw) * filters[d], s=(30, 28))
         ref = _reference(bank, pre, RECT)
@@ -147,7 +142,7 @@ def test_filter_planes_match_prefiltered_reference(bank):
 
     # a group holding only planes 2 and 0 (stored as (0, 2)) gets exactly those planes
     partial = store.add_group((0, 0, 1, 2), "fp32", planes=(2, 0))
-    feat.produce(images, partial, store.writer(partial), sched, chunk=4)
+    featurize_grid(bank, images, partial, store.writer(partial), sched, chunk=4)
     assert partial.planes == (0, 2)
     for local, d in enumerate((0, 2)):
         pre = torch.fft.irfft2(torch.fft.rfft2(raw) * filters[d], s=(30, 28))
@@ -158,7 +153,7 @@ def test_filter_planes_match_prefiltered_reference(bank):
         )
 
     per_image = ImageSet.from_stack(raw, filters=torch.rand(2, 2, 30, 15))
-    sched, store, group = _run(feat, per_image, geo, pixels, RECT)
+    sched, store, group = _run(bank, per_image, geo, pixels, RECT, tile=6)
     for d in range(2):
         pre = torch.stack(
             [
@@ -180,11 +175,10 @@ def test_inner_product_matches_grid_center_pixel(bank):
     images = ImageSet.from_boxes(boxes)
     geo = SearchGeometry.from_images(images, bank.template_shape)
     assert geo.mode == "center"
-    feat = make_featurizer(geo, bank, image_batch=2)
-    assert isinstance(feat, InnerProductFeaturizer)
     pixels = PixelSelection.all(geo)
-    sched, store, group = _run(feat, images, geo, pixels, RECT, block_pixels=2)
-    assert len(sched.items) == 3 and all(isinstance(i, ImageBatch) for i in sched.items)
+    sched, store, group = _run(bank, images, geo, pixels, RECT, block_pixels=2, image_batch=2)
+    assert sched.mode == "center" and len(sched.items) == 3
+    assert all(i.images is not None for i in sched.items)
     ref = _reference(bank, boxes, RECT)  # (B, cells, 1, 1)
     expected = ref[:, :, 0, 0].reshape(5, 2, 3)
     torch.testing.assert_close(
@@ -195,9 +189,7 @@ def test_inner_product_matches_grid_center_pixel(bank):
     big = _images(b=3, h=25, w=24)
     centred = ImageSet.from_boxes(big, center_only=True)
     geo_c = SearchGeometry.from_images(centred, bank.template_shape)
-    sched, store, group = _run(
-        make_featurizer(geo_c, bank), centred, geo_c, PixelSelection.all(geo_c), RECT
-    )
+    sched, store, group = _run(bank, centred, geo_c, PixelSelection.all(geo_c), RECT)
     ref = _reference(bank, big, RECT)  # (B, cells, 6, 5)
     expected = ref[:, :, (6 - 1) // 2, (5 - 1) // 2].reshape(3, 2, 3)
     torch.testing.assert_close(
@@ -207,7 +199,7 @@ def test_inner_product_matches_grid_center_pixel(bank):
     # with a filter plane
     filt = torch.rand(1, 20, 11)
     filtered = ImageSet.from_boxes(boxes, filters=filt)
-    sched, store, group = _run(make_featurizer(geo, bank), filtered, geo, pixels, RECT)
+    sched, store, group = _run(bank, filtered, geo, pixels, RECT)
     pre = torch.fft.irfft2(torch.fft.rfft2(boxes) * filt[0], s=(20, 20))
     expected = _reference(bank, pre, RECT)[:, :, 0, 0].reshape(5, 2, 3)
     torch.testing.assert_close(
@@ -215,13 +207,19 @@ def test_inner_product_matches_grid_center_pixel(bank):
     )
 
 
-def test_featurizer_mode_mismatch_raises(bank):
+def test_featurize_mode_mismatch_raises(bank):
     images = ImageSet.from_boxes(_images(b=2, h=20, w=20))
     geo = SearchGeometry.from_images(images, bank.template_shape)
-    with pytest.raises(ValueError):
-        FFTCorrelationFeaturizer(bank).schedule(geo, PixelSelection.all(geo))
-    grid = SearchGeometry.from_images(
-        ImageSet.from_stack(_images()), bank.template_shape
+    center = schedule_tiles(geo, PixelSelection.all(geo))
+    grid_images = ImageSet.from_stack(_images())
+    grid_geo = SearchGeometry.from_images(grid_images, bank.template_shape)
+    grid = schedule_tiles(grid_geo, PixelSelection.all(grid_geo))
+    assert center.mode == "center" and grid.mode == "grid" and center.fft_shape is None
+    store = FeatureStore(
+        geo, PixelSelection.all(geo), center.column_index, block_pixels=4, n_defocus=1, device="cpu"
     )
+    group = store.add_group(RECT, "fp32")
     with pytest.raises(ValueError):
-        InnerProductFeaturizer(bank).schedule(grid, PixelSelection.all(grid))
+        featurize_grid(bank, images, group, store.writer(group), center)
+    with pytest.raises(ValueError):
+        featurize_center(bank, grid_images, group, store.writer(group), grid)

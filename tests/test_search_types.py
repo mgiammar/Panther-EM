@@ -45,7 +45,7 @@ def test_image_set_promotes_single_image_and_validates_filters():
     assert s.images.shape == (1, 30, 32)
     assert s.n_defocus == 1 and s.filter_plane(0) is None
 
-    shared = ImageSet(img, filters=torch.ones(3, 30, 17))
+    shared = ImageSet.single(img, filters=torch.ones(3, 30, 17))
     assert shared.n_defocus == 3 and not shared.per_image_filters
     assert shared.filter_plane(2, 0).shape == (30, 17)
 
@@ -53,7 +53,7 @@ def test_image_set_promotes_single_image_and_validates_filters():
     assert per_image.n_defocus == 2 and per_image.per_image_filters
 
     with pytest.raises(ValueError):
-        ImageSet(img, filters=torch.ones(3, 30, 16))
+        ImageSet.single(img, filters=torch.ones(3, 30, 16))
     with pytest.raises(ValueError):
         ImageSet(torch.zeros(4, 30, 32), filters=torch.ones(3, 2, 30, 17))
     with pytest.raises(ValueError):

@@ -8,14 +8,13 @@ import pytest
 import torch
 
 from panther_em.inference.correlation import compute_feature_stack
-from panther_em.inference.search.basis import Template
+from panther_em.inference.search.template import Template
 from panther_em.inference.search.decisions import (
     NoDecision,
     ThresholdClassifier,
     TopFractionSelector,
     ZScoreIntervalClassifier,
 )
-from panther_em.inference.search.featurize import ImageBatch, TileSchedule
 from panther_em.inference.search.ledger import PixelLabel
 from panther_em.inference.search.results import SearchResult, StageResult
 from panther_em.inference.search.schedule import (
@@ -36,19 +35,16 @@ EXEC = ExecutionConfig(batch=BatchShape(8, 5), cell_chunk=4, use_cuda_graph=Fals
 
 
 class StubFeaturizer:
-    """Deterministic random features per cell; mirrors the legacy test stub."""
+    """Deterministic random features per cell; a stand-in for ``featurize``."""
 
     def __init__(self, seed: int = 1) -> None:
         self.seed = seed
         self.calls = 0
         self.planes_produced = 0
 
-    def schedule(self, geometry, pixels) -> TileSchedule:
-        idx = pixels.index.to("cpu")
-        return TileSchedule(idx, (ImageBatch(0, idx, slice(0, idx.numel())),), None)
-
-    def produce(
+    def __call__(
         self,
+        bank,
         images,
         group,
         writer,
@@ -201,7 +197,7 @@ def test_session_narrows_stops_and_keeps_stage_results(template):
         ],
         keep_stage_results=True,
     )
-    searcher = Searcher(template, schedule, execution=EXEC, featurizer=stub)
+    searcher = Searcher(template, schedule, execution=EXEC, featurize=stub)
     session = searcher.session(ImageSet.from_stack(torch.zeros(2, 30, 30)))
     stages = list(session)
     assert [s.stage_index for s in stages] == [
@@ -241,7 +237,7 @@ def test_error_model_fills_missing_errors_and_decision_uses_them(template):
         [(4, 5)], n_psi=16, decision=ZScoreIntervalClassifier(3.0)
     )
     assert schedule.requires_errors()
-    searcher = Searcher(template, schedule, execution=EXEC, featurizer=StubFeaturizer())
+    searcher = Searcher(template, schedule, execution=EXEC, featurize=StubFeaturizer())
     assert searcher.schedule.stages[0].error == pytest.approx(
         0.0, abs=1e-12
     )  # full rank
@@ -260,7 +256,7 @@ def test_center_mode_defocus_subset_and_run_many(template):
         template,
         schedule,
         execution=EXEC,
-        featurizer=stub,
+        featurize=stub,
         n_defocus=2,
         defocus_values=torch.tensor([-500.0, 500.0]),
     )
@@ -291,7 +287,7 @@ def test_search_result_round_trip_and_masked_pixels(template, tmp_path):
     )
     mask = torch.zeros(11, 11, dtype=torch.bool)
     mask[2:9, 2:9] = True
-    searcher = Searcher(template, schedule, execution=EXEC, featurizer=stub)
+    searcher = Searcher(template, schedule, execution=EXEC, featurize=stub)
     res = searcher.run(ImageSet.single(torch.zeros(30, 30), mask=mask))
     assert (res.label[0][~mask] == int(PixelLabel.MASKED)).all()
     assert (
@@ -396,7 +392,7 @@ def test_stage_planes_are_featurized_only_where_needed(template):
         keep_stage_results=True,
     )
     searcher = Searcher(
-        template, schedule, execution=EXEC, featurizer=stub, n_defocus=space_planes
+        template, schedule, execution=EXEC, featurize=stub, n_defocus=space_planes
     )
     images = ImageSet.from_stack(torch.zeros(1, 30, 30), filters=torch.ones(3, 30, 16))
     session = searcher.session(images)
@@ -414,7 +410,7 @@ def test_stage_planes_are_featurized_only_where_needed(template):
         template,
         SearchSchedule.single(StageSpec.create([rect], n_psi=16)),
         execution=EXEC,
-        featurizer=StubFeaturizer(),
+        featurize=StubFeaturizer(),
         n_defocus=space_planes,
     ).run(
         ImageSet.from_stack(
@@ -441,7 +437,7 @@ def test_session_store_is_released_after_the_session(template):
         template,
         SearchSchedule.single(StageSpec.create([(0, 0, 4, 5)], n_psi=16)),
         execution=EXEC,
-        featurizer=stub,
+        featurize=stub,
     )
     session = searcher.session(ImageSet.single(torch.zeros(30, 30)))
     session.run_all()

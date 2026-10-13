@@ -27,12 +27,13 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 from panther_em.inference.search.executor import Executor, plan_memory, plan_stage
-from panther_em.inference.search.featurize import make_featurizer
+from panther_em.inference.search.featurize import featurize as _featurize
+from panther_em.inference.search.featurize import schedule_tiles
 from panther_em.inference.search.hypotheses import HypothesisSpace, healpix_ipix
 from panther_em.inference.search.ledger import PixelLedger
 from panther_em.inference.search.results import SearchResult, StageResult
 from panther_em.inference.search.schedule import ErrorModel
-from panther_em.inference.search.store import FeatureStore
+from panther_em.inference.search.features import FeatureStore
 from panther_em.inference.search.types import (
     ImageSet,
     PixelSelection,
@@ -43,9 +44,9 @@ from panther_em.inference.search.types import (
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
 
-    from panther_em.inference.search.basis import Template
-    from panther_em.inference.search.store import Residency
-    from panther_em.inference.search.featurize import Featurizer, LoopOrder
+    from panther_em.inference.search.template import Template
+    from panther_em.inference.search.features import Residency
+    from panther_em.inference.search.featurize import Featurize, LoopOrder
     from panther_em.inference.search.schedule import SearchSchedule
     from panther_em.inference.search.types import BatchShape, Rectangle
 
@@ -130,8 +131,9 @@ class Searcher:
     defocus_values : torch.Tensor, optional
         ``(n_defocus,)`` labels for the planes, reported by ``SearchResult.decode()``.
     error_model : ErrorModel, optional
-    featurizer : Featurizer, optional
-        Override the featurizer (tests inject a stub); otherwise chosen per geometry.
+    featurize : callable, optional
+        Override :func:`~.featurize.featurize` (tests inject a stub with the same
+        signature).
     """
 
     def __init__(
@@ -143,7 +145,7 @@ class Searcher:
         n_defocus: int = 1,
         defocus_values: torch.Tensor | None = None,
         error_model: ErrorModel | None = None,
-        featurizer: Featurizer | None = None,
+        featurize: Featurize | None = None,
     ) -> None:
         self.template = template
         self.execution = execution or ExecutionConfig()
@@ -154,7 +156,7 @@ class Searcher:
             model = error_model or ErrorModel.from_result(template.result)
             schedule = schedule.with_errors(model)
         self.schedule = schedule
-        self._featurizer = featurizer
+        self.featurize: Featurize = featurize or _featurize
         # NESTED HEALPix ids of the template's orientations, when a stage samples
         # orientations by HEALPix level (None otherwise, or when not HEALPix)
         self.ipix = None
@@ -224,12 +226,6 @@ class SearchSession:
             images, searcher.template.template_shape
         )
         exe = searcher.execution
-        self.featurizer: Featurizer = searcher._featurizer or make_featurizer(
-            self.geometry,
-            searcher.template.kernels,
-            tile=exe.tile,
-            image_batch=exe.image_batch,
-        )
         initial = PixelSelection.from_mask(self.geometry, images.mask)
         self.ledger = PixelLedger(
             self.geometry,
@@ -269,7 +265,9 @@ class SearchSession:
         pixels = self.pixels
         store = self.store
         if store is None:
-            schedule = self.featurizer.schedule(self.geometry, pixels)
+            schedule = schedule_tiles(
+                self.geometry, pixels, tile=exe.tile, image_batch=exe.image_batch
+            )
             store = FeatureStore(
                 self.geometry,
                 pixels,
@@ -286,7 +284,9 @@ class SearchSession:
             )
             if not bool(keep.all()) or store.block_pixels != block_pixels:
                 store = store.subset(keep, block_pixels=block_pixels)
-            schedule = self.featurizer.schedule(self.geometry, pixels)
+            schedule = schedule_tiles(
+                self.geometry, pixels, tile=exe.tile, image_batch=exe.image_batch
+            )
             if not torch.equal(
                 schedule.column_index,
                 store.column_index.to(schedule.column_index.device),
@@ -305,7 +305,8 @@ class SearchSession:
         for rect, missing_planes in missing:
             group = store.add_group(rect, precision, missing_planes)
             self._mark("store:group_allocated")
-            self.featurizer.produce(
+            self.searcher.featurize(
+                self.searcher.template.kernels,
                 self.images,
                 group,
                 store.writer(group),

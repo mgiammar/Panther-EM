@@ -68,7 +68,7 @@ Radial boundaries of the inverse warp
 --------------------------------------
 The first ring sits at ``t = dt`` so the Cartesian pixels nearest the centre map to
 ``radius_idx`` in ``[-1, 0)``, outside the polar image. Before the polar -> Cartesian
-warp, :meth:`SpiralPolarTransform._pad_radial_axis` extends both axes.
+warp, :meth:`SpiralPolarTransform.pad_radial_axis` extends both axes.
 """
 
 from typing import Any
@@ -783,7 +783,7 @@ class SpiralPolarTransform(CoordinateTransform):
             )
         return self._continuation_cache[key]
 
-    def _pad_radial_axis(
+    def pad_radial_axis(
         self, image: np.ndarray | torch.Tensor
     ) -> tuple[np.ndarray | torch.Tensor, int]:
         """Continue the radial axis through the origin and mirror it past ``radius``.
@@ -811,7 +811,7 @@ class SpiralPolarTransform(CoordinateTransform):
         padded = torch.cat([inner, f, outer], dim=1)
         return (padded.numpy() if is_numpy else padded), inner.shape[1]
 
-    def _outer_radius_index(self) -> float:
+    def outer_radius_index(self) -> float:
         """``radius_idx`` of ``r = radius``: the last ring (plus rounding slack)."""
         return self.num_radius - 1 + 1e-6
 

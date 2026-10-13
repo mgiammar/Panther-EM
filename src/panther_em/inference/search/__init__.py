@@ -97,7 +97,7 @@ convention applied); Panther-EM applies no image preprocessing.
 
 from __future__ import annotations
 
-from panther_em.inference.search.basis import (
+from panther_em.inference.search.template import (
     KernelBank,
     Template,
     WeightSource,
@@ -115,10 +115,9 @@ from panther_em.inference.search.decisions import (
 )
 from panther_em.inference.search.executor import Executor, MemoryPlan, StagePlan
 from panther_em.inference.search.featurize import (
-    Featurizer,
-    FFTCorrelationFeaturizer,
-    InnerProductFeaturizer,
-    make_featurizer,
+    TileSchedule,
+    featurize,
+    schedule_tiles,
 )
 from panther_em.inference.search.hypotheses import (
     HypBatch,
@@ -142,8 +141,8 @@ from panther_em.inference.search.searcher import (
     Searcher,
     SearchSession,
 )
-from panther_em.inference.search.store import FeatureStore
-from panther_em.inference.search.tiling import FeatureLayout
+from panther_em.inference.search.features import FeatureStore
+from panther_em.inference.search.features import FeatureLayout
 from panther_em.inference.search.types import (
     BatchShape,
     ImageSet,
@@ -163,15 +162,12 @@ __all__ = [
     "ErrorModel",
     "ExecutionConfig",
     "Executor",
-    "FFTCorrelationFeaturizer",
     "FeatureLayout",
     "FeatureStore",
-    "Featurizer",
     "HypBatch",
     "HypothesisSet",
     "HypothesisSpace",
     "ImageSet",
-    "InnerProductFeaturizer",
     "KernelBank",
     "KernelConfig",
     "MemoryPlan",
@@ -186,6 +182,7 @@ __all__ = [
     "SearchSchedule",
     "SearchSession",
     "StagePlan",
+    "TileSchedule",
     "Searcher",
     "StageResult",
     "StageSpec",
@@ -198,8 +195,9 @@ __all__ = [
     "healpix_ipix",
     "healpix_level_ids",
     "healpix_orientations",
-    "make_featurizer",
+    "featurize",
     "nested_schedule",
     "psi_degrees",
+    "schedule_tiles",
     "zscore_error_intervals",
 ]

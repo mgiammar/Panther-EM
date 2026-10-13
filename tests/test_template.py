@@ -1,4 +1,4 @@
-"""KernelBank / WeightSource / Template."""
+"""KernelBank / WeightSource / Template (template.py)."""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ import torch
 from conftest import count_kernel_builds
 
 from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-from panther_em.inference.search.basis import (
+from panther_em.inference.search.template import (
     KernelBank,
     Template,
     WeightSource,
 )
-from panther_em.inference.search.tiling import FeatureLayout
+from panther_em.inference.search.features import FeatureLayout
 from panther_em.inference.search.types import KernelConfig
 
 pytestmark = pytest.mark.filterwarnings(
@@ -135,7 +135,7 @@ def test_kernel_bank_spectral_and_planar(recon):
 
 def test_weight_source_matches_reference_layout_weights(recon):
     rects = [(0, 0, 2, 3), (2, 0, 2, 2), (0, 3, 2, 2)]
-    layout = FeatureLayout(rects)
+    layout = FeatureLayout.create(rects)
     src = WeightSource(recon.result, "cpu")
     got = src.layout_weights(layout)
     legacy = reference_layout_weights(recon.result, layout)
@@ -200,7 +200,7 @@ def recon_cuda(synthetic_result):
 def test_kernel_bank_separable_build_matches_generic_on_a_side_stream(recon_cuda):
     """The CuPy fast path must agree with the generic warp, also when torch runs on a
     non-default stream (its DLPack views and CuPy work are stream-ordered)."""
-    from panther_em.inference.search.basis import KernelBank
+    from panther_em.inference.search.template import KernelBank
 
     fast = KernelBank(recon_cuda, device="cuda")
     slow = KernelBank(recon_cuda, device="cuda")

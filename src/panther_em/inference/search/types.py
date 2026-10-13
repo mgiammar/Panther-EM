@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import enum
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -112,17 +112,15 @@ class ImageSet:
     center_only: bool | None = None
 
     def __post_init__(self) -> None:
-        """Promote a single image and validate the filter stack shape."""
+        """Validate (never coerce): a real ``(B, H, W)`` stack and matching filters."""
         images = self.images
-        if images.dim() == 2:
-            images = images.unsqueeze(0)
         if images.dim() != 3:
             raise ValueError(
-                f"images must have shape (H, W) or (B, H, W), got {tuple(images.shape)}"
+                f"images must have shape (B, H, W), got {tuple(images.shape)}; use "
+                "ImageSet.single() for one (H, W) image"
             )
         if images.is_complex():
             raise ValueError("images must be real-valued")
-        object.__setattr__(self, "images", images)
 
         b, h, w = images.shape
         if self.filters is not None:
@@ -193,7 +191,9 @@ class ImageSet:
             raise ValueError(
                 f"single() expects an (H, W) image, got {tuple(image.shape)}"
             )
-        return cls(image, filters=filters, mask=mask, center_only=center_only)
+        return cls(
+            image.unsqueeze(0), filters=filters, mask=mask, center_only=center_only
+        )
 
     @classmethod
     def from_stack(
@@ -333,15 +333,19 @@ class PixelSelection:
 
     index: torch.Tensor
     geometry: SearchGeometry
-    _n: int = field(init=False, repr=False)
+
+    @classmethod
+    def create(cls, index: torch.Tensor, geometry: SearchGeometry) -> PixelSelection:
+        """Build a selection from any integer index tensor (cast to int64)."""
+        return cls(torch.as_tensor(index).reshape(-1).to(torch.long), geometry)
 
     def __post_init__(self) -> None:
-        """Coerce the index to int64 and cache its length."""
-        if self.index.dim() != 1:
-            raise ValueError(f"index must be 1-D, got shape {tuple(self.index.shape)}")
-        if self.index.dtype != torch.long:
-            object.__setattr__(self, "index", self.index.to(torch.long))
-        object.__setattr__(self, "_n", int(self.index.numel()))
+        """Validate (never coerce): a 1-D int64 index."""
+        if self.index.dim() != 1 or self.index.dtype is not torch.long:
+            raise ValueError(
+                f"index must be a 1-D int64 tensor, got {tuple(self.index.shape)} "
+                f"{self.index.dtype}; see PixelSelection.create()"
+            )
 
     @classmethod
     def all(
@@ -361,7 +365,7 @@ class PixelSelection:
 
     def __len__(self) -> int:
         """Number of selected pixels."""
-        return self._n
+        return int(self.index.numel())
 
     @property
     def device(self) -> torch.device:
@@ -371,7 +375,7 @@ class PixelSelection:
     @property
     def is_full(self) -> bool:
         """Whether every pixel of the geometry is selected (cheap size check)."""
-        return self._n == self.geometry.n_pixels
+        return len(self) == self.geometry.n_pixels
 
     def to(self, device: torch.device | str) -> PixelSelection:
         """Copy with the index on another device."""
@@ -379,15 +383,15 @@ class PixelSelection:
 
     def subset(self, keep: torch.Tensor) -> PixelSelection:
         """Keep pixels where the ``(P,)`` bool ``keep`` is True (order preserved)."""
-        if tuple(keep.shape) != (self._n,) or keep.dtype != torch.bool:
-            raise ValueError(f"keep must be a ({self._n},) bool tensor")
+        if tuple(keep.shape) != (len(self),) or keep.dtype != torch.bool:
+            raise ValueError(f"keep must be a ({len(self)},) bool tensor")
         return PixelSelection(self.index[keep.to(self.index.device)], self.geometry)
 
     def scatter(self, values: torch.Tensor, fill: float | int) -> torch.Tensor:
         """Scatter ``(P, ...)`` values into a dense ``(B, *grid, ...)`` map."""
-        if int(values.shape[0]) != self._n:
+        if int(values.shape[0]) != len(self):
             raise ValueError(
-                f"values must have leading axis {self._n}, got {tuple(values.shape)}"
+                f"values must have leading axis {len(self)}, got {tuple(values.shape)}"
             )
         dense = torch.full(
             (self.geometry.n_pixels, *values.shape[1:]),

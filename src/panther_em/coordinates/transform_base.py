@@ -352,7 +352,7 @@ class CoordinateTransform(ABC):
     # Device-dispatch coord cache
     # ------------------------------------------------------------------ #
 
-    def _get_device_coords(self, device: str | torch.device) -> dict[str, Any]:
+    def device_coords(self, device: str | torch.device) -> dict[str, Any]:
         """Return device-appropriate coord arrays, caching CUDA copies.
 
         Parameters
@@ -377,6 +377,10 @@ class CoordinateTransform(ABC):
             }
         return self._device_cache[key]
 
+    def _get_device_coords(self, device: str | torch.device) -> dict[str, Any]:
+        """Backwards-compatible alias of :meth:`device_coords`."""
+        return self.device_coords(device)
+
     # ------------------------------------------------------------------ #
     # Cache management
     # ------------------------------------------------------------------ #
@@ -392,15 +396,29 @@ class CoordinateTransform(ABC):
     # Radial boundary hooks for the polar -> Cartesian warp
     # ------------------------------------------------------------------ #
 
+    def pad_radial_axis(
+        self, image: np.ndarray | torch.Tensor
+    ) -> tuple[np.ndarray | torch.Tensor, int]:
+        """Extend a polar image along its radial axis before the inverse warp.
+
+        Returns the (possibly) padded image and the number of rows prepended at
+        the inner (small-radius) end; the base transform pads nothing.
+        """
+        return image, 0
+
+    def outer_radius_index(self) -> float | None:
+        """Largest radial coordinate inside the transform's support (``None`` = all)."""
+        return None
+
     def _pad_radial_axis(
         self, image: np.ndarray | torch.Tensor
     ) -> tuple[np.ndarray | torch.Tensor, int]:
-        """Extend a polar image along its radial axis before the inverse warp."""
-        return image, 0
+        """Backwards-compatible alias of :meth:`pad_radial_axis`."""
+        return self.pad_radial_axis(image)
 
     def _outer_radius_index(self) -> float | None:
-        """Largest radial coordinate inside the transform's support."""
-        return None
+        """Backwards-compatible alias of :meth:`outer_radius_index`."""
+        return self.outer_radius_index()
 
     # ------------------------------------------------------------------ #
     # Concrete warp methods
@@ -490,7 +508,7 @@ class CoordinateTransform(ABC):
             return torch.complex(real_part, imag_part)
 
         # --- base case: single real 2-D image ---
-        dc = self._get_device_coords(device)
+        dc = self.device_coords(device)
         warp_fn = get_warp_function(device)
         warped = warp_fn(
             image,
@@ -601,7 +619,7 @@ class CoordinateTransform(ABC):
             return torch.complex(real_part, imag_part)
 
         # --- base case: single real 2-D image ---
-        dc = self._get_device_coords(device)
+        dc = self.device_coords(device)
 
         if preserve_energy and dc["jacobian"] is not None:
             image = image / dc["jacobian"]
@@ -610,7 +628,7 @@ class CoordinateTransform(ABC):
 
         # Continue the radial axis though origin for spline interpolation
         if pad_radial_axis:
-            image, num_prepended = self._pad_radial_axis(image)
+            image, num_prepended = self.pad_radial_axis(image)
             if num_prepended:
                 coords = coords.copy() if device == "numpy" else coords.clone()
                 coords[1, ...] += num_prepended
@@ -647,7 +665,7 @@ class CoordinateTransform(ABC):
         )
 
         # Zero the pixels outside the support, which padded rows could otherwise reach
-        outer_index = self._outer_radius_index() if pad_radial_axis else None
+        outer_index = self.outer_radius_index() if pad_radial_axis else None
         if outer_index is not None:
             warped = warped * (dc["cartesian"][1] <= outer_index)
         return warped
@@ -745,19 +763,19 @@ class GridTransform(CoordinateTransform):
                 self._source_transform = source
         return self._source_transform
 
-    def _pad_radial_axis(
+    def pad_radial_axis(
         self, image: np.ndarray | torch.Tensor
     ) -> tuple[np.ndarray | torch.Tensor, int]:
         """Delegate to :attr:`source_transform` (no padding without one)."""
         source = self.source_transform
         if source is None:
             return image, 0
-        return source._pad_radial_axis(image)
+        return source.pad_radial_axis(image)
 
-    def _outer_radius_index(self) -> float | None:
+    def outer_radius_index(self) -> float | None:
         """Delegate to :attr:`source_transform` (no masking without one)."""
         source = self.source_transform
-        return None if source is None else source._outer_radius_index()
+        return None if source is None else source.outer_radius_index()
 
     @classmethod
     def from_transform(cls, transform: CoordinateTransform) -> GridTransform:

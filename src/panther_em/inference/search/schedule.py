@@ -15,7 +15,7 @@ from panther_em.inference.search.decisions import (
     Decision,
     NoDecision,
 )
-from panther_em.inference.search.tiling import FeatureLayout, rectangles_disjoint
+from panther_em.inference.search.features import FeatureLayout, rectangles_disjoint
 from panther_em.inference.search.types import Precision, Rectangle
 
 if TYPE_CHECKING:

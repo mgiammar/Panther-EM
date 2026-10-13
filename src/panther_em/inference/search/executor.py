@@ -24,8 +24,8 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 
 from panther_em.inference.search import fused_kernel_loader
-from panther_em.inference.search.basis import _ByteLRU
-from panther_em.inference.search.contraction import Spectrum, make_engine
+from panther_em.inference.search.template import _ByteLRU
+from panther_em.inference.search.features import Spectrum, make_engine
 from panther_em.inference.search.hypotheses import HypothesisSet
 from panther_em.inference.search.statistics import (
     SpectrumSpec,
@@ -33,18 +33,18 @@ from panther_em.inference.search.statistics import (
     fused_stats_supported,
     make_block_stats,
 )
-from panther_em.inference.search.store import Residency
+from panther_em.inference.search.features import Residency
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Hashable, Iterable, Sequence
 
-    from panther_em.inference.search.basis import WeightSource
-    from panther_em.inference.search.contraction import ContractionEngine
+    from panther_em.inference.search.template import WeightSource
+    from panther_em.inference.search.features import ContractionEngine
     from panther_em.inference.search.hypotheses import HypBatch, HypothesisSpace
     from panther_em.inference.search.schedule import StageSpec
     from panther_em.inference.search.statistics import BlockStats
-    from panther_em.inference.search.store import ColumnGroup, FeatureStore
-    from panther_em.inference.search.tiling import FeatureLayout, KRun
+    from panther_em.inference.search.features import ColumnGroup, FeatureStore
+    from panther_em.inference.search.features import FeatureLayout, KRun
     from panther_em.inference.search.types import BatchShape, Precision
 
 LoopKind = Literal["eager", "graph"]

@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from panther_em.inference.search.basis import WeightSource
-from panther_em.inference.search.contraction import ComplexGemmEngine
+from panther_em.inference.search.template import WeightSource
+from panther_em.inference.search.features import ComplexGemmEngine
 from panther_em.inference.search.executor import (
     Executor,
     hyp_batch_multiple,
@@ -14,10 +14,10 @@ from panther_em.inference.search.executor import (
     plan_stage,
 )
 from panther_em.inference.search.hypotheses import HypBatch
-from panther_em.inference.search.tiling import FeatureLayout
+from panther_em.inference.search.features import FeatureLayout
 from panther_em.inference.search.hypotheses import HypothesisSet, HypothesisSpace
 from panther_em.inference.search.schedule import StageSpec
-from panther_em.inference.search.store import FeatureStore
+from panther_em.inference.search.features import FeatureStore
 from panther_em.inference.search.types import (
     BatchShape,
     ImageSet,
@@ -238,7 +238,7 @@ def test_plan_memory_defaults_and_overrides(synthetic_result):
 def test_executor_prepared_weights_hit_and_evict(synthetic_result):
     result = synthetic_result()
     src = WeightSource(result, "cpu")
-    layout = FeatureLayout([(0, 0, 3, 2), (0, 2, 3, 3), (3, 0, 1, 5)])
+    layout = FeatureLayout.create([(0, 0, 3, 2), (0, 2, 3, 3), (3, 0, 1, 5)])
     engine = ComplexGemmEngine()
     run = layout.k_runs[0]  # k in [0, 3): both first rectangles
     batch = HypBatch(0, 1, 5, 1)

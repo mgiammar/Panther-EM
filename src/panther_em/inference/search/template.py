@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from collections.abc import Hashable, Iterable, Sequence
     from pathlib import Path
 
-    from panther_em.inference.search.tiling import FeatureLayout
+    from panther_em.inference.search.features import FeatureLayout
 
 Cell = tuple[int, int]
 
@@ -172,6 +172,9 @@ class KernelBank:
         self._host_arena: torch.Tensor | None = None
         self._spectral_cache = _ByteLRU(spectral_budget)
         self._spectral_enabled = spectral_budget is None or spectral_budget > 0
+        # device-side pieces of the separable kernel build, resolved on first use
+        self._sep: dict[str, Any] | None = None
+        self._sep_resolved = False
 
     # -- construction --------------------------------------------------------
 
@@ -183,10 +186,10 @@ class KernelBank:
         recon = self.reconstructor
         indices = np.column_stack([np.full(len(ms), k), np.asarray(ms)])
         _, _, vh = recon.result.get_svd_tensors(indices, recon.device)  # (M, R)
-        angular = recon._get_angular_phase_component(k, 0.0)  # (A,)
+        angular = recon.angular_phase_component(k, 0.0)  # (A,)
         polar = angular[None, :, None] * vh[:, None, :]  # (M, A, R) complex64
         cfg = self.config
-        cart = recon._coordinate_transform.to_cartesian(
+        cart = recon.coordinate_transform.to_cartesian(
             polar,
             preserve_energy=cfg.preserve_energy,
             wrap_angular_axis=cfg.wrap_angular_axis,
@@ -214,10 +217,10 @@ class KernelBank:
         12 samples of ``cval`` before prefiltering (zero padding keeps the outer
         product separable).
         """
-        if hasattr(self, "_sep"):
+        if self._sep_resolved:
             return self._sep
-        self._sep: dict[str, Any] | None = None
-        tf = self.reconstructor._coordinate_transform
+        self._sep_resolved = True
+        tf = self.reconstructor.coordinate_transform
         if self.device.type != "cuda" or self.config.mode != "constant":
             return None
         try:
@@ -225,7 +228,7 @@ class KernelBank:
             import cupyx.scipy.ndimage as ndi  # type: ignore[import-untyped]
         except ImportError:
             return None
-        dc = tf._get_device_coords(self.device)
+        dc = tf.device_coords(self.device)
         jac = dc["jacobian"]
         if jac is not None and not bool(torch.all(jac == jac[0:1])):
             return None  # Jacobian varies with angle: not separable
@@ -242,12 +245,12 @@ class KernelBank:
         # transforms); that continuation mixes angle and radius, so it is not separable
         probe = torch.zeros(tf.polar_shape, device=self.device)
         try:
-            _, num_prepended = tf._pad_radial_axis(probe)
+            _, num_prepended = tf.pad_radial_axis(probe)
         except Exception:
             return None
         if num_prepended:
             return None
-        outer = tf._outer_radius_index()
+        outer = tf.outer_radius_index()
         npad = 12  # ndimage's grid-constant pre-padding
         coords = dc["cartesian"].to(torch.float32).clone()
         support = (
@@ -311,7 +314,7 @@ class KernelBank:
 
         ang = sep["angular"].get(k)
         if ang is None:
-            a = recon._get_angular_phase_component(k, 0.0).to(torch.complex64)
+            a = recon.angular_phase_component(k, 0.0).to(torch.complex64)
             if wrap:
                 a = torch.nn.functional.pad(
                     a[None, None], (wrap, wrap), mode="circular"
