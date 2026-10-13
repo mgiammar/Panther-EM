@@ -6,7 +6,7 @@ import csv
 import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -14,7 +14,6 @@ import torch
 from panther_em.inference.search.decisions import (
     Decision,
     NoDecision,
-    PairEmissionDecision,
 )
 from panther_em.inference.search.tiling import FeatureLayout, rectangles_disjoint
 from panther_em.inference.search.types import Precision, Rectangle
@@ -24,7 +23,6 @@ if TYPE_CHECKING:
 
     from panther_em.decomposition.result import DecompositionResult
     from panther_em.inference.search.hypotheses import HypothesisSubset
-    from panther_em.inference.search.pairs import PairEmissionSpec
 
 
 def _as_rectangles(rectangles: Sequence[Sequence[int]]) -> tuple[Rectangle, ...]:
@@ -73,13 +71,6 @@ class StageSpec:
         Restrict this stage to a subset of the hypothesis space (e.g. a scout pass).
     name : str, optional
         Free-form label.
-    pairs : PairEmissionSpec, optional
-        Emit the sparse ``(pixel, template)`` pairs passing a threshold (plus their
-        dilation) for a following sparse stage; ``NoDecision`` on such a stage
-        becomes ``PairEmissionDecision``.
-    mode : {"dense", "sparse_pairs"}
-        ``"sparse_pairs"`` evaluates only the pairs the previous emitting stage
-        produced (all templates; ``hypotheses`` may still restrict defocus planes).
     """
 
     rectangles: tuple[Rectangle, ...]
@@ -88,8 +79,6 @@ class StageSpec:
     error: float | None = None
     hypotheses: HypothesisSubset | None = None
     name: str = ""
-    pairs: PairEmissionSpec | None = None
-    mode: Literal["dense", "sparse_pairs"] = "dense"
 
     def __post_init__(self) -> None:
         """Normalise rectangles/precision and validate the psi cap."""
@@ -117,23 +106,6 @@ class StageSpec:
             raise ValueError(
                 f"error must be a relative error in [0, 1), got {self.error}"
             )
-        if self.mode not in ("dense", "sparse_pairs"):
-            raise ValueError(
-                f"mode must be 'dense' or 'sparse_pairs', got {self.mode!r}"
-            )
-        if self.mode == "sparse_pairs":
-            if self.pairs is not None:
-                raise ValueError("a sparse_pairs stage cannot emit pairs itself")
-            if self.hypotheses is not None and self.hypotheses.template_ids is not None:
-                raise ValueError(
-                    "a sparse_pairs stage evaluates the pairs' templates; "
-                    "only defocus_ids may restrict it"
-                )
-
-    @property
-    def emit_pairs(self) -> bool:
-        """Whether this stage emits sparse pairs."""
-        return self.pairs is not None
 
     @property
     def k_stop(self) -> int:
@@ -168,7 +140,7 @@ class SearchSchedule:
     stop_when_empty : bool, optional
         Skip the remaining stages once no pixel is ``UNCERTAIN``. Defaults to True.
     keep_stage_results : bool, optional
-        Retain every stage's sparse result on the final :class:`SearchResult`.
+        Retain every stage's compact result on the final :class:`SearchResult`.
     """
 
     stages: tuple[StageSpec, ...]
@@ -189,18 +161,6 @@ class SearchSchedule:
                 f"got {len(decisions)} decisions for {len(stages)} stages; "
                 "need one per stage"
             )
-        # an emitting stage's default decision is the emission itself
-        decisions = tuple(
-            PairEmissionDecision() if s.emit_pairs and isinstance(d, NoDecision) else d
-            for s, d in zip(stages, decisions, strict=True)
-        )
-        for i, stage in enumerate(stages):
-            if stage.mode == "sparse_pairs" and not any(
-                s.emit_pairs for s in stages[:i]
-            ):
-                raise ValueError(
-                    f"sparse_pairs stage {i} has no emitting stage before it"
-                )
         object.__setattr__(self, "stages", stages)
         object.__setattr__(self, "decisions", decisions)
 
@@ -380,7 +340,6 @@ def nested_schedule(
     error_model: ErrorModel | None = None,
     decision: Decision | Sequence[Decision] | None = None,
     scout: HypothesisSubset | None = None,
-    pairs: PairEmissionSpec | None = None,
     stop_when_empty: bool = True,
     keep_stage_results: bool = False,
 ) -> SearchSchedule:
@@ -400,8 +359,6 @@ def nested_schedule(
         Defaults to :class:`NoDecision` everywhere.
     scout : HypothesisSubset, optional
         Applied to the first stage only.
-    pairs : PairEmissionSpec, optional
-        Makes the first stage emit pairs.
     stop_when_empty, keep_stage_results : bool, optional
         Forwarded to :class:`SearchSchedule`.
     """
@@ -425,7 +382,6 @@ def nested_schedule(
             error=e,
             hypotheses=scout if i == 0 else None,
             name=f"stage{i}",
-            pairs=pairs if i == 0 else None,
         )
         for i, ((k_ext, m_ext), p, ps, e) in enumerate(
             zip(extents, precisions, psis, errs, strict=True)

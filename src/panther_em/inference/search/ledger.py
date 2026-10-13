@@ -11,11 +11,8 @@ import torch.nn.functional as F
 from panther_em.inference.search.types import PixelSelection
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     from panther_em.inference.search.executor import StageMaps
     from panther_em.inference.search.hypotheses import HypothesisPlan
-    from panther_em.inference.search.pairs import PairList
     from panther_em.inference.search.types import SearchGeometry
 
 
@@ -54,10 +51,6 @@ class PixelLedger:
         Where the state lives.
     initial : PixelSelection, optional
         Pixels eligible for the search; everything else is ``MASKED``.
-    aux : Mapping[str, torch.Tensor], optional
-        Per-pixel auxiliary maps (``(n_pixels,)`` flat or ``(B, *grid)`` dense) that
-        decisions may read, e.g. ``image_norm`` and ``noise_variance``. Stored flat as
-        float32 on the ledger device.
     """
 
     FIELDS = (
@@ -76,19 +69,10 @@ class PixelLedger:
         device: torch.device | str,
         *,
         initial: PixelSelection | None = None,
-        aux: Mapping[str, torch.Tensor] | None = None,
     ) -> None:
         self.geometry = geometry
         self.device = torch.device(device)
         n = geometry.n_pixels
-        self.aux: dict[str, torch.Tensor] = {}
-        for name, values in (aux or {}).items():
-            flat = values.reshape(-1)
-            if int(flat.numel()) != n:
-                raise ValueError(
-                    f"aux map {name!r} has {int(flat.numel())} values for {n} pixels"
-                )
-            self.aux[name] = flat.to(self.device, torch.float32)
         nan = float("nan")
         self.label = torch.full(
             (n,), int(PixelLabel.PENDING), dtype=torch.int8, device=self.device
@@ -101,7 +85,6 @@ class PixelLedger:
         self.best_psi = torch.full((n,), -1, dtype=torch.int64, device=self.device)
         self.last_stage = torch.full((n,), -1, dtype=torch.int16, device=self.device)
         self.n_psi_of_stage: list[int] = []
-        self.pairs: dict[int, PairList] = {}  # stage index -> emitted pairs
         if initial is not None and not initial.is_full:
             self.label.fill_(int(PixelLabel.MASKED))
             self.label[initial.index.to(self.device)] = int(PixelLabel.PENDING)
@@ -159,9 +142,8 @@ class PixelLedger:
         return self.variance.clamp_min(0.0).sqrt()
 
     def grid(self, name: str) -> torch.Tensor:
-        """A field (or an ``aux`` map) as a dense ``(B, *grid)`` map."""
-        values = self.aux[name] if name in self.aux else getattr(self, name)
-        return self.geometry.unflatten(values)
+        """A field as a dense ``(B, *grid)`` map."""
+        return self.geometry.unflatten(getattr(self, name))
 
     # -- neighbourhood ----------------------------------------------------------
 

@@ -43,45 +43,31 @@ Pipeline of one stage
    ``ACCEPTED`` / ``REJECTED`` / ``UNCERTAIN`` (``ABSORBED`` near accepted ones);
    ``UNCERTAIN`` pixels form the next stage's pixel set.
 
-The three search algorithms, as schedules
+The two search types, as schedules
 -----------------------------------------
 1. **Single rank**: one dense stage::
 
-       SearchSchedule.single(StageSpec([(0, 0, 128, 64)], n_psi=256),
-                             ThresholdClassifier(7.8))
+       SearchSchedule.single(
+           StageSpec([(0, 0, 128, 64)], n_psi=256), ThresholdClassifier(7.8)
+       )
 
 2. **Pixel rejection**: a low-rank dense stage on one defocus plane rejects pixels; the
    survivors are re-searched densely at high rank over every plane::
 
        SearchSchedule(
-           (StageSpec([(0, 0, 32, 16)], precision="fp16",
-                      hypotheses=HypothesisSubset(defocus_ids=torch.tensor([D // 2]))),
-            StageSpec([(0, 0, 128, 64)])),
+           (
+               StageSpec(
+                   [(0, 0, 32, 16)],
+                   precision="fp16",
+                   hypotheses=HypothesisSubset(defocus_ids=torch.tensor([D // 2])),
+               ),
+               StageSpec([(0, 0, 128, 64)]),
+           ),
            (ZScoreIntervalClassifier(7.8), ThresholdClassifier(7.8)),
        )
 
    Each store group holds only the planes its stage uses, so the first stage pays
    the featurization of one plane.
-3. **Pixel and hypothesis rejection**: the first stage also *emits* the sparse
-   ``(pixel, template)`` pairs passing :func:`surpass_threshold`, dilated to
-   neighbouring pixels and (for HEALPix-sampled orientations) neighbouring
-   orientations; the second stage scores only those pairs at full rank::
-
-       SearchSchedule(
-           (StageSpec([(0, 0, 32, 16)], precision="fp16",
-                      pairs=PairEmissionSpec(threshold=5.0, pixel_radius=1,
-                                             orientation_rings=1)),
-            StageSpec([(0, 0, 128, 64)], mode="sparse_pairs")),
-           (NoDecision(), ThresholdClassifier(7.8)),  # NoDecision becomes the emission
-       )
-
-   The emitting stage needs the per-pixel maps the rule reads,
-   ``ImageSet(..., pixel_maps={"image_norm": ..., "noise_variance": ...})``, and
-   ``orientation_rings > 0`` needs a template whose Euler angles are HEALPix pixel
-   centers (``healpix_orientations(nside)`` generates them for a new decomposition;
-   other templates can use ``orientation_rings=0``). The sparse stage standardises
-   its scores with the emitting stage's per-pixel mean and variance.
-
 Example
 -------
 ::
@@ -123,13 +109,10 @@ from panther_em.inference.search.decisions import (
     DecisionChain,
     DilationAbsorb,
     NoDecision,
-    PairEmissionDecision,
-    SurpassThresholdDecision,
     ThresholdClassifier,
     TopFractionSelector,
     ZScoreIntervalClassifier,
     classify_zscore_interval,
-    surpass_threshold,
     zscore_error_intervals,
 )
 from panther_em.inference.search.featurize import (
@@ -142,14 +125,12 @@ from panther_em.inference.search.hypotheses import (
     HypothesisPlan,
     HypothesisSpace,
     HypothesisSubset,
+    healpix_ipix,
+    healpix_level_ids,
+    healpix_orientations,
     psi_degrees,
 )
 from panther_em.inference.search.ledger import PixelLabel, PixelLedger
-from panther_em.inference.search.orientations import (
-    S2Neighborhood,
-    healpix_orientations,
-)
-from panther_em.inference.search.pairs import PairEmissionSpec, PairList
 from panther_em.inference.search.results import DecodedMaps, SearchResult, StageResult
 from panther_em.inference.search.schedule import (
     ErrorModel,
@@ -162,7 +143,6 @@ from panther_em.inference.search.searcher import (
     Searcher,
     SearchSession,
 )
-from panther_em.inference.search.sparse import PairScores, SparsePairEvaluator
 from panther_em.inference.search.store import FeatureStore
 from panther_em.inference.search.tiling import FeatureLayout
 from panther_em.inference.search.types import (
@@ -197,10 +177,6 @@ __all__ = [
     "KernelConfig",
     "MemoryPlan",
     "NoDecision",
-    "PairEmissionDecision",
-    "PairEmissionSpec",
-    "PairList",
-    "PairScores",
     "PixelLabel",
     "PixelLedger",
     "PixelSelection",
@@ -208,26 +184,24 @@ __all__ = [
     "Precision",
     "PreparedWeightCache",
     "Rectangle",
-    "S2Neighborhood",
     "SearchGeometry",
     "SearchResult",
     "SearchSchedule",
     "SearchSession",
     "Searcher",
-    "SparsePairEvaluator",
     "StageResult",
     "StageSpec",
-    "SurpassThresholdDecision",
     "Template",
     "ThresholdClassifier",
     "TopFractionSelector",
     "WeightSource",
     "ZScoreIntervalClassifier",
     "classify_zscore_interval",
+    "healpix_ipix",
+    "healpix_level_ids",
     "healpix_orientations",
     "make_featurizer",
     "nested_schedule",
     "psi_degrees",
-    "surpass_threshold",
     "zscore_error_intervals",
 ]

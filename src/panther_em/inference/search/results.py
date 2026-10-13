@@ -1,9 +1,9 @@
-"""Results: one stage's sparse maps, and the dense final maps with decoding and I/O."""
+"""Results: one stage's compact maps, and the dense final maps with decoding and I/O."""
 
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
 import h5py  # type: ignore[import-untyped]
@@ -11,7 +11,6 @@ import numpy as np
 import torch
 
 from panther_em.inference.search.hypotheses import HypothesisSpace
-from panther_em.inference.search.pairs import PairEmissionSpec, PairList
 from panther_em.inference.search.schedule import SearchSchedule, StageSpec
 from panther_em.inference.search.types import SearchGeometry
 
@@ -20,7 +19,6 @@ if TYPE_CHECKING:
 
     from panther_em.inference.search.executor import StageMaps
     from panther_em.inference.search.ledger import PixelLedger
-    from panther_em.inference.search.sparse import PairScores
     from panther_em.inference.search.types import Rectangle
 
 MAP_NAMES = (
@@ -35,21 +33,9 @@ MAP_NAMES = (
 )
 
 
-def _pairs_spec_to_json(spec: PairEmissionSpec | None) -> dict | None:
-    if spec is None:
-        return None
-    return asdict(spec) | {"pair_dtype": str(spec.pair_dtype).removeprefix("torch.")}
-
-
-def _pairs_spec_from_json(data: dict | None) -> PairEmissionSpec | None:
-    if data is None:
-        return None
-    return PairEmissionSpec(**data | {"pair_dtype": getattr(torch, data["pair_dtype"])})
-
-
 @dataclass(eq=False)
 class StageResult:
-    """One stage's sparse result, in the stage's compact pixel order.
+    """One stage's result, in the stage's compact pixel order.
 
     Attributes
     ----------
@@ -67,11 +53,7 @@ class StageResult:
         Pixels still eligible for the next stage (whole ledger).
     elapsed_s : float
         Wall time of the stage; ``featurize_s`` (store preparation) and ``execute_s``
-        (block loop, or the sparse evaluation) split it for tuning.
-    pairs : PairList, optional
-        The ``(pixel, template)`` pairs an emitting stage produced (after dilation).
-    scores : PairScores, optional
-        A sparse stage's per-pair scores.
+        (block loop) split it for tuning.
     """
 
     stage_index: int
@@ -82,8 +64,6 @@ class StageResult:
     labels_after: torch.Tensor
     n_uncertain_after: int
     elapsed_s: float
-    pairs: PairList | None = None
-    scores: PairScores | None = None
     featurize_s: float = 0.0
     execute_s: float = 0.0
 
@@ -144,7 +124,6 @@ class SearchResult:
     n_psi_of_stage: tuple[int, ...]
     stages: list[StageResult] = field(default_factory=list)
     elapsed_s: float = 0.0
-    pairs: dict[int, PairList] = field(default_factory=dict)
 
     @classmethod
     def from_ledger(
@@ -173,7 +152,6 @@ class SearchResult:
             n_psi_of_stage=tuple(ledger.n_psi_of_stage),
             stages=list(stages or []),
             elapsed_s=elapsed_s,
-            pairs=dict(ledger.pairs),
         )
 
     # -- derived -----------------------------------------------------------------
@@ -262,7 +240,6 @@ class SearchResult:
             n_psi_of_stage=self.n_psi_of_stage,
             stages=self.stages,
             elapsed_s=self.elapsed_s,
-            pairs={i: p.to(device) for i, p in self.pairs.items()},
             **moved,
         )
 
@@ -307,17 +284,11 @@ class SearchResult:
                         "n_psi": s.n_psi,
                         "error": s.error,
                         "name": s.name,
-                        "pairs": _pairs_spec_to_json(s.pairs),
-                        "mode": s.mode,
                     }
                     for s in self.schedule.stages
                 ]
             )
             f.attrs["elapsed_s"] = float(self.elapsed_s)
-            if self.pairs:
-                grp = f.create_group("pairs")
-                for i, pairs in sorted(self.pairs.items()):
-                    pairs.save(grp.create_group(f"stage{i}"))
 
     @classmethod
     def load(cls, path: str | Path) -> SearchResult:
@@ -358,15 +329,9 @@ class SearchResult:
                     n_psi=int(s["n_psi"]),
                     error=s["error"],
                     name=s.get("name", ""),
-                    pairs=_pairs_spec_from_json(s.get("pairs")),
-                    mode=s.get("mode", "dense"),
                 )
                 for s in json.loads(f.attrs["stages"])
             )
-            pairs = {}
-            if "pairs" in f:
-                for name, grp in f["pairs"].items():
-                    pairs[int(name.removeprefix("stage"))] = PairList.load(grp)
             n_psi_of_stage = tuple(
                 int(v) for v in json.loads(f.attrs["n_psi_of_stage"])
             )
@@ -385,5 +350,4 @@ class SearchResult:
             last_stage=maps["last_stage"],
             n_psi_of_stage=n_psi_of_stage,
             elapsed_s=elapsed,
-            pairs=pairs,
         )

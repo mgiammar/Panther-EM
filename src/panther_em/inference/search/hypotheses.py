@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple
 
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
@@ -429,3 +430,67 @@ class HypothesisPlan:
         )
         g = d * self.space.n_templates + template
         return torch.where(valid, g, torch.full_like(v, -1))
+
+
+# --------------------------------------------------------------------------- #
+# HEALPix orientation grids
+# --------------------------------------------------------------------------- #
+
+
+def healpix_orientations(nside: int) -> tuple[np.ndarray, np.ndarray]:
+    """``(phi_deg, theta_deg)`` of every HEALPix pixel at ``nside``, NESTED order.
+
+    Float32, in the argument order of ``PolarProjectionDecomposer``; orientation
+    index == NESTED pixel id, which is what :func:`healpix_level_ids` relies on.
+    """
+    from torch_so3.hierarchical_s2_grid import (  # type: ignore[import-untyped]
+        HierarchicalS2Grid,
+    )
+
+    theta, phi = HierarchicalS2Grid(nside, 1).get_level_orientations(0)
+    return phi.astype(np.float32), theta.astype(np.float32)
+
+
+def _unit_vectors(theta_deg: np.ndarray, phi_deg: np.ndarray) -> np.ndarray:
+    theta, phi = np.radians(theta_deg), np.radians(phi_deg)
+    return np.stack(
+        [np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi), np.cos(theta)], -1
+    )
+
+
+def healpix_ipix(
+    space: HypothesisSpace, *, tol_deg: float = 1e-3, max_nside: int = 4096
+) -> tuple[int, np.ndarray] | None:
+    """``(nside, ipix)`` when the space's orientations are HEALPix pixel centers.
+
+    The smallest ``nside`` whose NESTED pixel centers coincide with every orientation
+    (within ``tol_deg``, all distinct) wins; ``None`` when there is none.
+    """
+    if space.phi_deg is None or space.theta_deg is None:
+        return None
+    from torch_so3.hierarchical_s2_grid import HierarchicalS2Grid
+
+    phi = space.phi_deg.cpu().numpy().astype(np.float64)
+    theta = space.theta_deg.cpu().numpy().astype(np.float64)
+    vec = _unit_vectors(theta, phi)
+    nside = 1
+    while nside <= max_nside:
+        grid = HierarchicalS2Grid(nside, 1)
+        if grid.get_level(0).npix >= phi.size:
+            ipix = grid.index_from_angle(theta, phi, level=0)
+            if np.unique(ipix).size == ipix.size:
+                t2, p2 = grid.angle_from_index(ipix, level=0)
+                cos = np.clip((vec * _unit_vectors(t2, p2)).sum(-1), -1.0, 1.0)
+                if np.degrees(np.arccos(cos)).max() <= tol_deg:
+                    return nside, np.asarray(ipix, dtype=np.int64)
+        nside *= 2
+    return None
+
+
+def healpix_level_ids(ipix: np.ndarray, level: int) -> torch.Tensor:
+    """Orientation ids forming a sampling ``level`` HEALPix levels coarser."""
+    if level < 0:
+        raise ValueError("level must be >= 0")
+    ipix = np.asarray(ipix, dtype=np.int64)
+    keep = np.nonzero(ipix % (4**level) == 0)[0]
+    return torch.from_numpy(keep.astype(np.int64))

@@ -141,15 +141,3 @@ def test_nested_schedule_broadcasts_and_fills_errors():
         nested_schedule([(2, 2), (4, 4)], precision=["fp16"])
     with pytest.raises(ValueError):
         nested_schedule([])
-
-
-def test_nested_schedule_pairs_apply_to_the_first_stage_only():
-    from panther_em.inference.search.decisions import PairEmissionDecision
-    from panther_em.inference.search.pairs import PairEmissionSpec
-
-    spec = PairEmissionSpec(5.0)
-    schedule = nested_schedule([(2, 2), (4, 4)], n_psi=16, pairs=spec)
-    assert schedule.stages[0].pairs is spec and schedule.stages[0].emit_pairs
-    assert schedule.stages[1].pairs is None and not schedule.stages[1].emit_pairs
-    assert isinstance(schedule.decisions[0], PairEmissionDecision)
-    assert isinstance(schedule.decisions[1], NoDecision)

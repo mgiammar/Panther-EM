@@ -10,12 +10,9 @@ from __future__ import annotations
 import enum
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import torch
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping
 
 # (k_start, m_start, k_extent, m_extent) block of ``(angular frequency, eigenvector)``
 # feature space.
@@ -107,19 +104,12 @@ class ImageSet:
     center_only : bool, optional
         Force the 1x1 (center pixel only) evaluation mode. ``None`` (default) selects
         it automatically when the image box equals the template box.
-    pixel_maps : Mapping[str, torch.Tensor], optional
-        Precomputed per-pixel maps on the valid-correlation grid that decisions may
-        read (e.g. ``"image_norm"`` and ``"noise_variance"`` for the calibrated
-        threshold rule): ``(out_h, out_w)`` shared, ``(B, out_h, out_w)`` per image,
-        or ``(B,)`` in center-only mode. Real-valued. Validated against the template
-        box by :meth:`SearchGeometry.from_images`.
     """
 
     images: torch.Tensor
     filters: torch.Tensor | None = None
     mask: torch.Tensor | None = None
     center_only: bool | None = None
-    pixel_maps: Mapping[str, torch.Tensor] | None = None
 
     def __post_init__(self) -> None:
         """Promote a single image and validate the filter stack shape."""
@@ -158,16 +148,6 @@ class ImageSet:
                 )
             if f.shape[-3] < 1:
                 raise ValueError("filters must have at least one defocus plane")
-        if self.pixel_maps is not None:
-            for name, t in self.pixel_maps.items():
-                if (
-                    not isinstance(t, torch.Tensor)
-                    or t.is_complex()
-                    or t.dim() not in (1, 2, 3)
-                ):
-                    raise ValueError(
-                        f"pixel map {name!r} must be a real tensor of 1 to 3 dims"
-                    )
 
     @property
     def n_images(self) -> int:
@@ -207,20 +187,13 @@ class ImageSet:
         filters: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
         center_only: bool | None = None,
-        pixel_maps: Mapping[str, torch.Tensor] | None = None,
     ) -> ImageSet:
         """One ``(H, W)`` image."""
         if image.dim() != 2:
             raise ValueError(
                 f"single() expects an (H, W) image, got {tuple(image.shape)}"
             )
-        return cls(
-            image,
-            filters=filters,
-            mask=mask,
-            center_only=center_only,
-            pixel_maps=pixel_maps,
-        )
+        return cls(image, filters=filters, mask=mask, center_only=center_only)
 
     @classmethod
     def from_stack(
@@ -230,20 +203,13 @@ class ImageSet:
         filters: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
         center_only: bool | None = None,
-        pixel_maps: Mapping[str, torch.Tensor] | None = None,
     ) -> ImageSet:
         """A ``(B, H, W)`` stack of same-size images (micrographs or particle boxes)."""
         if images.dim() != 3:
             raise ValueError(
                 f"from_stack() expects a (B, H, W) stack, got {tuple(images.shape)}"
             )
-        return cls(
-            images,
-            filters=filters,
-            mask=mask,
-            center_only=center_only,
-            pixel_maps=pixel_maps,
-        )
+        return cls(images, filters=filters, mask=mask, center_only=center_only)
 
     # Alias with the particle-stack vocabulary.
     from_boxes = from_stack
@@ -304,8 +270,6 @@ class SearchGeometry:
         )
         if images.mask is not None:
             geometry.validate_mask(images.mask)
-        if images.pixel_maps is not None:
-            geometry.validate_pixel_maps(images.pixel_maps)
         return geometry
 
     @property
@@ -338,32 +302,6 @@ class SearchGeometry:
             f"{self.grid} nor "
             f"the per-image {self.dense_shape}"
         )
-
-    def validate_pixel_map(self, name: str, values: torch.Tensor) -> torch.Tensor:
-        """Broadcast a shared/per-image real map to ``(B, *grid)`` float32."""
-        if values.is_complex():
-            raise ValueError(f"pixel map {name!r} must be real-valued")
-        shape = tuple(values.shape)
-        if shape == self.dense_shape:
-            dense = values
-        elif shape == self.grid:
-            dense = values.unsqueeze(0).expand(self.dense_shape)
-        elif self.mode == "center" and shape == (self.n_images,):
-            dense = values.reshape(self.dense_shape)
-        else:
-            raise ValueError(
-                f"pixel map {name!r} has shape {shape}; expected the shared grid "
-                f"{self.grid} or the per-image {self.dense_shape}"
-            )
-        return dense.to(torch.float32)
-
-    def validate_pixel_maps(
-        self, maps: Mapping[str, torch.Tensor] | None
-    ) -> dict[str, torch.Tensor]:
-        """Every map broadcast to ``(B, *grid)`` float32."""
-        if maps is None:
-            return {}
-        return {name: self.validate_pixel_map(name, t) for name, t in maps.items()}
 
     def flat_index(self, mask: torch.Tensor | None) -> torch.Tensor:
         """Sorted flat int64 indices of the selected pixels (all if no ``mask``)."""

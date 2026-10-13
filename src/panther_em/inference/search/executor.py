@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
 from panther_em.inference.search.context import (
-    Residency,
     LoopInputs,
     MemoryPlan,
+    Residency,
     choose_stats_backend,
 )
 from panther_em.inference.search.contraction import make_engine
@@ -83,7 +83,6 @@ def plan_memory(
     use_cuda_graph: bool = True,
     use_fused_kernel: bool = True,
     store: FeatureStore | None = None,
-    pair_dtype: torch.dtype | None = None,
     residency: Residency | Literal["auto"] = "auto",
 ) -> tuple[MemoryPlan, StatsBackend, ContractionEngine, HypothesisPlan]:
     """Resolve batch shape, block size, engine, stats backend and hypothesis plan.
@@ -92,8 +91,6 @@ def plan_memory(
     -----
     ``store`` (when given) lets the per-pixel byte estimate count the groups that
     will actually be resident, including planes held beyond the stage's own.
-    ``pair_dtype`` makes the stage emit per-pair maxima into a block slab (see
-    :class:`~panther_em.inference.search.statistics.BlockStats`).
     """
     engine = make_engine(spec.precision)
     provisional = HypothesisPlan(space, subset, hyp_batch=1, n_psi=spec.n_psi)
@@ -111,7 +108,6 @@ def plan_memory(
         hyp_batch=1,
         n_virtual=n_virtual,
         device=ctx.device,
-        pair_dtype=pair_dtype,
     )
     backend = choose_stats_backend(probe, ctx.caps, use_fused_kernel=use_fused_kernel)
     memory = ctx.planner.plan(
@@ -128,7 +124,6 @@ def plan_memory(
         batch=batch,
         block_pixels=block_pixels,
         use_cuda_graph=use_cuda_graph,
-        pair_dtype=pair_dtype,
         residency=residency,
     )
     hyp_plan = HypothesisPlan(
@@ -216,7 +211,6 @@ def plan_stage(
         hyp_batch=memory.hyp_batch,
         n_virtual=hyp_plan.n_virtual,
         device=ctx.device,
-        pair_dtype=memory.pair_dtype,
     )
     signature = (
         layout.rectangles,
@@ -230,7 +224,6 @@ def plan_stage(
         hyp_plan.signature,
         backend.name,
         memory.loop,
-        memory.pair_dtype,
     )
     return StagePlan(
         index=index,
@@ -292,27 +285,6 @@ class StageMaps:
         return int(self.mip.numel())
 
 
-@runtime_checkable
-class BlockPairSink(Protocol):
-    """Receives each block's per-pair maxima (a pair-emitting stage's collector)."""
-
-    def consume_block(
-        self,
-        pair_max: torch.Tensor,
-        *,
-        col_start: int,
-        n_valid: int,
-        mean: torch.Tensor,
-        variance: torch.Tensor,
-    ) -> None:
-        """Consume ``pair_max`` ``(n_valid, n_virtual)`` for columns from ``col_start``.
-
-        ``mean`` / ``variance`` are the block's finalized per-pixel moments, shape
-        ``(n_valid,)``. The slab view is overwritten by the next block: copy what
-        must outlive it.
-        """
-
-
 class StageExecutor:
     """Runs one stage's block loop over a store."""
 
@@ -326,16 +298,8 @@ class StageExecutor:
         plan: StagePlan,
         *,
         progress: Callable[[int], None] | None = None,
-        collector: BlockPairSink | None = None,
     ) -> StageMaps:
-        """Reduce every block of ``store`` for ``plan``; ``progress(n_pixels_done)``.
-
-        With ``collector`` (a plan whose memory plan has a ``pair_dtype``) each
-        block's ``(n_valid, n_virtual)`` per-pair maxima are handed over right after
-        its statistics are finalized, on the compute stream.
-        """
-        if collector is not None and plan.memory.pair_dtype is None:
-            raise ValueError("a collector needs a plan built with pair_dtype")
+        """Reduce every block of ``store`` for ``plan``; ``progress(n_pixels_done)``."""
         ctx = self.ctx
         rows = (
             plan.hyp_plan.template_rows(ctx.device)
@@ -385,14 +349,6 @@ class StageExecutor:
                 loop.run(block.operands, block.n_valid)
                 start, n_valid = block.col_range[0], block.n_valid
                 loop.stats.finalize_into(targets, start, n_valid)
-                if collector is not None:
-                    collector.consume_block(
-                        loop.stats.block_pair_max(n_valid),
-                        col_start=start,
-                        n_valid=n_valid,
-                        mean=maps.mean[start : start + n_valid],
-                        variance=maps.variance[start : start + n_valid],
-                    )
                 block.release(None)
                 if progress is not None:
                     progress(block.n_valid)

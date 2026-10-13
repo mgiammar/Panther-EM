@@ -251,33 +251,12 @@ def test_kernel_bank_separable_build_matches_generic_on_a_side_stream(recon_cuda
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         a = fast.spatial(cells)
-        _ = torch.randn(64 << 20, device="cuda")  # churn the allocator on the same stream
+        _ = torch.randn(
+            64 << 20, device="cuda"
+        )  # churn the allocator on the same stream
     torch.cuda.synchronize()
     b = slow.spatial(cells)
     torch.cuda.synchronize()
     rel = ((a - b).flatten(1).norm(dim=1) / b.flatten(1).norm(dim=1)).max().item()
     # both paths mirror the same seam padding; the residual is spline arithmetic
     assert fast._sep is not None and rel < 1e-4, rel
-
-
-def test_kernel_bank_planar_arena_matches_uncached_and_views_consecutive_cells(recon):
-    reference = KernelBank(recon)
-    cells = _cells((0, 0), (0, 1), (0, 2), (1, 0), (1, 1))
-    expected = reference.planar(cells)
-    row_bytes = 2 * 400 * 4
-    bank = KernelBank(recon, planar_budget=4 * row_bytes)  # room for four cells
-    first = bank.planar(cells[:3])
-    torch.testing.assert_close(first, expected[:, :3])
-    assert bank.planar_bytes == 4 * row_bytes
-    # consecutive resident cells come back as a view into the arena
-    again = bank.planar(cells[:3])
-    assert again.data_ptr() == bank._planar[torch.float32].rows.data_ptr()
-    # a permuted request gathers; a request beyond the arena's capacity builds the
-    # remainder on demand (cells (1,0) fills the last slot, (1,1) does not fit)
-    torch.testing.assert_close(bank.planar(cells[[2, 0]]), expected[:, [2, 0]])
-    torch.testing.assert_close(bank.planar(cells), expected)
-    assert bank._planar[torch.float32].n_used == 4
-    torch.testing.assert_close(bank.planar(cells[[4, 1]]), expected[:, [4, 1]])
-    bank.clear()
-    assert bank.planar_bytes == 0
-    torch.testing.assert_close(bank.planar(cells[1:4]), expected[:, 1:4])

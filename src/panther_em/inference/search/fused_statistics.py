@@ -96,15 +96,12 @@ class FusedPixelStats(PixelStats):
         hyp_offset: int,
         num_psi: int,
         reverse_psi_axis: bool = True,
-        pair_out: torch.Tensor | None = None,
     ) -> None:
         """Accumulate one contiguous-arange hypothesis batch, in-kernel when possible.
 
         Falls back to the parent's fused-reduce + graphed-accumulate path whenever
         the in-kernel path does not apply (see :meth:`inkernel_supported`, or
-        ``reverse_psi_axis=False``, or a non-float32 accumulate dtype). With
-        ``pair_out`` the per-pair emission kernel is used in-kernel, else the torch
-        path (the cuFFTDx kernels cannot emit pairs).
+        ``reverse_psi_axis=False``, or a non-float32 accumulate dtype).
         """
         if (
             reverse_psi_axis
@@ -113,32 +110,21 @@ class FusedPixelStats(PixelStats):
             and self.inkernel_supported(spectrum, num_psi, hyp_offset)
         ):
             outs = [self.corr_sum, self.corr_sum2, self.best_packed]
-            if pair_out is None:
-                ran = (
-                    fused_kernel_loader.lean_irfft_stats_transposed(
-                        spectrum.permute(2, 0, 1),
-                        num_psi,
-                        decode=False,
-                        hyp_offset=hyp_offset,
-                        outs=outs,
-                    )
-                    is not None
-                )
-            else:
-                ran = fused_kernel_loader.lean_irfft_stats_pairs_transposed(
+            ran = (
+                fused_kernel_loader.lean_irfft_stats_transposed(
                     spectrum.permute(2, 0, 1),
                     num_psi,
+                    decode=False,
                     hyp_offset=hyp_offset,
                     outs=outs,
-                    pair_out=pair_out,
                 )
+                is not None
+            )
             if ran:
                 self.hypothesis_count += spectrum.shape[1] * num_psi
                 self._packed_num_psi = num_psi
                 return None
-        return super().update_graphed(
-            spectrum, hyp_offset, num_psi, reverse_psi_axis, pair_out
-        )
+        return super().update_graphed(spectrum, hyp_offset, num_psi, reverse_psi_axis)
 
     @torch.no_grad()
     def merge_packed(self, hyp_base: int = 0) -> None:
@@ -253,14 +239,8 @@ class FusedPixelStats(PixelStats):
         return fused_kernel_loader.fused_irfft_stats(spectrum, num_psi, decode=False)
 
     def _reduce(
-        self,
-        spectrum: torch.Tensor,
-        num_psi: int,
-        pair_out: torch.Tensor | None = None,
+        self, spectrum: torch.Tensor, num_psi: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if pair_out is not None:
-            # The fused reduce kernels have no pair output: torch path.
-            return super()._reduce(spectrum, num_psi, pair_out)
         result = self._try_fused_reduce(spectrum, num_psi, decode=True)
         if result is not None:
             return result
@@ -282,16 +262,11 @@ class FusedStatsBackend:
     @staticmethod
     def supports(spec: SpectrumSpec) -> bool:
         """Whether every batch of a stage with ``spec`` takes the in-kernel path."""
-        pairs_ok = spec.pair_dtype is None or (
-            spec.pair_dtype in fused_kernel_loader.PAIR_DTYPES
-            and fused_kernel_loader.lean_pairs_supported(spec.n_psi, spec.n_freq)
-        )
         return bool(
             spec.device.type == "cuda"
             and spec.dtype in (torch.complex64, torch.complex32)
             and fused_kernel_loader.lean_supported(spec.n_psi, spec.n_freq)
             and fused_kernel_loader.lean_sentinel_packed() is not None
-            and pairs_ok
         )
 
     @staticmethod
@@ -304,6 +279,4 @@ class FusedStatsBackend:
             device=spec.device,
             n_psi=spec.n_psi,
             inkernel=True,
-            n_virtual=spec.n_virtual,
-            pair_dtype=spec.pair_dtype,
         )
