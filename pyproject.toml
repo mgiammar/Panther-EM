@@ -47,7 +47,8 @@ dependencies = [
     "h5py",
     "ttsim3d",
     "torch-fourier-slice>=0.6.0",
-    "torch-so3",
+    "torch-so3>=0.6.0",  # HierarchicalS2Grid: HEALPix orientation grids
+    "healpy; platform_system != 'Windows'",
     "roma",
     "ipykernel",
 ]

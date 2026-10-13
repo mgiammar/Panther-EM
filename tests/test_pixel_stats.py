@@ -8,9 +8,6 @@ Covers
   (n_psi, NumFreq) isn't one of the kernel's supported configs.
 - The fused-kernel-unavailable warning fires exactly once per process.
 - encode_argmax_packed / decode_argmax_packed round-trip correctness.
-- The batch-then-reduce accumulation path (begin_hypothesis_batches /
-  accumulate_batch / reduce_hypothesis_batches) matches repeated update() calls,
-  for both the contiguous-arange offset fast path and the gather fallback.
 - The CUDA-graph-captured streaming accumulate path (accumulate_graphed /
   update_graphed) matches repeated update() calls, reuses one captured graph
   across varying hypothesis-batch sizes, and falls back cleanly on CPU.
@@ -212,26 +209,6 @@ def _run_streaming(
     return stats.finalize()
 
 
-def _run_batched(
-    stats_cls,
-    spectra,
-    hyp_idx_batches,
-    num_psi,
-    hyp_offsets=None,
-    reverse_psi_axis=True,
-    device="cpu",
-):
-    stats = stats_cls(spectra[0].shape[0], device=torch.device(device))
-    stats.begin_hypothesis_batches(len(spectra))
-    offsets = hyp_offsets if hyp_offsets is not None else [None] * len(spectra)
-    for spectrum, hyp_idx, offset in zip(
-        spectra, hyp_idx_batches, offsets, strict=False
-    ):
-        stats.accumulate_batch(spectrum, hyp_idx, num_psi=num_psi, hyp_offset=offset)
-    stats.reduce_hypothesis_batches(num_psi=num_psi, reverse_psi_axis=reverse_psi_axis)
-    return stats.finalize()
-
-
 def _assert_results_match(expected, actual):
     for key in expected:
         if key in ("best_index", "best_psi"):
@@ -240,113 +217,6 @@ def _assert_results_match(expected, actual):
             assert torch.allclose(expected[key], actual[key], atol=1e-4), key
 
 
-@pytest.mark.parametrize("stats_cls", [PixelStats, FusedPixelStats])
-@pytest.mark.parametrize("reverse_psi_axis", [True, False])
-def test_batched_accumulation_matches_streaming_offset_fast_path(
-    stats_cls, reverse_psi_axis
-):
-    """Contiguous-arange hypothesis ids per batch -- exercises the additive
-    (no-gather) reconstruction of the winning global hypothesis id."""
-    num_pixels, n_freq, num_psi = 5, 9, 16
-    hyp_per_batch, n_batches = 6, 4
-
-    spectra = [
-        _make_spectrum(num_pixels, hyp_per_batch, n_freq, seed=100 + b)
-        for b in range(n_batches)
-    ]
-    hyp_idx_batches = [
-        torch.arange(b * hyp_per_batch, (b + 1) * hyp_per_batch)
-        for b in range(n_batches)
-    ]
-    hyp_offsets = [b * hyp_per_batch for b in range(n_batches)]
-
-    expected = _run_streaming(
-        stats_cls, spectra, hyp_idx_batches, num_psi, reverse_psi_axis
-    )
-    actual = _run_batched(
-        stats_cls,
-        spectra,
-        hyp_idx_batches,
-        num_psi,
-        hyp_offsets=hyp_offsets,
-        reverse_psi_axis=reverse_psi_axis,
-    )
-    _assert_results_match(expected, actual)
-
-
-@pytest.mark.parametrize("stats_cls", [PixelStats, FusedPixelStats])
-def test_batched_accumulation_matches_streaming_gather_fallback(stats_cls):
-    """Shuffled/non-contiguous hypothesis ids per batch (hyp_offset=None throughout)
-    -- exercises the stored-hyp_idx-stack gather reconstruction path."""
-    num_pixels, n_freq, num_psi = 5, 9, 16
-    hyp_per_batch, n_batches = 6, 4
-
-    torch.manual_seed(7)
-    spectra = [
-        _make_spectrum(num_pixels, hyp_per_batch, n_freq, seed=200 + b)
-        for b in range(n_batches)
-    ]
-    hyp_idx_batches = [torch.randperm(1000)[:hyp_per_batch] for _ in range(n_batches)]
-
-    expected = _run_streaming(stats_cls, spectra, hyp_idx_batches, num_psi)
-    actual = _run_batched(stats_cls, spectra, hyp_idx_batches, num_psi)
-    _assert_results_match(expected, actual)
-
-
-def test_reduce_hypothesis_batches_is_noop_without_staged_batches():
-    stats = PixelStats(3, device=torch.device("cpu"))
-    stats.begin_hypothesis_batches(2)
-    before = stats.finalize()
-    stats.reduce_hypothesis_batches(num_psi=16)
-    after = stats.finalize()
-    for key in before:
-        assert torch.equal(
-            torch.nan_to_num(before[key]), torch.nan_to_num(after[key])
-        ), key
-    assert stats.hypothesis_count == 0
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
-def test_fused_batched_accumulation_matches_streaming_on_cuda():
-    """End-to-end on an actual CUDA device: if the fused kernel is unavailable here,
-    both paths transparently fall back to the same pure-torch reduction, so this
-    still validates the batched-accumulation control flow either way."""
-    num_pixels, n_freq, num_psi = 8, 33, 64
-    hyp_per_batch, n_batches = 12, 5
-
-    spectra = [
-        _make_spectrum(num_pixels, hyp_per_batch, n_freq, device="cuda", seed=300 + b)
-        for b in range(n_batches)
-    ]
-    hyp_idx_batches = [
-        torch.arange(b * hyp_per_batch, (b + 1) * hyp_per_batch, device="cuda")
-        for b in range(n_batches)
-    ]
-    hyp_offsets = [b * hyp_per_batch for b in range(n_batches)]
-
-    expected = _run_streaming(
-        FusedPixelStats, spectra, hyp_idx_batches, num_psi, device="cuda"
-    )
-    actual = _run_batched(
-        FusedPixelStats,
-        spectra,
-        hyp_idx_batches,
-        num_psi,
-        hyp_offsets=hyp_offsets,
-        device="cuda",
-    )
-    for key in expected:
-        if key in ("best_index", "best_psi"):
-            assert torch.equal(expected[key], actual[key]), key
-        else:
-            assert torch.allclose(
-                expected[key].float(), actual[key].float(), atol=1e-3
-            ), key
-
-
-# --------------------------------------------------------------------------- #
-# CUDA-graph-captured streaming accumulate (accumulate_graphed / update_graphed)
-# --------------------------------------------------------------------------- #
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 def test_cuda_graph_capture_supported_probe_is_true_on_this_device():
     assert _cuda_graph_capture_supported(torch.device("cuda").index or 0)

@@ -8,12 +8,15 @@ search never has to materialize the full ``(pixels, hypotheses, psi)`` correlogr
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
+
+    from panther_em.inference.search.hypotheses import HypBatch
 
 
 def _bind_capture_stream(
@@ -263,10 +266,42 @@ class PixelStats:
             (num_pixels,), -1, device=device, dtype=torch.long
         )
 
+    BUFFERS: tuple[str, ...] = (
+        "corr_sum",
+        "corr_sum2",
+        "best_corr",
+        "best_hypothesis",
+        "best_psi_angle",
+    )
+
+    @classmethod
+    def view_of(cls, parent: PixelStats, start: int, stop: int) -> PixelStats:
+        """A tracker whose buffers are views ``[start:stop]`` of ``parent``'s.
+
+        Lets a block keep one set of buffers for all its GEMM sub-batches: the
+        sub-batches accumulate into their slices and the block finalizes once.
+        Scalar bookkeeping (``hypothesis_count``) is per view.
+        """
+        obj = cls.__new__(cls)
+        obj.hypothesis_count = 0
+        obj.num_pixels = stop - start
+        for name in cls.BUFFERS:
+            setattr(obj, name, getattr(parent, name)[start:stop])
+        obj._init_view_extras(parent, start, stop)
+        return obj
+
+    def _init_view_extras(self, parent: PixelStats, start: int, stop: int) -> None:
+        """Hook for subclasses with extra per-instance buffers (no-op here)."""
+        return None
+
+    def clear_bookkeeping(self) -> None:
+        """Reset the scalar state only (a view whose buffers the block cleared)."""
+        self.hypothesis_count = 0
+
     @torch.no_grad()
     def clear(self) -> None:
         """Clear all tracked statistics."""
-        self.hypothesis_count = 0
+        self.clear_bookkeeping()
         self.corr_sum.zero_()
         self.corr_sum2.zero_()
         self.best_corr.fill_(float("-inf"))
@@ -274,7 +309,10 @@ class PixelStats:
         self.best_psi_angle.fill_(-1)
 
     def _reduce(
-        self, spectrum: torch.Tensor, num_psi: int
+        self,
+        spectrum: torch.Tensor,
+        num_psi: int,
+        pair_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reduce one hypothesis batch's spectrum to ``(s1, s2, vmax, amax)``.
 
@@ -284,6 +322,9 @@ class PixelStats:
             The rfft-form angular spectrum ``C``, shape (num_pixels, hyp_batch, n_freq).
         num_psi : int
             Number of in-plane angles to reconstruct via irfft.
+        pair_out : torch.Tensor, optional
+            ``(num_pixels, hyp_batch)`` buffer receiving each pair's maximum over psi
+            (the per-pair emission; see ``BlockStats``).
 
         Returns
         -------
@@ -292,25 +333,12 @@ class PixelStats:
             :func:`_reduce_stats`.
         """
         corr = torch.fft.irfft(spectrum, n=num_psi, dim=-1, norm="forward")
+        if pair_out is not None:
+            pair_out.copy_(corr.amax(dim=-1).to(pair_out.dtype))
 
         return _reduce_stats(  # type: ignore[no-any-return]
             corr.to(self.best_corr.dtype), torch.view_as_real(spectrum)
         )
-
-    def _reduce_raw(
-        self, spectrum: torch.Tensor, num_psi: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reduce one hypothesis batch to ``(s1, s2, packed)`` without decoding argmax.
-
-        Returns
-        -------
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-            ``(s1, s2, packed)``, each shape ``(num_pixels,)``, dtypes
-            ``(accumulate_dtype, accumulate_dtype, int64)``.
-        """
-        s1, s2, vmax, amax = self._reduce(spectrum, num_psi)
-        packed = encode_argmax_packed(vmax.to(torch.float32), amax)
-        return s1.to(self.corr_sum.dtype), s2.to(self.corr_sum.dtype), packed
 
     @torch.no_grad()
     def update(
@@ -319,6 +347,7 @@ class PixelStats:
         hyp_global_idx: torch.Tensor,
         num_psi: int,
         reverse_psi_axis: bool = True,
+        pair_out: torch.Tensor | None = None,
     ) -> None:
         """Update tracked statistics with a new hypothesis batch's raw spectrum.
 
@@ -335,9 +364,11 @@ class PixelStats:
         reverse_psi_axis : bool, optional
             Whether to reverse the psi axis when updating the best psi angle. By default
             True because correlogram is produced by irfft(C) rather than irfft(C.conj())
+        pair_out : torch.Tensor, optional
+            ``(num_pixels, hyp_batch)`` buffer receiving each pair's max over psi.
         """
         total_hypotheses = spectrum.shape[1] * num_psi
-        s1, s2, vmax, amax = self._reduce(spectrum, num_psi)
+        s1, s2, vmax, amax = self._reduce(spectrum, num_psi, pair_out)
         self._accumulate(
             s1,
             s2,
@@ -399,9 +430,12 @@ class PixelStats:
         else:
             psi = amax % num_psi
 
-        self.best_corr = torch.where(improved, vmax_cast, self.best_corr)
-        self.best_hypothesis = torch.where(improved, global_hyp, self.best_hypothesis)
-        self.best_psi_angle = torch.where(improved, psi, self.best_psi_angle)
+        # In place: a BlockStats sub-batch is a view of the block's buffers.
+        torch.where(improved, vmax_cast, self.best_corr, out=self.best_corr)
+        torch.where(
+            improved, global_hyp, self.best_hypothesis, out=self.best_hypothesis
+        )
+        torch.where(improved, psi, self.best_psi_angle, out=self.best_psi_angle)
 
         return None
 
@@ -410,8 +444,7 @@ class PixelStats:
 
         Notes
         -----
-        Only supports the contiguous-arange ``hyp_offset`` fast path (see
-        :meth:`accumulate_batch`'s ``hyp_offset`` parameter).
+        Only supports the contiguous-arange ``hyp_offset`` fast path.
         """
         device = self.corr_sum.device
         self._graph_s1 = torch.zeros(
@@ -514,13 +547,13 @@ class PixelStats:
         hyp_offset: int,
         num_psi: int,
         reverse_psi_axis: bool = True,
+        pair_out: torch.Tensor | None = None,
     ) -> None:
         """Like :meth:`update`, but the accumulate step replays a captured CUDA graph.
 
         Requires the caller to already know ``hyp_global_idx`` for this batch is a
-        contiguous arange starting at ``hyp_offset`` (see :meth:`accumulate_batch`'s
-        ``hyp_offset`` parameter) -- callers without that guarantee should use
-        :meth:`update` instead. Transparently falls back to :meth:`update` when CUDA
+        contiguous arange starting at ``hyp_offset`` -- callers without that guarantee
+        should use :meth:`update` instead. Transparently falls back to :meth:`update` when CUDA
         graph capture isn't supported on this device (checked once per device via
         :func:`_cuda_graph_capture_supported`), so this is always safe to call.
         """
@@ -530,147 +563,16 @@ class PixelStats:
             hyp_global_idx = torch.arange(
                 hyp_offset, hyp_offset + spectrum.shape[1], device=spectrum.device
             )
-            return self.update(spectrum, hyp_global_idx, num_psi, reverse_psi_axis)
+            return self.update(
+                spectrum, hyp_global_idx, num_psi, reverse_psi_axis, pair_out
+            )
 
-        s1, s2, vmax, amax = self._reduce(spectrum, num_psi)
+        s1, s2, vmax, amax = self._reduce(spectrum, num_psi, pair_out)
         self.accumulate_graphed(
             s1, s2, vmax, amax, hyp_offset, num_psi, reverse_psi_axis
         )
         self.hypothesis_count += spectrum.shape[1] * num_psi
         return None
-
-    @torch.no_grad()
-    def begin_hypothesis_batches(self, n_batches: int) -> None:
-        """Preallocate staging buffers for the batch-then-reduce accumulation path."""
-        device = self.corr_sum.device
-        self._batch_capacity = n_batches
-        self._batch_cursor = 0
-        self._total_hypotheses_batched = 0
-        self._s1_stack = torch.empty(
-            (n_batches, self.num_pixels), device=device, dtype=self.corr_sum.dtype
-        )
-        self._s2_stack = torch.empty_like(self._s1_stack)
-        self._packed_stack = torch.empty(
-            (n_batches, self.num_pixels), device=device, dtype=torch.int64
-        )
-        self._hyp_offset_stack: list[int | None] = [None] * n_batches
-        self._hyp_idx_stack: torch.Tensor | None = None
-
-    @torch.no_grad()
-    def accumulate_batch(
-        self,
-        spectrum: torch.Tensor,
-        hyp_global_idx: torch.Tensor,
-        num_psi: int,
-        hyp_offset: int | None = None,
-    ) -> None:
-        """Stage one hypothesis batch's reduced result for deferred reduction.
-
-        Must be called after :meth:`begin_hypothesis_batches` and before
-        :meth:`reduce_hypothesis_batches`, once per hypothesis batch (in place of
-        :meth:`update`).
-
-        Parameters
-        ----------
-        spectrum : torch.Tensor
-            Same as :meth:`update`'s ``spectrum``.
-        hyp_global_idx : torch.Tensor
-            Same as :meth:`update`'s ``hyp_global_idx``.
-        num_psi : int
-            Same as :meth:`update`'s ``num_psi``.
-        hyp_offset : int, optional
-            Pass this batch's starting global hypothesis index when
-            ``hyp_global_idx`` is known to equal
-            ``arange(hyp_offset, hyp_offset + hyp_global_idx.numel())`` -- true
-            whenever the caller sliced this batch off a plain, unshuffled ``arange``
-            (the common case in
-            :func:`~panther_em.inference.search.compressed._run_stage`).
-            When every staged batch provides this, :meth:`reduce_hypothesis_batches`
-            recovers the winning global hypothesis id with a plain addition instead of
-            a gather. If any staged batch omits it, all batches fall back to a gather
-            against a stored copy of each batch's ``hyp_global_idx``.
-        """
-        i = self._batch_cursor
-        s1, s2, packed = self._reduce_raw(spectrum, num_psi)
-        self._s1_stack[i] = s1
-        self._s2_stack[i] = s2
-        self._packed_stack[i] = packed
-        self._hyp_offset_stack[i] = hyp_offset
-
-        if hyp_offset is None:
-            m = hyp_global_idx.numel()
-            if self._hyp_idx_stack is None:
-                self._hyp_idx_stack = torch.zeros(
-                    (self._batch_capacity, m),
-                    device=hyp_global_idx.device,
-                    dtype=torch.long,
-                )
-            self._hyp_idx_stack[i, :m] = hyp_global_idx
-
-        self._total_hypotheses_batched += hyp_global_idx.numel() * num_psi
-        self._batch_cursor += 1
-
-    @torch.no_grad()
-    def reduce_hypothesis_batches(
-        self, num_psi: int, reverse_psi_axis: bool = True
-    ) -> None:
-        """Decode and reduce all staged hypothesis batches, updating running stats once.
-
-        Equivalent to calling :meth:`update` once per staged batch, but the argmax
-        decode, best-of compare, and running-sum update each run once over the whole
-        ``(n_batches, num_pixels)`` stack instead of once per batch. No-op if no
-        batches were staged since the last :meth:`begin_hypothesis_batches` call.
-
-        Parameters
-        ----------
-        num_psi : int
-            Same ``num_psi`` used for every staged :meth:`accumulate_batch` call.
-        reverse_psi_axis : bool, optional
-            Same as :meth:`update`'s ``reverse_psi_axis``.
-        """
-        n = self._batch_cursor
-        if n == 0:
-            return
-
-        s1_total = self._s1_stack[:n].sum(dim=0)
-        s2_total = self._s2_stack[:n].sum(dim=0)
-
-        # Decode the WHOLE stack in one shot -- and only ever compare/reduce the
-        # DECODED float vmax, never the raw packed int64 (see decode_argmax_packed's
-        # docstring: the packed encoding assumes unsigned comparison, which a plain
-        # torch.max on this signed-int64-typed tensor would get backwards).
-        vmax_stack, amax_local_stack = decode_argmax_packed(self._packed_stack[:n])
-
-        best_vmax, best_batch = vmax_stack.max(dim=0)
-        best_amax_local = amax_local_stack.gather(0, best_batch.unsqueeze(0)).squeeze(0)
-        n_local = torch.div(best_amax_local, num_psi, rounding_mode="floor")
-
-        offsets = self._hyp_offset_stack[:n]
-        if all(offset is not None for offset in offsets):
-            offset_stack = torch.tensor(
-                offsets, device=best_batch.device, dtype=torch.long
-            )
-            global_hyp = offset_stack[best_batch] + n_local
-        else:
-            assert self._hyp_idx_stack is not None
-            global_hyp = self._hyp_idx_stack[best_batch, n_local]
-
-        if reverse_psi_axis:
-            psi = (num_psi - best_amax_local % num_psi) % num_psi
-        else:
-            psi = best_amax_local % num_psi
-
-        vmax_cast = best_vmax.to(self.best_corr.dtype)
-        self.corr_sum += s1_total.to(self.best_corr.dtype)
-        self.corr_sum2 += s2_total.to(self.best_corr.dtype)
-        self.hypothesis_count += self._total_hypotheses_batched
-
-        improved = vmax_cast > self.best_corr
-        self.best_corr = torch.where(improved, vmax_cast, self.best_corr)
-        self.best_hypothesis = torch.where(improved, global_hyp, self.best_hypothesis)
-        self.best_psi_angle = torch.where(improved, psi, self.best_psi_angle)
-
-        self._batch_cursor = 0
 
     @torch.no_grad()
     def finalize(self) -> dict[str, torch.Tensor]:
@@ -699,12 +601,219 @@ class PixelStats:
         }
 
 
-# ---------------------------------------------------------------------------
-# Error-aware partitioning (multi-precision follow-up)
-# ---------------------------------------------------------------------------
-#
-# Between incremental stages the reconstructed correlations are partitioned, using
-# the reconstruction-accuracy bounds implied by the retained singular values, into
-# accepted / rejected / follow-up sets. This is implemented as a pluggable
-# `follow_up_fn` rather than as part of `PixelStats` -- see
-# panther_em.inference.search.tracking.MultiPrecisionPixelTracker.
+# --------------------------------------------------------------------------- #
+# Block-level accumulation (the redesigned executor's view of the statistics)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class SpectrumSpec:
+    """What a stage's spectra look like; decides which statistics backend applies.
+
+    Attributes
+    ----------
+    dtype : torch.dtype
+        complex64 or complex32 spectrum.
+    n_freq : int
+        ``F = k_stop`` angular frequencies.
+    n_psi : int
+        In-plane samples recovered by the inverse FFT.
+    gemm_pixels : int
+        Pixels per contraction (``P_g``).
+    n_sub : int
+        GEMM sub-batches per block (``block_pixels / gemm_pixels``).
+    hyp_batch : int
+        Hypotheses per contraction.
+    n_virtual : int
+        Hypotheses enumerated per pixel (all defocus planes x selected templates).
+    device : torch.device
+        Compute device.
+    pair_dtype : torch.dtype, optional
+        When set, every batch also emits its per-pair max over psi into a block
+        slab of this dtype (float16 or float32); ``None`` is the dense search.
+    """
+
+    dtype: torch.dtype
+    n_freq: int
+    n_psi: int
+    gemm_pixels: int
+    n_sub: int
+    hyp_batch: int
+    n_virtual: int
+    device: torch.device
+    pair_dtype: torch.dtype | None = None
+
+
+class BlockStats:
+    """Per-pixel statistics of one block: one :class:`PixelStats` per GEMM sub-batch.
+
+    Parameters
+    ----------
+    stats_cls : type
+        :class:`PixelStats` or a subclass (the fused specialization).
+    n_sub : int
+        Sub-batches per block.
+    gemm_pixels : int
+        Pixels per sub-batch.
+    device : torch.device
+        Where the state lives.
+    n_psi : int
+        In-plane samples.
+    inkernel : bool
+        ``True`` when every batch takes the fused in-kernel accumulate path. Batches
+        are then fed the kernel-relative ``HypBatch.kernel_offset`` and epochs are
+        merged with their base (:meth:`FusedPixelStats.merge_packed`); otherwise the
+        full ``virtual_offset`` is used directly (int64, no epoch bookkeeping).
+    n_virtual : int, optional
+        Hypotheses per pixel (columns of the pair slab); needed with ``pair_dtype``.
+    pair_dtype : torch.dtype, optional
+        Allocate the per-block pair slab ``(n_sub, gemm_pixels, n_virtual)`` in this
+        dtype and have every batch write its per-pair max over psi into it. Columns
+        are *virtual* hypothesis ids (``HypBatch.virtual_offset``), so epochs do not
+        matter and ``HypothesisPlan.decode`` recovers global ids. The slab is static
+        (captured by CUDA graphs) and fully overwritten every block.
+    """
+
+    def __init__(
+        self,
+        stats_cls: type[PixelStats],
+        *,
+        n_sub: int,
+        gemm_pixels: int,
+        device: torch.device,
+        n_psi: int,
+        inkernel: bool,
+        n_virtual: int = 0,
+        pair_dtype: torch.dtype | None = None,
+    ) -> None:
+        # One tracker for the whole block; the sub-batches are views of its buffers,
+        # so finalization runs once per block instead of once per sub-batch (that
+        # was ~20 small launches x n_sub per block, the dominant loop overhead).
+        self.block = stats_cls(int(n_sub) * int(gemm_pixels), device=device)
+        self.stats = [
+            stats_cls.view_of(self.block, sub * gemm_pixels, (sub + 1) * gemm_pixels)
+            for sub in range(n_sub)
+        ]
+        self.n_sub = int(n_sub)
+        self.gemm_pixels = int(gemm_pixels)
+        self.n_psi = int(n_psi)
+        self.inkernel = bool(inkernel)
+        self.device = device
+        self.n_virtual = int(n_virtual)
+        self.pair_slab: torch.Tensor | None = None
+        if pair_dtype is not None:
+            if self.n_virtual < 1:
+                raise ValueError("pair_dtype needs n_virtual >= 1")
+            self.pair_slab = torch.empty(
+                (self.n_sub, self.gemm_pixels, self.n_virtual),
+                dtype=pair_dtype,
+                device=device,
+            )
+
+    @torch.no_grad()
+    def clear(self) -> None:
+        """Reset the block's buffers (one pass) and every sub-batch's bookkeeping."""
+        self.block.clear()
+        for st in self.stats:
+            st.clear_bookkeeping()
+
+    @torch.no_grad()
+    def consume(self, spectrum_pnf: torch.Tensor, batch: HypBatch, sub: int) -> None:
+        """Accumulate one batch's spectrum ``(P_g, N_b, F)`` into sub-batch ``sub``."""
+        offset = batch.kernel_offset if self.inkernel else batch.virtual_offset
+        pair_out = None
+        if self.pair_slab is not None:
+            v0 = batch.virtual_offset
+            pair_out = self.pair_slab[sub][:, v0 : v0 + batch.size]
+        self.stats[sub].update_graphed(
+            spectrum_pnf,
+            offset,
+            num_psi=self.n_psi,
+            reverse_psi_axis=True,
+            pair_out=pair_out,
+        )
+
+    def block_pair_max(self, n_valid: int) -> torch.Tensor:
+        """View ``(n_valid, n_virtual)`` of the block's per-pair maxima, rows in order."""
+        if self.pair_slab is None:
+            raise ValueError("this accumulator was built without a pair slab")
+        return self.pair_slab.reshape(-1, self.n_virtual)[:n_valid]
+
+    @torch.no_grad()
+    def end_epoch(self, base: int, sub: int) -> None:
+        """Fold an epoch's in-kernel packed best into the running best (fused only)."""
+        if self.inkernel:
+            merge = getattr(self.stats[sub], "merge_packed", None)
+            if merge is not None:
+                merge(hyp_base=base)
+
+    def note_replayed(self, n_evaluated: int) -> None:
+        """Set the per-pixel evaluation count after a CUDA-graph replay.
+
+        A captured hypothesis loop does not execute the Python-side bookkeeping, so the
+        caller states how many ``(hypothesis, psi)`` pairs each pixel saw.
+        """
+        for st in self.stats:
+            st.hypothesis_count = int(n_evaluated)
+            if hasattr(st, "_packed_num_psi"):
+                st._packed_num_psi = self.n_psi
+
+    @torch.no_grad()
+    def finalize_into(
+        self, outs: Mapping[str, torch.Tensor], start: int, n_valid: int
+    ) -> None:
+        """Write the finalized maps into rows ``[start, start + n_valid)`` of ``outs``.
+
+        Keys: ``mip``, ``mean``, ``variance``, ``zscore``, ``best_index``, ``best_psi``.
+        """
+        for st in self.stats:  # fold any pending in-kernel best into the shared buffers
+            merge = getattr(st, "merge_packed", None)
+            if merge is not None:
+                merge()
+        self.block.hypothesis_count = self.stats[0].hypothesis_count
+        result = self.block.finalize()
+        for key, value in result.items():
+            target = outs[key]
+            target[start : start + n_valid] = value[:n_valid].to(
+                target.device, target.dtype
+            )
+
+
+@runtime_checkable
+class StatsBackend(Protocol):
+    """Chooses and builds the block accumulator for a stage."""
+
+    name: str
+
+    @staticmethod
+    def supports(spec: SpectrumSpec) -> bool:
+        """Whether this backend can reduce spectra of ``spec``."""
+
+    @staticmethod
+    def make(spec: SpectrumSpec) -> BlockStats:
+        """A fresh block accumulator for ``spec``."""
+
+
+class TorchStatsBackend:
+    """Pure-torch reduction (``irfft`` + compiled moments); works on any device."""
+
+    name = "torch"
+
+    @staticmethod
+    def supports(spec: SpectrumSpec) -> bool:
+        """Always."""
+        return True
+
+    @staticmethod
+    def make(spec: SpectrumSpec) -> BlockStats:
+        """Block accumulator backed by plain :class:`PixelStats`."""
+        return BlockStats(
+            PixelStats,
+            n_sub=spec.n_sub,
+            gemm_pixels=spec.gemm_pixels,
+            device=spec.device,
+            n_psi=spec.n_psi,
+            inkernel=False,
+            n_virtual=spec.n_virtual,
+            pair_dtype=spec.pair_dtype,
+        )
