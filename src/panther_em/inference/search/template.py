@@ -492,16 +492,34 @@ class KernelBank:
                     self._spectral_cache.put((keys[i], fft_shape), spec[j].clone())
         return result
 
+    def spectral_fits(self, n_cells: int, fft_shape: tuple[int, int]) -> bool:
+        """Whether ``n_cells`` spectra at ``fft_shape`` fit the spectral budget.
+
+        A sweep over more spectra than the LRU holds never hits (each pass evicts
+        what the next pass needs) and would only evict the spectra of other stages,
+        so such a sweep is better run uncached (:meth:`spectral_views`).
+        """
+        if not self._spectral_enabled:
+            return False
+        budget = self._spectral_cache.budget
+        if budget is None:
+            return True
+        per_cell = int(fft_shape[0]) * int(fft_shape[1]) * 8  # complex64
+        return n_cells * per_cell <= budget
+
     def spectral_views(
         self,
         cells: torch.Tensor | Iterable[Sequence[int]],
         fft_shape: tuple[int, int],
+        *,
+        cache: bool = True,
     ) -> list[torch.Tensor]:
         """Per-cell ``(Fh, Fw)`` spectra, the cached tensors themselves (no stacking).
 
         Same contents as :meth:`spectral`; use this when the consumer processes one
         cell at a time, so a large tile's spectrum (134 MB at 4096^2) is not copied
-        into a batch first.
+        into a batch first. ``cache=False`` reads the cache but does not fill it
+        (see :meth:`spectral_fits`).
         """
         keys = _as_cells(cells)
         fft_shape = (int(fft_shape[0]), int(fft_shape[1]))
@@ -516,10 +534,12 @@ class KernelBank:
             spatial = self.spatial([keys[i] for i in todo])
             spec = torch.fft.fft2(spatial, s=fft_shape).conj()
             for j, i in enumerate(todo):
-                fresh = spec[j].clone()  # own storage, not a view of the batch
-                views[i] = fresh
-                if self._spectral_enabled:
+                if self._spectral_enabled and cache:
+                    fresh = spec[j].clone()  # own storage, not a view of the batch
                     self._spectral_cache.put((keys[i], fft_shape), fresh)
+                    views[i] = fresh
+                else:
+                    views[i] = spec[j]  # consumed before the batch is dropped
         return [v for v in views if v is not None]
 
     def planar(

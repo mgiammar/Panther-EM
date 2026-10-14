@@ -431,3 +431,30 @@ def test_plane_restricted_groups_cover_and_reject_overlap():
     keep = torch.tensor([1, 0, 1, 1, 0, 0, 1, 0, 1, 1], dtype=torch.bool)
     sub = store.subset(keep, block_pixels=3)
     assert [(g.id, g.planes) for g in sub.groups] == [(0, (2,)), (1, (0, 1))]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA (pinned memory)")
+def test_subset_can_move_a_pinned_host_store_to_the_device():
+    geo = SearchGeometry.from_images(ImageSet.single(torch.zeros(24, 24)), (20, 20))
+    pixels = PixelSelection.all(geo)  # 25 pixels
+    store = FeatureStore(
+        geo, pixels, pixels.index, block_pixels=8, n_defocus=1, device="cuda",
+        residency="pinned_host",
+    )
+    group = store.add_group((0, 0, 2, 2), "fp32")
+    for blk in group.blocks:
+        assert blk.is_pinned() and blk.device.type == "cpu"
+        blk.normal_()
+    group.complete = True
+    keep = torch.zeros(25, dtype=torch.bool)
+    keep[::3] = True
+    sub = store.subset(keep, block_pixels=4, residency="device")
+    assert sub.residency == "device" and all(b.device.type == "cuda" for b in sub.groups[0].blocks)
+    assert torch.equal(sub.column_index, pixels.index[keep])
+    kept = torch.nonzero(keep).squeeze(-1).tolist()
+    for new_col, old_col in enumerate(kept):
+        old = group.blocks[old_col // 8][:, :, old_col % 8, :]
+        new = sub.groups[0].blocks[new_col // 4][:, :, new_col % 4, :].cpu()
+        assert torch.equal(old, new)
+    same = store.subset(keep, block_pixels=4)
+    assert same.residency == "pinned_host" and same.groups[0].blocks[0].is_pinned()

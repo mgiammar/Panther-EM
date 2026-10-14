@@ -224,7 +224,8 @@ def test_two_stage_rescored_pixels_match_fresh_searches(template):
     rejected = results[0].pixel_index[after0 == int(PixelLabel.REJECTED)]
     assert torch.all(flat_last[rejected] == 0)
     assert not (final.label == int(PixelLabel.AMBIGUOUS)).any()  # stage 1 decided all
-    assert [g.rect for g in session.store.groups] == [(0, 0, 2, 2), (0, 0, 4, 5)]
+    # stage 1 reads a different rectangle, so stage 0's store was dropped, not compacted
+    assert [g.rect for g in session.store.groups] == [(0, 0, 4, 5)]
 
 
 def test_two_stage_healpix_level_and_planes(synthetic_result):
@@ -252,10 +253,7 @@ def test_two_stage_healpix_level_and_planes(synthetic_result):
     results = list(session)
     # stage 1's larger rectangle is a new group, so it is produced on all three planes
     assert stub.calls == 2 and stub.planes_produced == 4
-    assert [(g.rect, g.planes) for g in session.store.groups] == [
-        ((0, 0, 3, 3), (1,)),
-        ((0, 0, 4, 5), (0, 1, 2)),
-    ]
+    assert [(g.rect, g.planes) for g in session.store.groups] == [((0, 0, 4, 5), (0, 1, 2))]
     assert results[0].maps.n_evaluated == 24 * 16
     assert results[1].maps.n_evaluated == 3 * 96 * 16
     final = session.snapshot()
@@ -483,7 +481,9 @@ def test_session_store_is_released_after_the_session(template):
     session = searcher.session(ImageSet.single(torch.zeros(30, 30)))
     session.run_all()
     store_ref = weakref.ref(session.store)
+    block_ref = weakref.ref(session.store.groups[0].blocks[0])  # the bytes themselves
     del session
     gc.collect()
     assert store_ref() is None  # only the session owned the store
+    assert block_ref() is None  # and nothing (the cached loop's plan) kept its blocks
     assert searcher.executor.loops  # the loop cache survives for the next image set

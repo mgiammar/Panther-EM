@@ -288,6 +288,9 @@ def featurize_grid(
     cells = group_cells(group)
     n_cells = int(cells.shape[0])
     device = bank.device
+    # Caching a sweep larger than the cache never hits and evicts other stages' spectra
+    # (8192 cells at 2560^2 are 400 GiB): fill the cache only when it fits.
+    cache = bank.spectral_fits(n_cells, fft_shape)
     with _stream_scope(stream):
         for plane in group.planes:
             filtered: dict[int, torch.Tensor] = {}  # image -> plane-filtered image
@@ -315,7 +318,7 @@ def featurize_grid(
                     for tile, image_fft in zip(schedule.items, ffts, strict=True)
                 )
             for tile, image_fft, cell_range in work:
-                spectra = bank.spectral_views(cells[cell_range], fft_shape)
+                spectra = bank.spectral_views(cells[cell_range], fft_shape, cache=cache)
                 features = _correlate_tile(image_fft, spectra, tile, schedule.tile_side)
                 writer.write(
                     cell_range, (tile.columns.start, tile.columns.stop), features, plane=plane

@@ -70,18 +70,28 @@ class ExecutionConfig:
     use_cuda_graph, use_fused_kernel : bool
         Allow the graphed hypothesis loop / the fused statistics kernel.
     tile : int
-        Featurizer output tile side (grid mode). Larger tiles waste less of each
-        overlap-save FFT but their kernel spectra are bigger (8 MiB per cell at
-        1024, 134 MiB at 4096), and once they no longer fit the template's
+        Featurizer output tile side (grid mode) for a pinned-host store, whose
+        blocks must complete tile by tile to be staged out. Larger tiles waste less
+        of each overlap-save FFT but their kernel spectra are bigger (8 MiB per cell
+        at 1024, 134 MiB at 4096), and once they no longer fit the template's
         ``spectral_budget`` every plane re-FFTs every kernel, which costs as much as
         the correlation itself. 1024 keeps a rank-1024 stage's spectra in 8 GiB.
+    device_tile : int, optional
+        Tile side for a device-resident store, which has no staging constraint.
+        Featurizing a pixel subset costs one correlation per (cell, tile touched),
+        so the per-pixel cost is set by the tile: measured on the 60S template at
+        rank 8192, 0.49 ns per pixel-cell at 1024, 0.22 at 2048 (2560^2 FFTs) and
+        0.47 at 4096 (134 MB spectra, memory-bound passes). ``None`` covers each
+        image with one tile.
     cell_chunk : int
         Kernels per featurization chunk.
     image_batch : int
         Boxes per inner-product GEMM (center mode).
     loop_order : {"pixel_major", "cell_major"}
-        Featurizer loop order (``pixel_major`` completes blocks tile by tile, which a
-        pinned-host store needs; ``cell_major`` fetches each spectrum once).
+        Featurizer loop order of a pinned-host store (``pixel_major`` completes
+        blocks tile by tile, which staging needs). A device-resident store is always
+        featurized ``cell_major``: each kernel spectrum is FFT'd once and reused
+        across the image's tiles instead of once per tile.
     ledger_device : device, optional
         Where the dense per-pixel state lives; defaults to the compute device.
     prepared_budget : int, optional
@@ -109,6 +119,7 @@ class ExecutionConfig:
     use_cuda_graph: bool = True
     use_fused_kernel: bool = True
     tile: int = 1024
+    device_tile: int | None = 2048
     cell_chunk: int = 64
     image_batch: int = 1024
     loop_order: LoopOrder = "pixel_major"
@@ -254,6 +265,7 @@ class SearchSession:
         )
         self.pixels: PixelSelection = initial
         self.store: FeatureStore | None = None
+        self._store_tile = 0  # the tile the store's column order was built with
         self.stage_index = 0
         self.stage_results: list[StageResult] = []
         self.elapsed_s = 0.0
@@ -285,8 +297,24 @@ class SearchSession:
         executor = self.searcher.executor
         pixels = self.pixels
         store = self.store
+        rects = tuple(tuple(int(v) for v in r) for r in rectangles)
+        reusable = store is not None and any(
+            g.rect in rects and g.precision is precision for g in store.groups
+        )
+        if store is not None and not reusable:
+            # Nothing of the previous stage's store is read again (a different
+            # rectangle or precision): drop it rather than compact it.
+            store = None
+        if reusable:
+            tile = self._store_tile  # the subset keeps the store's column order
+        elif residency == "pinned_host":
+            tile = exe.tile
+        elif exe.device_tile is not None:
+            tile = exe.device_tile
+        else:
+            tile = max(int(g) for g in self.geometry.grid)  # one tile per image
         schedule = schedule_tiles(
-            self.geometry, pixels, tile=exe.tile, image_batch=exe.image_batch
+            self.geometry, pixels, tile=tile, image_batch=exe.image_batch
         )
         if store is None:
             store = FeatureStore(
@@ -301,12 +329,18 @@ class SearchSession:
             store.copy_stream = executor.copy
         else:
             keep = torch.isin(store.column_index, pixels.index.to(store.column_index.device))
-            if not bool(keep.all()) or store.block_pixels != block_pixels:
-                store = store.subset(keep, block_pixels=block_pixels)
+            if (
+                not bool(keep.all())
+                or store.block_pixels != block_pixels
+                or store.residency != residency
+            ):
+                store = store.subset(keep, block_pixels=block_pixels, residency=residency)
+                store.copy_stream = executor.copy
             if not torch.equal(
                 schedule.column_index, store.column_index.to(schedule.column_index.device)
             ):
                 raise RuntimeError("featurization column order diverged from the store's")
+        self._store_tile = tile
         self._mark("store:ready")
         missing = [
             (rect, mp)
@@ -326,7 +360,7 @@ class SearchSession:
                 store.writer(group),
                 schedule,
                 chunk=exe.cell_chunk,
-                order=exe.loop_order,
+                order=exe.loop_order if store.residency == "pinned_host" else "cell_major",
                 stream=executor.featurize,
             )
         if missing and executor.featurize is not None:

@@ -927,12 +927,17 @@ class FeatureStore:
     # -- compaction -----------------------------------------------------------
 
     def subset(
-        self, keep: torch.Tensor, *, block_pixels: int | None = None
+        self,
+        keep: torch.Tensor,
+        *,
+        block_pixels: int | None = None,
+        residency: Residency | None = None,
     ) -> FeatureStore:
         """Keep the compact columns where ``keep`` is True (order preserved).
 
         Works block by block, so the transient peak is the new store plus one old
-        block's gathered columns.
+        block's gathered columns. ``residency`` defaults to this store's; a subset small
+        enough for the device is usually moved there.
         """
         if tuple(keep.shape) != (self.n_pixels,) or keep.dtype != torch.bool:
             raise ValueError(f"keep must be a ({self.n_pixels},) bool tensor")
@@ -948,7 +953,7 @@ class FeatureStore:
             block_pixels=block_pixels or self.block_pixels,
             n_defocus=self.n_defocus,
             device=self.device,
-            residency=self.residency,
+            residency=residency or self.residency,
         )
         positions = torch.nonzero(keep_cpu, as_tuple=False).squeeze(-1)
         for g in self.groups:

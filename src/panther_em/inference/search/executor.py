@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -517,7 +517,9 @@ class HypLoop:
         graph: torch.cuda.CUDAGraph | None = None,
         statics: Mapping[int, torch.Tensor] | None = None,
     ) -> None:
-        self.plan = plan
+        # Loop outlives the session that built it (cached by signature on the executor)
+        # Store plan without blocks since groups hold the session's store blocks
+        self.plan = replace(plan, groups=())
         self.prepared = prepared
         self.stats = stats
         self.spectra = spectra  # captured buffers: keep them alive with the graph
@@ -554,8 +556,17 @@ class HypLoop:
             torch.cuda.current_stream(device).wait_stream(side)
             torch.cuda.synchronize(device)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=pool, stream=side):
-                body()
+            # NOTE: Not ``torch.cuda.graph(...)``: that context also empties the caching
+            # allocators, including the pinned-host cache, and a capture that follows
+            # a dropped pinned store (stage 1 after stage 0 of the first micrograph)
+            # would release its 52 GB only for the next micrograph to pin them again.
+            with torch.cuda.stream(side):
+                graph.capture_begin(pool=pool)
+                try:
+                    body()
+                finally:
+                    graph.capture_end()
+            torch.cuda.synchronize(device)
         except Exception:
             torch.cuda.synchronize(device)
             return cls(plan, prepared, stats, spectra)
