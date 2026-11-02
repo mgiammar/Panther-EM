@@ -86,7 +86,11 @@ class ExecutionConfig:
     cell_chunk : int
         Kernels per featurization chunk.
     image_batch : int
-        Boxes per inner-product GEMM (center mode).
+        Positions per GEMM of the direct featurization engine.
+    featurize_mode : {"auto", "fft", "direct"}
+        Featurization engine: tiled FFT correlation or box gather + planar GEMM.
+        ``"auto"`` applies :func:`~panther_em.inference.search.featurize.choose_mode`
+        (its constants ``DIRECT_MAX_DENSITY`` / ``DIRECT_MAX_BOX_EXCESS`` decide).
     loop_order : {"pixel_major", "cell_major"}
         Featurizer loop order of a pinned-host store (``pixel_major`` completes
         blocks tile by tile, which staging needs). A device-resident store is always
@@ -122,6 +126,7 @@ class ExecutionConfig:
     device_tile: int | None = 2048
     cell_chunk: int = 64
     image_batch: int = 1024
+    featurize_mode: Literal["auto", "fft", "direct"] = "auto"
     loop_order: LoopOrder = "pixel_major"
     ledger_device: torch.device | str | None = None
     prepared_budget: int | None = None
@@ -314,7 +319,14 @@ class SearchSession:
         else:
             tile = max(int(g) for g in self.geometry.grid)  # one tile per image
         schedule = schedule_tiles(
-            self.geometry, pixels, tile=tile, image_batch=exe.image_batch
+            self.geometry,
+            pixels,
+            tile=tile,
+            image_batch=exe.image_batch,
+            mode=None if exe.featurize_mode == "auto" else exe.featurize_mode,
+            # a direct schedule keeps a reused store's column order (FFT tiles
+            # already match through ``tile``)
+            order=store.column_index if reusable and store is not None else None,
         )
         if store is None:
             store = FeatureStore(

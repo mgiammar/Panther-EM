@@ -28,7 +28,8 @@ How a stage runs
    :class:`HypothesisSet` from the device capabilities and the execution knobs.
 2. **Featurize** (:mod:`.featurize`, :mod:`.features`): the store is compacted to the
    stage's pixels and every missing (rectangle, precision, plane) group is produced,
-   by tiled FFT correlation on image grids or inner products on particle boxes.
+   by tiled FFT correlation (dense grids) or a patch gather + planar GEMM (sparse
+   selections, particle boxes; see ``featurize.choose_mode`` and its constants).
 3. **Execute** (:mod:`.executor`, :mod:`.statistics`): per block, per GEMM sub-batch,
    per defocus plane and per hypothesis batch, one contraction and one statistics
    update (in-kernel accumulation on CUDA), optionally replayed as one CUDA graph.

@@ -133,6 +133,11 @@ class KernelBank:
     spectral_budget : int, optional
         Bytes of ``conj(fft2(pad(kernel)))`` kept per FFT shape. ``None`` =
         unbounded; ``0`` disables spectral caching.
+    planar_budget : int, optional
+        Bytes of planar kernel blocks (:meth:`planar_block`: one contiguous
+        ``[Re K; -Im K]`` tensor per rectangle and dtype, 1 MiB per cell in fp16 at a
+        512 box) kept resident for the direct featurization engine. ``None`` =
+        unbounded; ``0`` disables the tier.
     build_chunk : int, optional
         Maximum kernels built per polar-to-Cartesian call. Defaults to 64.
 
@@ -152,6 +157,7 @@ class KernelBank:
         device_budget: int | None = None,
         host_budget: int = 0,
         spectral_budget: int | None = None,
+        planar_budget: int | None = None,
         build_chunk: int = 64,
     ) -> None:
         if reconstructor.result.is_complex_projection:
@@ -172,6 +178,8 @@ class KernelBank:
         self._host_arena: torch.Tensor | None = None
         self._spectral_cache = _ByteLRU(spectral_budget)
         self._spectral_enabled = spectral_budget is None or spectral_budget > 0
+        self._planar_cache = _ByteLRU(planar_budget)
+        self._planar_enabled = planar_budget is None or planar_budget > 0
         # device-side pieces of the separable kernel build, resolved on first use
         self._sep: dict[str, Any] | None = None
         self._sep_resolved = False
@@ -558,6 +566,54 @@ class KernelBank:
         )
         return torch.stack((spatial.real, -spatial.imag), dim=0).to(dtype)
 
+    # -- planar blocks (the direct featurization engine's GEMM operand) -------
+
+    def planar_bytes_of(self, rect: Rectangle, dtype: torch.dtype) -> int:
+        """Bytes of the planar block of ``rect`` at ``dtype``."""
+        n_cells = int(rect[2]) * int(rect[3])
+        elem = torch.empty((), dtype=dtype).element_size()
+        return 2 * n_cells * self.template_shape[0] * self.template_shape[1] * elem
+
+    def planar_fits(self, rect: Rectangle, dtype: torch.dtype) -> bool:
+        """Whether ``rect``'s planar block fits the planar budget (tier enabled)."""
+        if not self._planar_enabled:
+            return False
+        budget = self._planar_cache.budget
+        return budget is None or self.planar_bytes_of(rect, dtype) <= budget
+
+    def has_planar_block(self, rect: Rectangle, dtype: torch.dtype) -> bool:
+        """Whether the block is resident now (no build needed)."""
+        return (tuple(int(v) for v in rect), dtype) in self._planar_cache
+
+    def planar_block(self, rect: Rectangle, dtype: torch.dtype) -> torch.Tensor:
+        """``(2, n, kH * kW)`` planar rows of every cell of ``rect``, row-major ``(k, m)``.
+
+        Built once per ``(rect, dtype)`` into one contiguous tensor and kept under
+        ``planar_budget`` (least recently used rectangles are dropped), so the direct
+        engine reuses the same operand across planes, stages and images. With the
+        tier disabled the block is built and returned uncached.
+        """
+        key = (tuple(int(v) for v in rect), dtype)
+        cached = self._planar_cache.get(key) if self._planar_enabled else None
+        if cached is not None:
+            return cached
+        k0, m0, kx, mx = key[0]
+        cells = [(k, m) for k in range(k0, k0 + kx) for m in range(m0, m0 + mx)]
+        n_pix = self.template_shape[0] * self.template_shape[1]
+        block = torch.empty((2, len(cells), n_pix), dtype=dtype, device=self.device)
+        for start in range(0, len(cells), self.build_chunk):
+            spatial = self.spatial(cells[start : start + self.build_chunk]).reshape(-1, n_pix)
+            block[0, start : start + spatial.shape[0]] = spatial.real.to(dtype)
+            block[1, start : start + spatial.shape[0]] = -spatial.imag.to(dtype)
+        if self._planar_enabled:
+            self._planar_cache.put(key, block)  # evicted blocks are simply dropped
+        return block
+
+    @property
+    def planar_bytes(self) -> int:
+        """Bytes of resident planar blocks."""
+        return self._planar_cache.nbytes
+
     def bytes(self) -> tuple[int, int]:
         """``(device_bytes, host_bytes)`` of cached spatial kernels."""
         return self._device_cache.nbytes, self._host_cache.nbytes
@@ -569,6 +625,7 @@ class KernelBank:
             self._host_slots = list(self._host_arena.unbind(0))
         self._host_cache.clear()
         self._spectral_cache.clear()
+        self._planar_cache.clear()
 
 
 class WeightSource:
@@ -682,7 +739,7 @@ class Template:
         Compute device for kernels and weights.
     kernel : KernelConfig, optional
         Polar-to-Cartesian warp settings.
-    kernel_budget, kernel_host_budget, spectral_budget : int, optional
+    kernel_budget, kernel_host_budget, spectral_budget, planar_budget : int, optional
         Byte budgets forwarded to :class:`KernelBank`.
     weights_cells : Rectangle or sequence of Rectangle, optional
         Bounding box of the feature space any stage will use; restricts the
@@ -698,6 +755,7 @@ class Template:
         kernel_budget: int | None = None,
         kernel_host_budget: int = 0,
         spectral_budget: int | None = None,
+        planar_budget: int | None = None,
         weights_cells: Rectangle | Sequence[Rectangle] | None = None,
     ) -> None:
         self.result = result
@@ -712,6 +770,7 @@ class Template:
             device_budget=kernel_budget,
             host_budget=kernel_host_budget,
             spectral_budget=spectral_budget,
+            planar_budget=planar_budget,
         )
         self._weights_cells = weights_cells
         self._weights: WeightSource | None = None

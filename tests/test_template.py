@@ -218,3 +218,50 @@ def test_kernel_bank_separable_build_matches_generic_on_a_side_stream(recon_cuda
     rel = ((a - b).flatten(1).norm(dim=1) / b.flatten(1).norm(dim=1)).max().item()
     # both paths mirror the same seam padding; the residual is spline arithmetic
     assert fast._sep is not None and rel < 1e-4, rel
+
+
+def test_spectral_views_can_bypass_the_cache(recon):
+    one = 32 * 30 * 8  # one complex64 spectrum at (32, 30)
+    bank = KernelBank(recon, spectral_budget=3 * one)
+    cells = _cells((1, 0), (2, 2), (0, 1), (1, 1))
+    assert bank.spectral_fits(3, (32, 30)) and not bank.spectral_fits(4, (32, 30))
+    views = bank.spectral_views(cells, (32, 30), cache=False)
+    expected = torch.fft.fft2(bank.spatial(cells), s=(32, 30)).conj()
+    torch.testing.assert_close(torch.stack(views), expected)
+    assert bank._spectral_cache.nbytes == 0  # nothing was cached
+    cached = bank.spectral_views(cells[:2], (32, 30))
+    torch.testing.assert_close(torch.stack(cached), expected[:2])
+    assert bank._spectral_cache.nbytes == 2 * one
+    # the uncached call still reads what is cached
+    again = bank.spectral_views(cells[:2], (32, 30), cache=False)
+    assert again[0] is cached[0] and again[1] is cached[1]
+
+
+def test_kernel_bank_planar_block_tier(recon):
+    one = 2 * 400 * 2  # one cell's planar rows in fp16 at the 20x20 box
+    bank = KernelBank(recon, planar_budget=4 * one)
+    rect = (1, 0, 2, 2)  # 4 cells: fits exactly
+    assert bank.planar_fits(rect, torch.float16) and not bank.has_planar_block(rect, torch.float16)
+    assert bank.planar_bytes_of(rect, torch.float16) == 4 * one
+    block = bank.planar_block(rect, torch.float16)
+    assert block.shape == (2, 4, 400) and block.dtype == torch.float16 and block.is_contiguous()
+    # row-major (k, m) cells, same rows as planar()
+    cells = _cells((1, 0), (1, 1), (2, 0), (2, 1))
+    torch.testing.assert_close(block, bank.planar(cells, torch.float16))
+    # built once: the same tensor comes back, nothing is reallocated
+    assert bank.planar_block(rect, torch.float16) is block
+    assert bank.has_planar_block(rect, torch.float16) and bank.planar_bytes == 4 * one
+    # another dtype is another block; the budget evicts the least recently used one
+    assert bank.planar_fits(rect, torch.float32) is False  # 8 * one > budget
+    small = (0, 0, 1, 2)  # 2 cells in fp16: fits, evicts the 4-cell block
+    other = bank.planar_block(small, torch.float16)
+    assert bank.has_planar_block(small, torch.float16)
+    assert not bank.has_planar_block(rect, torch.float16) and bank.planar_bytes == 2 * one
+    assert bank.planar_block(small, torch.float16) is other
+    bank.clear()
+    assert bank.planar_bytes == 0 and not bank.has_planar_block(small, torch.float16)
+    # tier disabled: built and returned, never cached
+    off = KernelBank(recon, planar_budget=0)
+    assert not off.planar_fits(rect, torch.float16)
+    b1 = off.planar_block(rect, torch.float16)
+    assert b1 is not off.planar_block(rect, torch.float16) and off.planar_bytes == 0
