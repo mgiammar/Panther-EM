@@ -114,5 +114,6 @@ svd_comparison
 experiments
 *.tmp
 benchmark/
+benchmarks/
 examples/
 scratch/
