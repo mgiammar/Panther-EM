@@ -70,7 +70,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
 
     from panther_em.inference.search.features import Residency
-    from panther_em.inference.search.featurize import Featurize, LoopOrder
+    from panther_em.inference.search.featurize import Featurize, LoopOrder, TileSpec
     from panther_em.inference.search.template import Template
     from panther_em.inference.search.types import BatchShape, Rectangle
 
@@ -95,13 +95,16 @@ class ExecutionConfig:
         at 1024, 134 MiB at 4096), and once they no longer fit the template's
         ``spectral_budget`` every plane re-FFTs every kernel, which costs as much as
         the correlation itself. 1024 keeps a rank-1024 stage's spectra in 8 GiB.
-    device_tile : int, optional
-        Tile side for a device-resident store, which has no staging constraint.
+    device_tile : int, (int, int), "fit" or None
+        Tile of a device-resident store, which has no staging constraint.
         Featurizing a pixel subset costs one correlation per (cell, tile touched),
-        so the per-pixel cost is set by the tile: measured on the 60S template at
-        rank 8192, 0.49 ns per pixel-cell at 1024, 0.22 at 2048 (2560^2 FFTs) and
-        0.47 at 4096 (134 MB spectra, memory-bound passes). ``None`` covers each
-        image with one tile.
+        so the per-pixel cost is set by how much of each tile the selection uses.
+        ``"fit"`` (default) uses one tile the size of the selection's bounding box:
+        a band of 180 rows of a 4k micrograph is then one 700 x 4096 FFT per cell
+        instead of two 2560^2 ones of which 9 % is kept. A side or ``(h, w)`` pair
+        tiles from the grid origin (measured on the 60S template at rank 8192: 0.49
+        ns per pixel-cell at 1024, 0.22 at 2048, 0.47 at 4096 with 134 MB spectra);
+        ``None`` covers each image with one tile.
     cell_chunk : int
         Kernels per featurization chunk.
     image_batch : int
@@ -147,7 +150,7 @@ class ExecutionConfig:
     use_cuda_graph: bool = True
     use_fused_kernel: bool = True
     tile: int = 1024
-    device_tile: int | None = 2048
+    device_tile: TileSpec | None = "fit"
     cell_chunk: int = 64
     image_batch: int = 1024
     featurize_mode: Literal["auto", "fft", "direct"] = "auto"
@@ -335,7 +338,7 @@ class SearchSession:
         )
         self.pixels: PixelSelection = initial
         self.store: FeatureStore | None = None
-        self._store_tile = 0  # the tile the store's column order was built with
+        self._store_tile: TileSpec = 0  # tile the store's column order was built with
         self.stage_index = 0
         self.stage_results: list[StageResult] = []
         self.elapsed_s = 0.0
@@ -375,6 +378,7 @@ class SearchSession:
             # Nothing of the previous stage's store is read again (a different
             # rectangle or precision): drop it rather than compact it.
             store = None
+        tile: TileSpec
         if reusable:
             tile = self._store_tile  # the subset keeps the store's column order
         elif residency == "pinned_host":

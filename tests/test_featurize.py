@@ -106,9 +106,9 @@ def test_single_tile_matches_reference_all_pixels(bank):
     geo = SearchGeometry.from_images(images, bank.template_shape)
     pixels = PixelSelection.all(geo)
     sched, store, group = _run(bank, images, geo, pixels, RECT, tile=1024, mode="fft")
-    # tile side is clamped to min(out_h, out_w) = 9 on an 11 x 9 grid -> 2 tiles/image,
-    # whose owned rows stay row-major, so the compact order equals the sorted order
-    assert sched.tile == 9 and len(sched.items) == 4
+    # the tile is clamped to the 11 x 9 grid -> 1 tile per image, whose owned rows
+    # stay row-major, so the compact order equals the sorted order
+    assert sched.tile_shape == (11, 9) and len(sched.items) == 2
     assert torch.equal(sched.column_index, pixels.index)
     ref = _reference(bank, images.images, RECT)
     expected = _expected_columns(ref, geo, sched.column_index).reshape(-1, 2, 3)
@@ -138,6 +138,40 @@ def test_tiled_masked_selection_matches_reference(bank, order):
     torch.testing.assert_close(
         read_group(store, group, 0), expected, rtol=1e-4, atol=1e-5
     )
+
+
+@pytest.mark.parametrize("order", ["pixel_major", "cell_major"])
+def test_fitted_and_rectangular_tiles_match_reference(bank, order):
+    images = ImageSet.from_stack(_images(b=2, h=31, w=29, seed=4), filters=torch.rand(2, 31, 15))
+    geo = SearchGeometry.from_images(images, bank.template_shape)  # grid (12, 10)
+    mask = torch.zeros(geo.dense_shape, dtype=torch.bool)
+    mask[:, 3:6, 1:9] = True  # a band of 3 rows in both images
+    mask[1, 4, 2] = False
+    pixels = PixelSelection.from_mask(geo, mask)
+    raw = images.images
+    # "fit": one tile the size of the band's bounding box, anchored at it, per image
+    sched, store, group = _run(
+        bank, images, geo, pixels, RECT, block_pixels=5, chunk=4, order=order, tile="fit", mode="fft"
+    )
+    assert sched.tile_shape == (3, 8) and sched.origin == (3, 1) and len(sched.items) == 2
+    assert sched.fft_shape == (3 + 20 - 1, 8 + 20 - 1) or sched.fft_shape[0] >= 22
+    assert all(item.row0 == 3 and item.col0 == 1 for item in sched.items)
+    for d in range(2):
+        pre = torch.fft.irfft2(torch.fft.rfft2(raw) * images.filters[d], s=(31, 29))
+        expected = _expected_columns(_reference(bank, pre, RECT), geo, sched.column_index).reshape(-1, 2, 3)
+        torch.testing.assert_close(read_group(store, group, d), expected, rtol=1e-4, atol=1e-5)
+    # an explicit (tile_h, tile_w) tiles from the grid origin
+    sched, store, group = _run(
+        bank, images, geo, pixels, RECT, block_pixels=5, chunk=4, order=order, tile=(2, 7), mode="fft"
+    )
+    assert sched.tile_shape == (2, 7) and sched.n_tile_rows == 6 and sched.n_tile_cols == 2
+    assert len(sched.items) == 8  # rows 3..5 span tile rows 1 and 2, cols 1..8 both tile cols
+    for d in range(2):
+        pre = torch.fft.irfft2(torch.fft.rfft2(raw) * images.filters[d], s=(31, 29))
+        expected = _expected_columns(_reference(bank, pre, RECT), geo, sched.column_index).reshape(-1, 2, 3)
+        torch.testing.assert_close(read_group(store, group, d), expected, rtol=1e-4, atol=1e-5)
+    with pytest.raises(ValueError):
+        schedule_tiles(geo, pixels, tile=(0, 3), mode="fft")
 
 
 def test_filter_planes_match_prefiltered_reference(bank):
