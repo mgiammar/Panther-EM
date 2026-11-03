@@ -4,15 +4,15 @@ Builds (or reuses) the two JIT extensions with ``-Xptxas -v`` and prints one row
 kernel instantiation: registers, spill bytes and whether the entry meets the register
 cap implied by its ``__launch_bounds__`` occupancy (``min_blocks_per_sm`` in
 ``csrc/lean_irfft_stats.cuh``). Exits non-zero when any lean entry exceeds its cap
-or spills more than the tolerances below (a few bytes of spill at the 168/255-register
-caps are known and harmless: the ``<64,4>``/``<56,4>`` fp32 dense entries and the
-fp16 ``n_psi=256`` emit entries with ``FMAX`` in {120, 128}).
+or spills more than the tolerance below (a few bytes of spill at the 168/255-register
+caps are known and harmless, e.g. the ``<64,4>``/``<56,4>`` fp32 entries and the
+``n_psi=512`` fp16 entries).
 
 Usage::
 
     CUDA_VISIBLE_DEVICES=1 TORCH_EXTENSIONS_DIR=... python scripts/check_lean_ptxas.py
 
-Set ``--rebuild`` to force a clean rebuild of both extensions (needed after editing the
+Set ``--rebuild`` to force a clean rebuild of the extension (needed after editing the
 kernels so a fresh ptxas report is produced; a cached build prints nothing).
 """
 
@@ -30,11 +30,10 @@ ENTRY_RE = re.compile(
     r"(?=ptxas info\s+: Compiling entry|\Z)",
     re.S,
 )
-LEAN_RE = re.compile(r"lean_irfft_stats_transposed<(\d+)u, (\d+)u, (\w+), (true|false)")
+LEAN_RE = re.compile(r"lean_irfft_stats_transposed<(\d+)u, (\d+)u, (\w+)")
 REGS_PER_SM = 65536
 # bytes of spill stores + loads tolerated per entry before the check fails
-DENSE_SPILL_TOLERANCE = 16
-EMIT_SPILL_TOLERANCE = 128
+SPILL_TOLERANCE = 16
 
 
 def _demangle(name: str) -> str:
@@ -69,31 +68,29 @@ sys.exit(0 if module is not None else 3)
 """
 
 
-def _build_logs(rebuild: bool) -> tuple[str, str]:
-    """Return the verbose build logs of the pairs and dense extensions.
+def _build_log(rebuild: bool) -> str:
+    """Return the verbose build log of the extension.
 
-    Each build runs in a child interpreter so that ninja's ptxas output (written to
+    The build runs in a child interpreter so that ninja's ptxas output (written to
     the process's real file descriptors) is captured.
     """
     if rebuild:
         ext_dir = os.environ.get("TORCH_EXTENSIONS_DIR")
         if ext_dir is None:
             sys.exit("--rebuild needs TORCH_EXTENSIONS_DIR to be set")
-        for name in ("panther_em_fused_irfft_stats", "panther_em_lean_pairs"):
-            shutil.rmtree(os.path.join(ext_dir, name), ignore_errors=True)
-    env = {**os.environ, "PANTHER_EM_FUSED_KERNEL_VERBOSE": "1"}
-    logs = []
-    for fn_name in ("_try_compile_pairs", "_try_compile"):
-        proc = subprocess.run(
-            [sys.executable, "-c", _BUILD_SNIPPET, fn_name],
-            capture_output=True,
-            text=True,
-            env=env,
+        shutil.rmtree(
+            os.path.join(ext_dir, "panther_em_fused_irfft_stats"), ignore_errors=True
         )
-        if proc.returncode != 0:
-            sys.exit(f"{fn_name} failed:\n{(proc.stdout + proc.stderr)[-4000:]}")
-        logs.append(proc.stdout + proc.stderr)
-    return logs[0], logs[1]
+    env = {**os.environ, "PANTHER_EM_FUSED_KERNEL_VERBOSE": "1"}
+    proc = subprocess.run(
+        [sys.executable, "-c", _BUILD_SNIPPET, "_try_compile"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if proc.returncode != 0:
+        sys.exit(f"_try_compile failed:\n{(proc.stdout + proc.stderr)[-4000:]}")
+    return proc.stdout + proc.stderr
 
 
 def main() -> int:
@@ -105,12 +102,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    pairs_log, dense_log = _build_logs(args.rebuild)
+    log = _build_log(args.rebuild)
     failures = 0
     rows = 0
-    header = f"{'module':6s} {'sm':5s} {'regs':>4s} {'cap':>4s} {'spill(st/ld)':>13s}"
+    header = f"{'sm':5s} {'regs':>4s} {'cap':>4s} {'spill(st/ld)':>13s}"
     print(f"{header}  kernel")
-    for module, log in (("pairs", pairs_log), ("dense", dense_log)):
+    if True:
         for mangled, sm, body in ENTRY_RE.findall(log):
             name = _demangle(mangled)
             lean = LEAN_RE.search(name)
@@ -127,26 +124,20 @@ def main() -> int:
             cap = ""
             flag = ""
             if lean is not None:
-                fmax, r, _dtype, emit = (
-                    int(lean.group(1)),
-                    int(lean.group(2)),
-                    lean.group(3),
-                    lean.group(4) == "true",
-                )
+                fmax, r = int(lean.group(1)), int(lean.group(2))
                 cap_n = _register_cap(_min_blocks_per_sm(fmax, r))
                 cap = str(cap_n)
                 if regs > cap_n:
                     flag = "  OVER CAP"
                     failures += 1
-                tolerance = EMIT_SPILL_TOLERANCE if emit else DENSE_SPILL_TOLERANCE
                 if any(spill):
-                    flag += "  spill (emit)" if emit else "  spill (dense)"
-                    if sum(spill) > tolerance:
+                    flag += "  spill"
+                    if sum(spill) > SPILL_TOLERANCE:
                         flag += " OVER TOLERANCE"
                         failures += 1
             rows += 1
             spill_s = f"{spill[0]:6d}/{spill[1]:<6d}"
-            cells = f"{module:6s} sm_{sm:3s} {regs:4d} {cap:>4s} {spill_s}"
+            cells = f"sm_{sm:3s} {regs:4d} {cap:>4s} {spill_s}"
             print(f"{cells}  {name[:100]}{flag}")
     if rows == 0:
         print(

@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import enum
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
+import h5py  # type: ignore[import-untyped]
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from pathlib import Path
 
 # (k_start, m_start, k_extent, m_extent) block of ``(angular frequency, eigenvector)``
 # feature space.
@@ -86,6 +88,143 @@ class BatchShape:
             raise ValueError(f"batch sizes must be positive, got {self}")
 
 
+def _with_leading_axes(t: torch.Tensor, rank: int) -> torch.Tensor:
+    """``t`` with unit axes prepended up to ``rank``."""
+    while t.dim() < rank:
+        t = t.unsqueeze(0)
+    return t
+
+
+@dataclass(frozen=True, eq=False)
+class ImageSpectra:
+    """Per-image curves and maps of the colored-noise model.
+
+    Parameters
+    ----------
+    freq : torch.Tensor
+        ``(F,)`` float32 frequency axis of the curves (cycles per pixel).
+    noise : torch.Tensor
+        ``(B'|1, D'|1, F)`` float64 noise power per ring of each image's search image
+        on each CTF plane (the note's ``kappa^2 P(f)``; grid mean = variance).
+    signal : torch.Tensor
+        ``(B'|1, D'|1, F)`` float64 signal weight per ring: the filter a particle
+        carries in the search image beyond the template's (the note's ``G_i``,
+        ``C_i^2 |CTF|^2``).
+    level : torch.Tensor
+        ``(B'|1, H|1, W|1)`` float32 relative noise level at each image pixel
+        (mean 1).
+    pixel_size : float
+        Angstrom per pixel, for the B-factor envelope.
+    """
+
+    freq: torch.Tensor
+    noise: torch.Tensor
+    signal: torch.Tensor
+    level: torch.Tensor
+    pixel_size: float = 1.0
+
+    @classmethod
+    def create(
+        cls,
+        freq: torch.Tensor,
+        noise: torch.Tensor,
+        signal: torch.Tensor | None = None,
+        level: torch.Tensor | None = None,
+        pixel_size: float = 1.0,
+    ) -> ImageSpectra:
+        """Coerce curves of rank 1 to 3 and maps of rank 0 to 3 (CPU tensors)."""
+        f = torch.as_tensor(freq).reshape(-1).to(torch.float32).cpu()
+        n = _with_leading_axes(torch.as_tensor(noise).to(torch.float64).cpu(), 3)
+        s = (
+            torch.ones((1, 1, f.numel()), dtype=torch.float64)
+            if signal is None
+            else _with_leading_axes(torch.as_tensor(signal).to(torch.float64).cpu(), 3)
+        )
+        lv = (
+            torch.ones((1, 1, 1), dtype=torch.float32)
+            if level is None
+            else _with_leading_axes(torch.as_tensor(level).to(torch.float32).cpu(), 3)
+        )
+        return cls(f, n, s, lv, float(pixel_size))
+
+    def __post_init__(self) -> None:
+        """Validate (never coerce); see :meth:`create`."""
+        if self.freq.dim() != 1 or self.freq.dtype is not torch.float32:
+            raise ValueError(
+                "freq must be a 1-D float32 tensor; see ImageSpectra.create()"
+            )
+        if self.freq.numel() < 2 or not bool(torch.all(self.freq[1:] > self.freq[:-1])):
+            raise ValueError("freq must be increasing with at least two bins")
+        n_bins = self.freq.numel()
+        for name, t in (("noise", self.noise), ("signal", self.signal)):
+            if t.dim() != 3 or t.dtype is not torch.float64 or t.shape[-1] != n_bins:
+                raise ValueError(
+                    f"{name} must be a float64 (B', D', {n_bins}) tensor, got "
+                    f"{tuple(t.shape)} {t.dtype}; see ImageSpectra.create()"
+                )
+            if not bool(torch.isfinite(t).all()) or bool((t < 0).any()):
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.level.dim() != 3 or self.level.dtype is not torch.float32:
+            raise ValueError("level must be a float32 (B', H', W') tensor")
+        if not bool(torch.isfinite(self.level).all()) or bool((self.level <= 0).any()):
+            raise ValueError("level must be finite and positive")
+        if not self.pixel_size > 0.0:
+            raise ValueError("pixel_size must be positive")
+
+    @property
+    def n_bins(self) -> int:
+        """``F``."""
+        return int(self.freq.numel())
+
+    def validate_for(
+        self, n_images: int, n_defocus: int, image_shape: tuple[int, int]
+    ) -> None:
+        """Check every non-unit axis against an image set's ``B``, ``D``, ``(H, W)``."""
+        for name, t, sizes in (
+            ("noise", self.noise, (n_images, n_defocus)),
+            ("signal", self.signal, (n_images, n_defocus)),
+            ("level", self.level, (n_images, int(image_shape[0]), int(image_shape[1]))),
+        ):
+            for axis, (got, want) in enumerate(zip(t.shape, sizes, strict=False)):
+                if got not in (1, want):
+                    raise ValueError(
+                        f"spectra.{name} axis {axis} has size {got}; the image set "
+                        f"needs 1 or {want}"
+                    )
+
+    def write_group(self, group: h5py.Group) -> None:
+        """Write the curves and the level map into an open HDF5 group."""
+        for name in ("freq", "noise", "signal", "level"):
+            group.create_dataset(name, data=getattr(self, name).numpy())
+        group.attrs["pixel_size"] = float(self.pixel_size)
+
+    @classmethod
+    def read_group(cls, group: h5py.Group) -> ImageSpectra:
+        """Read a group written by :meth:`write_group`."""
+        data = {
+            name: torch.from_numpy(np.asarray(group[name]))
+            for name in ("freq", "noise", "signal", "level")
+        }
+        return cls.create(
+            data["freq"],
+            data["noise"],
+            data["signal"],
+            data["level"],
+            float(group.attrs["pixel_size"]),
+        )
+
+    def save(self, path: str | Path) -> None:
+        """Write the curves and the level map to an HDF5 file."""
+        with h5py.File(path, "w") as f:
+            self.write_group(f)
+
+    @classmethod
+    def load(cls, path: str | Path) -> ImageSpectra:
+        """Read a file written by :meth:`save`."""
+        with h5py.File(path, "r") as f:
+            return cls.read_group(f)
+
+
 @dataclass(frozen=True, eq=False)
 class ImageSet:
     """A batch of already-preprocessed images plus optional per-image inputs.
@@ -107,32 +246,27 @@ class ImageSet:
     center_only : bool, optional
         Force the 1x1 (center pixel only) evaluation mode. ``None`` (default) selects
         it automatically when the image box equals the template box.
-    pixel_maps : Mapping[str, torch.Tensor], optional
-        Precomputed per-pixel maps on the valid-correlation grid that decisions may
-        read (e.g. ``"image_norm"`` and ``"noise_variance"`` for the calibrated
-        threshold rule): ``(out_h, out_w)`` shared, ``(B, out_h, out_w)`` per image,
-        or ``(B,)`` in center-only mode. Real-valued. Validated against the template
-        box by :meth:`SearchGeometry.from_images`.
+    spectra : ImageSpectra, optional
+        The images' noise/signal curves and level maps, needed by a stage whose
+        decision runs the coloured-noise threshold test (see :meth:`with_spectra`).
     """
 
     images: torch.Tensor
     filters: torch.Tensor | None = None
     mask: torch.Tensor | None = None
     center_only: bool | None = None
-    pixel_maps: Mapping[str, torch.Tensor] | None = None
+    spectra: ImageSpectra | None = None
 
     def __post_init__(self) -> None:
-        """Promote a single image and validate the filter stack shape."""
+        """Validate (never coerce): a real ``(B, H, W)`` stack and matching filters."""
         images = self.images
-        if images.dim() == 2:
-            images = images.unsqueeze(0)
         if images.dim() != 3:
             raise ValueError(
-                f"images must have shape (H, W) or (B, H, W), got {tuple(images.shape)}"
+                f"images must have shape (B, H, W), got {tuple(images.shape)}; use "
+                "ImageSet.single() for one (H, W) image"
             )
         if images.is_complex():
             raise ValueError("images must be real-valued")
-        object.__setattr__(self, "images", images)
 
         b, h, w = images.shape
         if self.filters is not None:
@@ -158,16 +292,8 @@ class ImageSet:
                 )
             if f.shape[-3] < 1:
                 raise ValueError("filters must have at least one defocus plane")
-        if self.pixel_maps is not None:
-            for name, t in self.pixel_maps.items():
-                if (
-                    not isinstance(t, torch.Tensor)
-                    or t.is_complex()
-                    or t.dim() not in (1, 2, 3)
-                ):
-                    raise ValueError(
-                        f"pixel map {name!r} must be a real tensor of 1 to 3 dims"
-                    )
+        if self.spectra is not None:
+            self.spectra.validate_for(b, self.n_defocus, (h, w))
 
     @property
     def n_images(self) -> int:
@@ -207,7 +333,7 @@ class ImageSet:
         filters: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
         center_only: bool | None = None,
-        pixel_maps: Mapping[str, torch.Tensor] | None = None,
+        spectra: ImageSpectra | None = None,
     ) -> ImageSet:
         """One ``(H, W)`` image."""
         if image.dim() != 2:
@@ -215,11 +341,11 @@ class ImageSet:
                 f"single() expects an (H, W) image, got {tuple(image.shape)}"
             )
         return cls(
-            image,
+            image.unsqueeze(0),
             filters=filters,
             mask=mask,
             center_only=center_only,
-            pixel_maps=pixel_maps,
+            spectra=spectra,
         )
 
     @classmethod
@@ -230,7 +356,7 @@ class ImageSet:
         filters: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
         center_only: bool | None = None,
-        pixel_maps: Mapping[str, torch.Tensor] | None = None,
+        spectra: ImageSpectra | None = None,
     ) -> ImageSet:
         """A ``(B, H, W)`` stack of same-size images (micrographs or particle boxes)."""
         if images.dim() != 3:
@@ -238,12 +364,12 @@ class ImageSet:
                 f"from_stack() expects a (B, H, W) stack, got {tuple(images.shape)}"
             )
         return cls(
-            images,
-            filters=filters,
-            mask=mask,
-            center_only=center_only,
-            pixel_maps=pixel_maps,
+            images, filters=filters, mask=mask, center_only=center_only, spectra=spectra
         )
+
+    def with_spectra(self, spectra: ImageSpectra | None) -> ImageSet:
+        """A copy carrying ``spectra`` (validated against this set)."""
+        return replace(self, spectra=spectra)
 
     # Alias with the particle-stack vocabulary.
     from_boxes = from_stack
@@ -304,8 +430,6 @@ class SearchGeometry:
         )
         if images.mask is not None:
             geometry.validate_mask(images.mask)
-        if images.pixel_maps is not None:
-            geometry.validate_pixel_maps(images.pixel_maps)
         return geometry
 
     @property
@@ -339,32 +463,6 @@ class SearchGeometry:
             f"the per-image {self.dense_shape}"
         )
 
-    def validate_pixel_map(self, name: str, values: torch.Tensor) -> torch.Tensor:
-        """Broadcast a shared/per-image real map to ``(B, *grid)`` float32."""
-        if values.is_complex():
-            raise ValueError(f"pixel map {name!r} must be real-valued")
-        shape = tuple(values.shape)
-        if shape == self.dense_shape:
-            dense = values
-        elif shape == self.grid:
-            dense = values.unsqueeze(0).expand(self.dense_shape)
-        elif self.mode == "center" and shape == (self.n_images,):
-            dense = values.reshape(self.dense_shape)
-        else:
-            raise ValueError(
-                f"pixel map {name!r} has shape {shape}; expected the shared grid "
-                f"{self.grid} or the per-image {self.dense_shape}"
-            )
-        return dense.to(torch.float32)
-
-    def validate_pixel_maps(
-        self, maps: Mapping[str, torch.Tensor] | None
-    ) -> dict[str, torch.Tensor]:
-        """Every map broadcast to ``(B, *grid)`` float32."""
-        if maps is None:
-            return {}
-        return {name: self.validate_pixel_map(name, t) for name, t in maps.items()}
-
     def flat_index(self, mask: torch.Tensor | None) -> torch.Tensor:
         """Sorted flat int64 indices of the selected pixels (all if no ``mask``)."""
         if mask is None:
@@ -395,15 +493,19 @@ class PixelSelection:
 
     index: torch.Tensor
     geometry: SearchGeometry
-    _n: int = field(init=False, repr=False)
+
+    @classmethod
+    def create(cls, index: torch.Tensor, geometry: SearchGeometry) -> PixelSelection:
+        """Build a selection from any integer index tensor (cast to int64)."""
+        return cls(torch.as_tensor(index).reshape(-1).to(torch.long), geometry)
 
     def __post_init__(self) -> None:
-        """Coerce the index to int64 and cache its length."""
-        if self.index.dim() != 1:
-            raise ValueError(f"index must be 1-D, got shape {tuple(self.index.shape)}")
-        if self.index.dtype != torch.long:
-            object.__setattr__(self, "index", self.index.to(torch.long))
-        object.__setattr__(self, "_n", int(self.index.numel()))
+        """Validate (never coerce): a 1-D int64 index."""
+        if self.index.dim() != 1 or self.index.dtype is not torch.long:
+            raise ValueError(
+                f"index must be a 1-D int64 tensor, got {tuple(self.index.shape)} "
+                f"{self.index.dtype}; see PixelSelection.create()"
+            )
 
     @classmethod
     def all(
@@ -423,7 +525,7 @@ class PixelSelection:
 
     def __len__(self) -> int:
         """Number of selected pixels."""
-        return self._n
+        return int(self.index.numel())
 
     @property
     def device(self) -> torch.device:
@@ -433,7 +535,7 @@ class PixelSelection:
     @property
     def is_full(self) -> bool:
         """Whether every pixel of the geometry is selected (cheap size check)."""
-        return self._n == self.geometry.n_pixels
+        return len(self) == self.geometry.n_pixels
 
     def to(self, device: torch.device | str) -> PixelSelection:
         """Copy with the index on another device."""
@@ -441,15 +543,15 @@ class PixelSelection:
 
     def subset(self, keep: torch.Tensor) -> PixelSelection:
         """Keep pixels where the ``(P,)`` bool ``keep`` is True (order preserved)."""
-        if tuple(keep.shape) != (self._n,) or keep.dtype != torch.bool:
-            raise ValueError(f"keep must be a ({self._n},) bool tensor")
+        if tuple(keep.shape) != (len(self),) or keep.dtype != torch.bool:
+            raise ValueError(f"keep must be a ({len(self)},) bool tensor")
         return PixelSelection(self.index[keep.to(self.index.device)], self.geometry)
 
     def scatter(self, values: torch.Tensor, fill: float | int) -> torch.Tensor:
         """Scatter ``(P, ...)`` values into a dense ``(B, *grid, ...)`` map."""
-        if int(values.shape[0]) != self._n:
+        if int(values.shape[0]) != len(self):
             raise ValueError(
-                f"values must have leading axis {self._n}, got {tuple(values.shape)}"
+                f"values must have leading axis {len(self)}, got {tuple(values.shape)}"
             )
         dense = torch.full(
             (self.geometry.n_pixels, *values.shape[1:]),

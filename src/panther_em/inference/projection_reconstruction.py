@@ -3,6 +3,8 @@
 import numpy as np
 import torch
 
+from panther_em.coordinates.transform_base import CoordinateTransform
+
 from panther_em.decomposition.result import DecompositionResult
 
 
@@ -23,6 +25,11 @@ class ProjectionReconstructor:
         # GridTransform is device-agnostic; GPU dispatch is handled internally.
         self._coordinate_transform = result.coordinate_transform
         self.image_shape: tuple[int, int] = self._coordinate_transform.cartesian_shape
+
+    @property
+    def coordinate_transform(self) -> CoordinateTransform:
+        """The result's polar <-> Cartesian transform."""
+        return self._coordinate_transform
 
     def clear_coordinate_transform_cache(self) -> None:
         """Remove any cached interpolation grids."""
@@ -60,6 +67,10 @@ class ProjectionReconstructor:
     def _get_angular_phase_component(
         self, k_idx: int, phase_shift: float
     ) -> torch.Tensor:
+        """Backwards-compatible alias of :meth:`angular_phase_component`."""
+        return self.angular_phase_component(k_idx, phase_shift)
+
+    def angular_phase_component(self, k_idx: int, phase_shift: float) -> torch.Tensor:
         """Compute the k-th discrete angular Fourier basis vector.
 
         Parameters

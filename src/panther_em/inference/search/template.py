@@ -6,16 +6,14 @@ Everything here is built once per decomposition and reused across stages and ima
   ``V[k, m]`` (spatial, spectral or planar form) under a byte budget.
 * :class:`WeightSource` -- holds ``U * S`` device-resident once and serves rectangular
   ``(N, num_k, num_m)`` blocks.
-* :class:`PreparedWeightCache` -- caches the engine-specific B operands per
-  ``(k-run, hypothesis batch, precision)``.
 * :class:`Template` -- the bundle a
-  :class:`~panther_em.inference.search.searcher.Searcher` is built from.
+  :class:`~panther_em.inference.search.search.Searcher` is built from.
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -32,9 +30,7 @@ if TYPE_CHECKING:
     from collections.abc import Hashable, Iterable, Sequence
     from pathlib import Path
 
-    from panther_em.inference.search.contraction import ContractionEngine
-    from panther_em.inference.search.hypotheses import HypBatch
-    from panther_em.inference.search.tiling import FeatureLayout, KRun
+    from panther_em.inference.search.features import FeatureLayout
 
 Cell = tuple[int, int]
 
@@ -118,19 +114,6 @@ class _ByteLRU:
         self.nbytes = 0
 
 
-class _PlanarArena:
-    """``(2, capacity, kH*kW)`` planar rows filled in insertion order, never evicted."""
-
-    def __init__(self, rows: torch.Tensor) -> None:
-        self.rows = rows
-        self.index: dict[Cell, int] = {}
-        self.n_used = 0
-
-    @property
-    def capacity(self) -> int:
-        return int(self.rows.shape[1])
-
-
 class KernelBank:
     """Lazily built, byte-budgeted cache of Cartesian feature kernels.
 
@@ -147,13 +130,14 @@ class KernelBank:
     host_budget : int, optional
         Bytes of evicted spatial kernels kept on the CPU (pinned when CUDA is the
         device) before they must be rebuilt. Defaults to ``0`` (no host tier).
-    planar_budget : int, optional
-        Bytes of the planar-row arena (``[Re K ; -Im K]`` rows per cell, one arena per
-        dtype; 1 MiB per 512^2 cell in fp16). Zero (default) builds planar rows on
-        demand from the spatial kernels.
     spectral_budget : int, optional
         Bytes of ``conj(fft2(pad(kernel)))`` kept per FFT shape. ``None`` =
         unbounded; ``0`` disables spectral caching.
+    planar_budget : int, optional
+        Bytes of planar kernel blocks (:meth:`planar_block`: one contiguous
+        ``[Re K; -Im K]`` tensor per rectangle and dtype, 1 MiB per cell in fp16 at a
+        512 box) kept resident for the direct featurization engine. ``None`` =
+        unbounded; ``0`` disables the tier.
     build_chunk : int, optional
         Maximum kernels built per polar-to-Cartesian call. Defaults to 64.
 
@@ -173,7 +157,7 @@ class KernelBank:
         device_budget: int | None = None,
         host_budget: int = 0,
         spectral_budget: int | None = None,
-        planar_budget: int = 0,
+        planar_budget: int | None = None,
         build_chunk: int = 64,
     ) -> None:
         if reconstructor.result.is_complex_projection:
@@ -194,12 +178,11 @@ class KernelBank:
         self._host_arena: torch.Tensor | None = None
         self._spectral_cache = _ByteLRU(spectral_budget)
         self._spectral_enabled = spectral_budget is None or spectral_budget > 0
-        # Planar rows ([Re K ; -Im K], the inner-product GEMM's A operand) live in one
-        # device arena per dtype so a chunk of consecutive cells is a strided view:
-        # the GEMM reads the arena directly, and once every cell is resident the
-        # spatial kernels are never touched again by the sparse stage.
-        self._planar_budget = int(planar_budget)
-        self._planar: dict[torch.dtype, _PlanarArena] = {}
+        self._planar_cache = _ByteLRU(planar_budget)
+        self._planar_enabled = planar_budget is None or planar_budget > 0
+        # device-side pieces of the separable kernel build, resolved on first use
+        self._sep: dict[str, Any] | None = None
+        self._sep_resolved = False
 
     # -- construction --------------------------------------------------------
 
@@ -211,10 +194,10 @@ class KernelBank:
         recon = self.reconstructor
         indices = np.column_stack([np.full(len(ms), k), np.asarray(ms)])
         _, _, vh = recon.result.get_svd_tensors(indices, recon.device)  # (M, R)
-        angular = recon._get_angular_phase_component(k, 0.0)  # (A,)
+        angular = recon.angular_phase_component(k, 0.0)  # (A,)
         polar = angular[None, :, None] * vh[:, None, :]  # (M, A, R) complex64
         cfg = self.config
-        cart = recon._coordinate_transform.to_cartesian(
+        cart = recon.coordinate_transform.to_cartesian(
             polar,
             preserve_energy=cfg.preserve_energy,
             wrap_angular_axis=cfg.wrap_angular_axis,
@@ -242,10 +225,10 @@ class KernelBank:
         12 samples of ``cval`` before prefiltering (zero padding keeps the outer
         product separable).
         """
-        if hasattr(self, "_sep"):
+        if self._sep_resolved:
             return self._sep
-        self._sep: dict[str, Any] | None = None
-        tf = self.reconstructor._coordinate_transform
+        self._sep_resolved = True
+        tf = self.reconstructor.coordinate_transform
         if self.device.type != "cuda" or self.config.mode != "constant":
             return None
         try:
@@ -253,16 +236,34 @@ class KernelBank:
             import cupyx.scipy.ndimage as ndi  # type: ignore[import-untyped]
         except ImportError:
             return None
-        dc = tf._get_device_coords(self.device)
+        dc = tf.device_coords(self.device)
         jac = dc["jacobian"]
         if jac is not None and not bool(torch.all(jac == jac[0:1])):
             return None  # Jacobian varies with angle: not separable
         if tf.has_periodic_axis and tf.periodic_axis not in (None, 0):
             return None
         order = self.config.order
-        wrap = order if (self.config.wrap_angular_axis and tf.has_periodic_axis) else 0
+        # the generic warp pads the periodic axis by 4 * order rows (the prefilter's
+        # boundary error decays like |pole|**rows); mirror it exactly or the fast and
+        # generic kernels differ at the 0/360 seam by ~1e-3
+        wrap = (
+            4 * order if (self.config.wrap_angular_axis and tf.has_periodic_axis) else 0
+        )
+        # the generic warp may continue the radial axis through the origin (spiral
+        # transforms); that continuation mixes angle and radius, so it is not separable
+        probe = torch.zeros(tf.polar_shape, device=self.device)
+        try:
+            _, num_prepended = tf.pad_radial_axis(probe)
+        except Exception:
+            return None
+        if num_prepended:
+            return None
+        outer = tf.outer_radius_index()
         npad = 12  # ndimage's grid-constant pre-padding
         coords = dc["cartesian"].to(torch.float32).clone()
+        support = (
+            None if outer is None else (coords[1] <= float(outer)).to(torch.float32)
+        )
         coords[0] += wrap + npad
         coords[1] += npad
         self._sep = {
@@ -275,6 +276,7 @@ class KernelBank:
             "wrap": wrap,
             "npad": npad,
             "order": order,
+            "support": support,  # (kH, kW) 0/1 mask outside the transform's support
             "angular": {},  # k -> (F a_re, F a_im) cupy float32
         }
         return self._sep
@@ -299,25 +301,32 @@ class KernelBank:
         recon = self.reconstructor
         cval = float(self.config.cval)
 
-        keep: list[torch.Tensor] = []  # torch temporaries viewed by CuPy, alive till return
+        keep: list[
+            torch.Tensor
+        ] = []  # torch temporaries viewed by CuPy, alive till return
 
         def filt(vecs: torch.Tensor) -> Any:
             """1-D grid-constant prefilter of ``(..., L)`` rows, pre-padded by npad."""
-            x = torch.nn.functional.pad(vecs.to(torch.float32), (npad, npad), value=cval)
+            x = torch.nn.functional.pad(
+                vecs.to(torch.float32), (npad, npad), value=cval
+            )
             x = x.contiguous()
             keep.append(x)
             return ndi.spline_filter1d(
-                cupy.asarray(x), order=order, axis=-1, mode="grid-constant",
+                cupy.asarray(x),
+                order=order,
+                axis=-1,
+                mode="grid-constant",
                 output=cupy.float32,  # default float64 would make the planes/maps f64
             )
 
         ang = sep["angular"].get(k)
         if ang is None:
-            a = recon._get_angular_phase_component(k, 0.0).to(torch.complex64)
+            a = recon.angular_phase_component(k, 0.0).to(torch.complex64)
             if wrap:
-                a = torch.nn.functional.pad(a[None, None], (wrap, wrap), mode="circular")[
-                    0, 0
-                ]
+                a = torch.nn.functional.pad(
+                    a[None, None], (wrap, wrap), mode="circular"
+                )[0, 0]
             ang = (filt(a.real), filt(a.imag))  # (A',)
             sep["angular"][k] = ang
         indices = np.column_stack([np.full(len(ms), k), np.asarray(ms)])
@@ -328,24 +337,40 @@ class KernelBank:
         fb_r, fb_i = filt(vh.real), filt(vh.imag)  # (M, R')
         fa_r, fa_i = ang
         # prefiltered polar planes for the whole group: (M, A', R')
-        planes_r = fa_r[None, :, None] * fb_r[:, None, :] - fa_i[None, :, None] * fb_i[:, None, :]
-        planes_i = fa_r[None, :, None] * fb_i[:, None, :] + fa_i[None, :, None] * fb_r[:, None, :]
+        planes_r = (
+            fa_r[None, :, None] * fb_r[:, None, :]
+            - fa_i[None, :, None] * fb_i[:, None, :]
+        )
+        planes_i = (
+            fa_r[None, :, None] * fb_i[:, None, :]
+            + fa_i[None, :, None] * fb_r[:, None, :]
+        )
         out = torch.empty(
             (len(ms), *self.template_shape), dtype=torch.complex64, device=self.device
         )
         for i in range(len(ms)):
             cart_r = ndi.map_coordinates(
-                planes_r[i], sep["coords"], order=order, prefilter=False,
-                mode="grid-constant", cval=cval,
+                planes_r[i],
+                sep["coords"],
+                order=order,
+                prefilter=False,
+                mode="grid-constant",
+                cval=cval,
             )
             cart_i = ndi.map_coordinates(
-                planes_i[i], sep["coords"], order=order, prefilter=False,
-                mode="grid-constant", cval=cval,
+                planes_i[i],
+                sep["coords"],
+                order=order,
+                prefilter=False,
+                mode="grid-constant",
+                cval=cval,
             )
             out[i] = torch.complex(
                 torch.as_tensor(cart_r, device=self.device),
                 torch.as_tensor(cart_i, device=self.device),
             )
+        if sep["support"] is not None:
+            out *= sep["support"]
         return out
 
     def _build(self, missing: Sequence[Cell]) -> dict[Cell, torch.Tensor]:
@@ -475,16 +500,34 @@ class KernelBank:
                     self._spectral_cache.put((keys[i], fft_shape), spec[j].clone())
         return result
 
+    def spectral_fits(self, n_cells: int, fft_shape: tuple[int, int]) -> bool:
+        """Whether ``n_cells`` spectra at ``fft_shape`` fit the spectral budget.
+
+        A sweep over more spectra than the LRU holds never hits (each pass evicts
+        what the next pass needs) and would only evict the spectra of other stages,
+        so such a sweep is better run uncached (:meth:`spectral_views`).
+        """
+        if not self._spectral_enabled:
+            return False
+        budget = self._spectral_cache.budget
+        if budget is None:
+            return True
+        per_cell = int(fft_shape[0]) * int(fft_shape[1]) * 8  # complex64
+        return n_cells * per_cell <= budget
+
     def spectral_views(
         self,
         cells: torch.Tensor | Iterable[Sequence[int]],
         fft_shape: tuple[int, int],
+        *,
+        cache: bool = True,
     ) -> list[torch.Tensor]:
         """Per-cell ``(Fh, Fw)`` spectra, the cached tensors themselves (no stacking).
 
         Same contents as :meth:`spectral`; use this when the consumer processes one
         cell at a time, so a large tile's spectrum (134 MB at 4096^2) is not copied
-        into a batch first.
+        into a batch first. ``cache=False`` reads the cache but does not fill it
+        (see :meth:`spectral_fits`).
         """
         keys = _as_cells(cells)
         fft_shape = (int(fft_shape[0]), int(fft_shape[1]))
@@ -499,10 +542,12 @@ class KernelBank:
             spatial = self.spatial([keys[i] for i in todo])
             spec = torch.fft.fft2(spatial, s=fft_shape).conj()
             for j, i in enumerate(todo):
-                fresh = spec[j].clone()  # own storage, not a view of the batch
-                views[i] = fresh
-                if self._spectral_enabled:
+                if self._spectral_enabled and cache:
+                    fresh = spec[j].clone()  # own storage, not a view of the batch
                     self._spectral_cache.put((keys[i], fft_shape), fresh)
+                    views[i] = fresh
+                else:
+                    views[i] = spec[j]  # consumed before the batch is dropped
         return [v for v in views if v is not None]
 
     def planar(
@@ -516,97 +561,62 @@ class KernelBank:
         of a centred box are ``planar @ I.flatten()`` with real part row 0 and imaginary
         part ``-``row 1.
         """
-        keys = _as_cells(cells)
-        k_flat = self.template_shape[0] * self.template_shape[1]
-        arena = self._planar_arena(dtype)
-        if arena is None:
-            return self._planar_uncached(keys, dtype)
-        missing = [c for c in dict.fromkeys(keys) if c not in arena.index]
-        fill = missing[: arena.capacity - arena.n_used]
-        for start in range(0, len(fill), self.build_chunk):
-            chunk = fill[start : start + self.build_chunk]
-            spatial = self.spatial(chunk).reshape(len(chunk), k_flat)
-            r0 = arena.n_used
-            arena.rows[0, r0 : r0 + len(chunk)] = spatial.real
-            arena.rows[1, r0 : r0 + len(chunk)] = -spatial.imag
-            for i, cell in enumerate(chunk):
-                arena.index[cell] = r0 + i
-            arena.n_used += len(chunk)
-        rows = [arena.index.get(c, -1) for c in keys]
-        if all(r >= 0 for r in rows):
-            if rows == list(range(rows[0], rows[0] + len(rows))):
-                return arena.rows[:, rows[0] : rows[0] + len(rows)]  # a view
-            return arena.rows.index_select(1, torch.tensor(rows, device=self.device))
-        # partially resident: gather what is, build the rest uncached
-        out = torch.empty((2, len(keys), k_flat), dtype=dtype, device=self.device)
-        hit = [i for i, r in enumerate(rows) if r >= 0]
-        miss = [i for i, r in enumerate(rows) if r < 0]
-        if hit:
-            out[:, hit] = arena.rows.index_select(
-                1, torch.tensor([rows[i] for i in hit], device=self.device)
-            )
-        out[:, miss] = self._planar_uncached([keys[i] for i in miss], dtype)
-        return out
-
-    def _planar_uncached(self, keys: Sequence[Cell], dtype: torch.dtype) -> torch.Tensor:
-        spatial = self.spatial(keys).reshape(
+        spatial = self.spatial(cells).reshape(
             -1, self.template_shape[0] * self.template_shape[1]
         )
         return torch.stack((spatial.real, -spatial.imag), dim=0).to(dtype)
 
-    def _planar_arena(self, dtype: torch.dtype) -> _PlanarArena | None:
-        if self._planar_budget <= 0:
-            return None
-        arena = self._planar.get(dtype)
-        if arena is None:
-            k_flat = self.template_shape[0] * self.template_shape[1]
-            row_bytes = 2 * k_flat * torch.empty((), dtype=dtype).element_size()
-            capacity = self._planar_budget // row_bytes
-            if capacity < 1:
-                return None
-            arena = _PlanarArena(
-                torch.empty((2, capacity, k_flat), dtype=dtype, device=self.device)
-            )
-            self._planar[dtype] = arena
-        return arena
+    # -- planar blocks (the direct featurization engine's GEMM operand) -------
 
-    def reserve_planar(self, dtype: torch.dtype = torch.float32) -> int:
-        """Allocate the planar arena for ``dtype`` now (empty); returns its capacity.
+    def planar_bytes_of(self, rect: Rectangle, dtype: torch.dtype) -> int:
+        """Bytes of the planar block of ``rect`` at ``dtype``."""
+        n_cells = int(rect[2]) * int(rect[3])
+        elem = torch.empty((), dtype=dtype).element_size()
+        return 2 * n_cells * self.template_shape[0] * self.template_shape[1] * elem
 
-        Eager reservation makes the device memory layout independent of when the
-        first sparse stage runs (the arena outlives sessions, so it should be carved
-        before the per-session buffers rather than between them).
+    def planar_fits(self, rect: Rectangle, dtype: torch.dtype) -> bool:
+        """Whether ``rect``'s planar block fits the planar budget (tier enabled)."""
+        if not self._planar_enabled:
+            return False
+        budget = self._planar_cache.budget
+        return budget is None or self.planar_bytes_of(rect, dtype) <= budget
+
+    def has_planar_block(self, rect: Rectangle, dtype: torch.dtype) -> bool:
+        """Whether the block is resident now (no build needed)."""
+        return (tuple(int(v) for v in rect), dtype) in self._planar_cache
+
+    def planar_block(self, rect: Rectangle, dtype: torch.dtype) -> torch.Tensor:
+        """``(2, n, kH * kW)`` planar rows of every cell of ``rect``, row-major ``(k, m)``.
+
+        Built once per ``(rect, dtype)`` into one contiguous tensor and kept under
+        ``planar_budget`` (least recently used rectangles are dropped), so the direct
+        engine reuses the same operand across planes, stages and images. With the
+        tier disabled the block is built and returned uncached.
         """
-        arena = self._planar_arena(dtype)
-        return 0 if arena is None else arena.capacity
+        key = (tuple(int(v) for v in rect), dtype)
+        cached = self._planar_cache.get(key) if self._planar_enabled else None
+        if cached is not None:
+            return cached
+        k0, m0, kx, mx = key[0]
+        cells = [(k, m) for k in range(k0, k0 + kx) for m in range(m0, m0 + mx)]
+        n_pix = self.template_shape[0] * self.template_shape[1]
+        block = torch.empty((2, len(cells), n_pix), dtype=dtype, device=self.device)
+        for start in range(0, len(cells), self.build_chunk):
+            spatial = self.spatial(cells[start : start + self.build_chunk]).reshape(-1, n_pix)
+            block[0, start : start + spatial.shape[0]] = spatial.real.to(dtype)
+            block[1, start : start + spatial.shape[0]] = -spatial.imag.to(dtype)
+        if self._planar_enabled:
+            self._planar_cache.put(key, block)  # evicted blocks are simply dropped
+        return block
 
     @property
     def planar_bytes(self) -> int:
-        """Bytes of the planar row arenas (allocated capacity)."""
-        return sum(a.rows.numel() * a.rows.element_size() for a in self._planar.values())
-
-    def prefetch(
-        self,
-        cells: torch.Tensor | Iterable[Sequence[int]],
-        stream: torch.cuda.Stream | None = None,
-    ) -> torch.cuda.Event | None:
-        """Build/load ``cells`` (on ``stream`` when given); returns its event."""
-        if stream is None or self.device.type != "cuda":
-            self.spatial(cells)
-            return None
-        with torch.cuda.stream(stream):
-            self.spatial(cells)
-            event = torch.cuda.Event()  # type: ignore[no-untyped-call]
-            event.record(stream)  # type: ignore[no-untyped-call]
-        return event
+        """Bytes of resident planar blocks."""
+        return self._planar_cache.nbytes
 
     def bytes(self) -> tuple[int, int]:
         """``(device_bytes, host_bytes)`` of cached spatial kernels."""
         return self._device_cache.nbytes, self._host_cache.nbytes
-
-    def clear_spectra(self) -> None:
-        """Drop the cached kernel spectra (the FFT featurizer's working set)."""
-        self._spectral_cache.clear()
 
     def clear(self) -> None:
         """Drop every cached kernel."""
@@ -615,7 +625,7 @@ class KernelBank:
             self._host_slots = list(self._host_arena.unbind(0))
         self._host_cache.clear()
         self._spectral_cache.clear()
-        self._planar.clear()
+        self._planar_cache.clear()
 
 
 class WeightSource:
@@ -718,90 +728,6 @@ class WeightSource:
         return torch.cat(blocks, dim=1)
 
 
-class PreparedWeightCache:
-    """Engine-specific B operands per ``(k-run, hypothesis batch, precision)``.
-
-    Entries are shared across defocus planes (weights do not depend on the image),
-    across stages that reuse a run, and across images. Entries referenced by a
-    captured CUDA graph are pinned via :meth:`pin` and never evicted.
-    """
-
-    def __init__(self, source: WeightSource, byte_budget: int | None = None) -> None:
-        self.source = source
-        self._cache = _ByteLRU(byte_budget)
-
-    @staticmethod
-    def key(
-        layout: FeatureLayout,
-        run: KRun,
-        batch: HypBatch,
-        engine: ContractionEngine,
-        rows_key: Hashable,
-    ) -> tuple:
-        """Cache key for one prepared operand."""
-        parts = tuple(
-            (layout.rectangles[p.rect], p.m_start, p.m_stop) for p in run.parts
-        )
-        return (
-            parts,
-            run.k_start,
-            run.k_stop,
-            engine.precision,
-            rows_key,
-            batch.j0,
-            batch.j1,
-        )
-
-    def get(
-        self,
-        layout: FeatureLayout,
-        run: KRun,
-        batch: HypBatch,
-        engine: ContractionEngine,
-        template_rows: torch.Tensor | None = None,
-        rows_key: Hashable = None,
-    ) -> torch.Tensor:
-        """Concatenated B operand for ``run`` and hypotheses ``batch.j0:batch.j1``."""
-        key = self.key(layout, run, batch, engine, rows_key)
-        cached = self._cache.get(key)
-        if cached is not None:
-            return cached
-        rows = (
-            torch.arange(batch.j0, batch.j1, device=self.source.device)
-            if template_rows is None
-            else template_rows.to(self.source.device)[batch.j0 : batch.j1]
-        )
-        parts = []
-        for part in run.parts:
-            sub = (
-                run.k_start,
-                part.m_start,
-                run.k_stop - run.k_start,
-                part.m_stop - part.m_start,
-            )
-            parts.append(engine.prepare_weights(self.source.block(sub, rows)))
-        prepared = parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
-        self._cache.put(key, prepared)
-        return prepared
-
-    def pin(self, tag: Hashable, keys: Iterable[Hashable]) -> None:
-        """Protect ``keys`` from eviction while ``tag`` (e.g. a graph) is alive."""
-        self._cache.pin(tag, keys)
-
-    def unpin(self, tag: Hashable) -> None:
-        """Release a pin."""
-        self._cache.unpin(tag)
-
-    @property
-    def nbytes(self) -> int:
-        """Cached bytes."""
-        return self._cache.nbytes
-
-    def clear(self) -> None:
-        """Drop every entry (including pinned ones; only call with no live graphs)."""
-        self._cache.clear()
-
-
 class Template:
     """A decomposition plus everything derived from it that a search reuses.
 
@@ -829,7 +755,7 @@ class Template:
         kernel_budget: int | None = None,
         kernel_host_budget: int = 0,
         spectral_budget: int | None = None,
-        planar_budget: int = 0,
+        planar_budget: int | None = None,
         weights_cells: Rectangle | Sequence[Rectangle] | None = None,
     ) -> None:
         self.result = result

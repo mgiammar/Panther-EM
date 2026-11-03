@@ -45,7 +45,7 @@ def make_synthetic_result(
     )
     angles: dict = {}
     if s2_nside is not None:
-        from panther_em.inference.search.orientations import healpix_orientations
+        from panther_em.inference.search.hypotheses import healpix_orientations
 
         phi, theta = healpix_orientations(s2_nside)
         angles = {"phi_values": phi, "theta_values": theta}

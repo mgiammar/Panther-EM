@@ -23,10 +23,11 @@ from typing import TYPE_CHECKING, Any, Literal, overload
 
 import torch
 
+from panther_em.inference.search.packed import decode_argmax_packed
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-from panther_em.inference.search.statistics import decode_argmax_packed
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _CSRC_DIR = os.path.join(_THIS_DIR, "csrc")
@@ -34,8 +35,6 @@ _INCLUDE_DIR = os.path.join(_CSRC_DIR, "include")
 
 _warned_compile_failure = False
 _warned_runtime_failure = False
-_warned_pairs_compile_failure = False
-_warned_pairs_runtime_failure = False
 
 
 # --------------------------------------------------------------------------- #
@@ -187,69 +186,14 @@ def _try_compile() -> Any:
         return None
 
 
-@functools.lru_cache(maxsize=1)
-def _try_compile_pairs() -> Any:
-    """JIT-compile the per-pair emission extension (``panther_em_lean_pairs``).
-
-    A separate module from the dense kernel: it needs no cuFFTDx headers, its
-    instantiations never touch the dense kernel's codegen, and its build time is
-    paid only when a schedule emits pairs. ``None`` when unavailable.
-    """
-    global _warned_pairs_compile_failure
-
-    if not torch.cuda.is_available():
-        return None
-    if os.environ.get("PANTHER_EM_DISABLE_FUSED_KERNEL"):
-        return None
-    try:
-        from torch.utils.cpp_extension import load
-
-        defines, gencode = _arch_flags()
-        nvcc_flags = [
-            "-O3",
-            "-std=c++17",
-            "-U__CUDA_NO_HALF_OPERATORS__",
-            "-U__CUDA_NO_HALF_CONVERSIONS__",
-            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-            "-U__CUDA_NO_HALF2_OPERATORS__",
-            "--expt-relaxed-constexpr",
-            "-Xptxas",
-            "-v",
-            *defines,
-            *gencode,
-        ]
-        return load(
-            name="panther_em_lean_pairs",
-            sources=[os.path.join(_CSRC_DIR, "lean_pairs_1d.cu")],
-            extra_include_paths=[_CSRC_DIR, _INCLUDE_DIR],
-            extra_cuda_cflags=nvcc_flags,
-            extra_cflags=["-O3", "-std=c++17"],
-            verbose=bool(int(os.environ.get("PANTHER_EM_FUSED_KERNEL_VERBOSE", "0"))),
-        )
-    except Exception as exc:
-        if not _warned_pairs_compile_failure:
-            warnings.warn(
-                "Per-pair emission CUDA kernel unavailable, falling back to the "
-                f"pure-torch path for this process: {exc}",
-                UserWarning,
-                stacklevel=2,
-            )
-            _warned_pairs_compile_failure = True
-        return None
-
-
-# --------------------------------------------------------------------------- #
-# Public API
-# --------------------------------------------------------------------------- #
-LEAN_NUM_PSI = (128, 256)
-PAIR_DTYPES = (torch.float16, torch.float32)
+LEAN_NUM_PSI = (128, 256, 512)
 
 
 def lean_supported(n_psi: int, n_freq: int) -> bool:
     """Whether the register-resident kernel covers ``(n_psi, n_freq)``.
 
-    Any ``n_freq`` in ``[1, n_psi // 2 + 1]`` at ``n_psi`` in ``{128, 256}`` (bins above
-    64 fold exactly onto the kernel's 64-point transform; the Nyquist bin is handled).
+    Any ``n_freq`` in ``[1, n_psi // 2 + 1]`` at ``n_psi`` in ``{128, 256, 512}`` (bins
+    above the base transform fold exactly onto it; the Nyquist bin is handled).
     The cuFFTDx block-FFT kernel (:func:`fused_irfft_stats_transposed`) remains the
     fallback for ``n_psi = 64``.
     """
@@ -258,11 +202,19 @@ def lean_supported(n_psi: int, n_freq: int) -> bool:
 
 @overload
 def lean_irfft_stats_transposed(
-    c: torch.Tensor, n_psi: int, decode: Literal[True] = True
+    c: torch.Tensor,
+    n_psi: int,
+    decode: Literal[True] = True,
+    hyp_offset: int = 0,
+    outs: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None: ...
 @overload
 def lean_irfft_stats_transposed(
-    c: torch.Tensor, n_psi: int, decode: Literal[False]
+    c: torch.Tensor,
+    n_psi: int,
+    decode: Literal[False],
+    hyp_offset: int = 0,
+    outs: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None: ...
 def lean_irfft_stats_transposed(
     c: torch.Tensor,
@@ -288,7 +240,7 @@ def lean_irfft_stats_transposed(
         ``(NumFreq, P, 2Q)`` tensor of interleaved ``(re, im)`` pairs is also accepted.
         ``NumFreq`` may be anything in ``[1, n_psi // 2 + 1]``.
     n_psi : int
-        Full in-plane-angle length, 128 or 256.
+        Full in-plane-angle length, 128, 256 or 512.
     decode : bool, optional
         See :func:`fused_irfft_stats`.
     hyp_offset : int, optional
@@ -337,7 +289,7 @@ def lean_irfft_stats_transposed(
 
 
 def lean_debug_ifft(x: torch.Tensor) -> torch.Tensor | None:
-    """Unnormalized inverse DFT of complex64 ``(B, N)`` rows, ``N`` in ``{64, 128}``.
+    """Unnormalized inverse DFT of complex64 ``(B, N)`` rows, ``N`` in ``{64, 128, 256}``.
 
     Runs the generated register-resident transforms (``csrc/lean_fft_gen.cuh``) on the
     device; equals ``torch.fft.ifft(x, norm="forward")``. Test entry point only;
@@ -469,7 +421,7 @@ def fused_irfft_stats(
         ``(vmax, amax)`` before returning. Pass ``False`` to skip that decode and get
         the raw packed value back instead -- useful when a caller wants to batch
         several calls' raw outputs together and decode the whole batch once (see
-        :func:`panther_em.inference.search.statistics.decode_argmax_packed`).
+        :func:`panther_em.inference.search.packed.decode_argmax_packed`).
 
     Returns
     -------
@@ -542,51 +494,3 @@ def fused_irfft_stats_transposed(
         label=" (transposed)",
         make_contiguous=False,
     )
-
-
-def lean_pairs_supported(n_psi: int, n_freq: int) -> bool:
-    """Whether the per-pair emission kernel covers ``(n_psi, n_freq)`` and compiled."""
-    return lean_supported(n_psi, n_freq) and _try_compile_pairs() is not None
-
-
-def lean_irfft_stats_pairs_transposed(
-    c: torch.Tensor,
-    n_psi: int,
-    *,
-    hyp_offset: int,
-    outs: list[torch.Tensor],
-    pair_out: torch.Tensor,
-) -> bool:
-    """In-kernel statistics accumulation plus per-pair max-over-psi emission.
-
-    Same contract as :func:`lean_irfft_stats_transposed` with ``outs`` (required
-    here) and, in addition, writes each ``(pixel, hypothesis)`` pair's maximum over
-    psi into ``pair_out``: a ``(P, Q)`` float16/float32 view with unit stride along
-    ``Q`` (its row stride may be wider, e.g. a column window of a stage-wide slab).
-
-    Returns
-    -------
-    bool
-        ``True`` when the kernel ran; ``False`` when it is unavailable, the config is
-        unsupported, or the kernel raised (warned once), so the caller falls back.
-    """
-    global _warned_pairs_runtime_failure
-
-    module = _try_compile_pairs()
-    if module is None or not lean_supported(n_psi, int(c.shape[0])):
-        return False
-    try:
-        module.lean_irfft_stats_pairs_transposed(
-            c, int(n_psi), int(hyp_offset), list(outs), pair_out
-        )
-    except Exception as exc:
-        if not _warned_pairs_runtime_failure:
-            warnings.warn(
-                "Per-pair emission CUDA kernel raised at runtime, falling back to the "
-                f"pure-torch path for this call: {exc}",
-                UserWarning,
-                stacklevel=3,
-            )
-            _warned_pairs_runtime_failure = True
-        return False
-    return True

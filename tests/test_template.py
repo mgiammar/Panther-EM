@@ -1,4 +1,4 @@
-"""KernelBank / WeightSource / PreparedWeightCache / Template."""
+"""KernelBank / WeightSource / Template (template.py)."""
 
 from __future__ import annotations
 
@@ -7,15 +7,12 @@ import torch
 from conftest import count_kernel_builds
 
 from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-from panther_em.inference.search.basis import (
+from panther_em.inference.search.template import (
     KernelBank,
-    PreparedWeightCache,
     Template,
     WeightSource,
 )
-from panther_em.inference.search.contraction import ComplexGemmEngine
-from panther_em.inference.search.hypotheses import HypBatch
-from panther_em.inference.search.tiling import FeatureLayout
+from panther_em.inference.search.features import FeatureLayout
 from panther_em.inference.search.types import KernelConfig
 
 pytestmark = pytest.mark.filterwarnings(
@@ -138,7 +135,7 @@ def test_kernel_bank_spectral_and_planar(recon):
 
 def test_weight_source_matches_reference_layout_weights(recon):
     rects = [(0, 0, 2, 3), (2, 0, 2, 2), (0, 3, 2, 2)]
-    layout = FeatureLayout(rects)
+    layout = FeatureLayout.create(rects)
     src = WeightSource(recon.result, "cpu")
     got = src.layout_weights(layout)
     legacy = reference_layout_weights(recon.result, layout)
@@ -172,45 +169,6 @@ def test_weight_source_bounding_box_and_sparse(recon):
     torch.testing.assert_close(sparse_src.us, dense)
 
 
-def test_prepared_weight_cache_hits_evicts_and_pins(recon):
-    layout = FeatureLayout([(0, 0, 3, 2), (0, 2, 3, 3), (3, 0, 1, 5)])
-    src = WeightSource(recon.result, "cpu")
-    engine = ComplexGemmEngine()
-    run = layout.k_runs[0]  # k in [0, 3): both first rectangles
-    batch = HypBatch(0, 1, 5, 1, 1, 0)
-
-    cache = PreparedWeightCache(src)
-    got = cache.get(layout, run, batch, engine)
-    manual = engine.prepare_weights(
-        torch.cat([src.block((0, 0, 3, 2))[1:5], src.block((0, 2, 3, 3))[1:5]], dim=-1)
-    )
-    torch.testing.assert_close(got, manual)
-    assert got.shape == (3, 5, 4)
-    assert cache.get(layout, run, batch, engine) is got
-
-    rows = torch.tensor([0, 2, 4, 5])
-    sub = cache.get(layout, run, HypBatch(0, 0, 2, 0, 0, 0), engine, rows, rows_key="r")
-    torch.testing.assert_close(
-        sub,
-        engine.prepare_weights(
-            torch.cat(
-                [src.block((0, 0, 3, 2))[[0, 2]], src.block((0, 2, 3, 3))[[0, 2]]],
-                dim=-1,
-            )
-        ),
-    )
-
-    tiny = PreparedWeightCache(src, byte_budget=got.numel() * got.element_size())
-    a = tiny.get(layout, run, batch, engine)
-    tiny.pin("graph", [PreparedWeightCache.key(layout, run, batch, engine, None)])
-    b = tiny.get(layout, layout.k_runs[1], batch, engine)  # over budget, newest: kept
-    assert tiny.get(layout, layout.k_runs[1], batch, engine) is b
-    tiny.get(layout, run, HypBatch(0, 0, 1, 0, 0, 0), engine)  # third entry evicts b
-    assert tiny.get(layout, run, batch, engine) is a  # pinned survived
-    assert tiny.get(layout, layout.k_runs[1], batch, engine) is not b
-    tiny.unpin("graph")
-
-
 def test_template_bundle_and_hdf5_round_trip(synthetic_result, tmp_path):
     result = synthetic_result()
     template = Template(result, device="cpu", weights_cells=(0, 0, 4, 5))
@@ -242,7 +200,7 @@ def recon_cuda(synthetic_result):
 def test_kernel_bank_separable_build_matches_generic_on_a_side_stream(recon_cuda):
     """The CuPy fast path must agree with the generic warp, also when torch runs on a
     non-default stream (its DLPack views and CuPy work are stream-ordered)."""
-    from panther_em.inference.search.basis import KernelBank
+    from panther_em.inference.search.template import KernelBank
 
     fast = KernelBank(recon_cuda, device="cuda")
     slow = KernelBank(recon_cuda, device="cuda")
@@ -251,32 +209,59 @@ def test_kernel_bank_separable_build_matches_generic_on_a_side_stream(recon_cuda
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         a = fast.spatial(cells)
-        _ = torch.randn(64 << 20, device="cuda")  # churn the allocator on the same stream
+        _ = torch.randn(
+            64 << 20, device="cuda"
+        )  # churn the allocator on the same stream
     torch.cuda.synchronize()
     b = slow.spatial(cells)
     torch.cuda.synchronize()
     rel = ((a - b).flatten(1).norm(dim=1) / b.flatten(1).norm(dim=1)).max().item()
-    assert fast._sep is not None and rel < 1e-2, rel
+    # both paths mirror the same seam padding; the residual is spline arithmetic
+    assert fast._sep is not None and rel < 1e-4, rel
 
 
-def test_kernel_bank_planar_arena_matches_uncached_and_views_consecutive_cells(recon):
-    reference = KernelBank(recon)
-    cells = _cells((0, 0), (0, 1), (0, 2), (1, 0), (1, 1))
-    expected = reference.planar(cells)
-    row_bytes = 2 * 400 * 4
-    bank = KernelBank(recon, planar_budget=4 * row_bytes)  # room for four cells
-    first = bank.planar(cells[:3])
-    torch.testing.assert_close(first, expected[:, :3])
-    assert bank.planar_bytes == 4 * row_bytes
-    # consecutive resident cells come back as a view into the arena
-    again = bank.planar(cells[:3])
-    assert again.data_ptr() == bank._planar[torch.float32].rows.data_ptr()
-    # a permuted request gathers; a request beyond the arena's capacity builds the
-    # remainder on demand (cells (1,0) fills the last slot, (1,1) does not fit)
-    torch.testing.assert_close(bank.planar(cells[[2, 0]]), expected[:, [2, 0]])
-    torch.testing.assert_close(bank.planar(cells), expected)
-    assert bank._planar[torch.float32].n_used == 4
-    torch.testing.assert_close(bank.planar(cells[[4, 1]]), expected[:, [4, 1]])
+def test_spectral_views_can_bypass_the_cache(recon):
+    one = 32 * 30 * 8  # one complex64 spectrum at (32, 30)
+    bank = KernelBank(recon, spectral_budget=3 * one)
+    cells = _cells((1, 0), (2, 2), (0, 1), (1, 1))
+    assert bank.spectral_fits(3, (32, 30)) and not bank.spectral_fits(4, (32, 30))
+    views = bank.spectral_views(cells, (32, 30), cache=False)
+    expected = torch.fft.fft2(bank.spatial(cells), s=(32, 30)).conj()
+    torch.testing.assert_close(torch.stack(views), expected)
+    assert bank._spectral_cache.nbytes == 0  # nothing was cached
+    cached = bank.spectral_views(cells[:2], (32, 30))
+    torch.testing.assert_close(torch.stack(cached), expected[:2])
+    assert bank._spectral_cache.nbytes == 2 * one
+    # the uncached call still reads what is cached
+    again = bank.spectral_views(cells[:2], (32, 30), cache=False)
+    assert again[0] is cached[0] and again[1] is cached[1]
+
+
+def test_kernel_bank_planar_block_tier(recon):
+    one = 2 * 400 * 2  # one cell's planar rows in fp16 at the 20x20 box
+    bank = KernelBank(recon, planar_budget=4 * one)
+    rect = (1, 0, 2, 2)  # 4 cells: fits exactly
+    assert bank.planar_fits(rect, torch.float16) and not bank.has_planar_block(rect, torch.float16)
+    assert bank.planar_bytes_of(rect, torch.float16) == 4 * one
+    block = bank.planar_block(rect, torch.float16)
+    assert block.shape == (2, 4, 400) and block.dtype == torch.float16 and block.is_contiguous()
+    # row-major (k, m) cells, same rows as planar()
+    cells = _cells((1, 0), (1, 1), (2, 0), (2, 1))
+    torch.testing.assert_close(block, bank.planar(cells, torch.float16))
+    # built once: the same tensor comes back, nothing is reallocated
+    assert bank.planar_block(rect, torch.float16) is block
+    assert bank.has_planar_block(rect, torch.float16) and bank.planar_bytes == 4 * one
+    # another dtype is another block; the budget evicts the least recently used one
+    assert bank.planar_fits(rect, torch.float32) is False  # 8 * one > budget
+    small = (0, 0, 1, 2)  # 2 cells in fp16: fits, evicts the 4-cell block
+    other = bank.planar_block(small, torch.float16)
+    assert bank.has_planar_block(small, torch.float16)
+    assert not bank.has_planar_block(rect, torch.float16) and bank.planar_bytes == 2 * one
+    assert bank.planar_block(small, torch.float16) is other
     bank.clear()
-    assert bank.planar_bytes == 0
-    torch.testing.assert_close(bank.planar(cells[1:4]), expected[:, 1:4])
+    assert bank.planar_bytes == 0 and not bank.has_planar_block(small, torch.float16)
+    # tier disabled: built and returned, never cached
+    off = KernelBank(recon, planar_budget=0)
+    assert not off.planar_fits(rect, torch.float16)
+    b1 = off.planar_block(rect, torch.float16)
+    assert b1 is not off.planar_block(rect, torch.float16) and off.planar_bytes == 0

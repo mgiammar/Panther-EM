@@ -1,9 +1,9 @@
-"""Unit tests for PixelStats and its fused-CUDA-kernel specialization.
+"""Unit tests for PixelStats, plain and with the fused CUDA kernels.
 
 Covers
 ------
 - PixelStats.update / finalize against a hand-derived reference.
-- FusedPixelStats falling back to the pure-torch reduction: on a CPU spectrum
+- PixelStats(fused=True) falling back to the pure-torch reduction: on a CPU spectrum
   (no CUDA at all), when the fused kernel fails to compile, and when
   (n_psi, NumFreq) isn't one of the kernel's supported configs.
 - The fused-kernel-unavailable warning fires exactly once per process.
@@ -21,13 +21,14 @@ import pytest
 import torch
 
 from panther_em.inference.search import fused_kernel_loader
-from panther_em.inference.search.fused_statistics import FusedPixelStats
+from panther_em.inference.search.packed import (
+    decode_argmax_packed,
+    encode_argmax_packed,
+)
 from panther_em.inference.search.statistics import (
     PixelStats,
     _cuda_graph_capture_supported,
     _reduce_stats,
-    decode_argmax_packed,
-    encode_argmax_packed,
 )
 
 
@@ -90,7 +91,7 @@ def test_fused_pixel_stats_matches_plain_on_cpu_spectrum():
     plain = PixelStats(num_pixels, device=torch.device("cpu"))
     plain.update(spectrum, hyp_global_idx, num_psi=num_psi)
 
-    fused = FusedPixelStats(num_pixels, device=torch.device("cpu"))
+    fused = PixelStats(num_pixels, device=torch.device("cpu"), fused=True)
     fused.update(spectrum, hyp_global_idx, num_psi=num_psi)
 
     plain_result, fused_result = plain.finalize(), fused.finalize()
@@ -109,7 +110,7 @@ def test_fused_pixel_stats_falls_back_when_compile_unavailable(monkeypatch):
     plain = PixelStats(num_pixels, device=torch.device("cuda"))
     plain.update(spectrum, hyp_global_idx, num_psi=num_psi)
 
-    fused = FusedPixelStats(num_pixels, device=torch.device("cuda"))
+    fused = PixelStats(num_pixels, device=torch.device("cuda"), fused=True)
     fused.update(spectrum, hyp_global_idx, num_psi=num_psi)
 
     plain_result, fused_result = plain.finalize(), fused.finalize()
@@ -199,9 +200,9 @@ def test_encode_argmax_packed_preserves_order_via_unsigned_comparison():
 # Batch-then-reduce accumulation path
 # --------------------------------------------------------------------------- #
 def _run_streaming(
-    stats_cls, spectra, hyp_idx_batches, num_psi, reverse_psi_axis=True, device="cpu"
+    spectra, hyp_idx_batches, num_psi, reverse_psi_axis=True, device="cpu", fused=False
 ):
-    stats = stats_cls(spectra[0].shape[0], device=torch.device(device))
+    stats = PixelStats(spectra[0].shape[0], device=torch.device(device), fused=fused)
     for spectrum, hyp_idx in zip(spectra, hyp_idx_batches, strict=False):
         stats.update(
             spectrum, hyp_idx, num_psi=num_psi, reverse_psi_axis=reverse_psi_axis
@@ -223,8 +224,8 @@ def test_cuda_graph_capture_supported_probe_is_true_on_this_device():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
-@pytest.mark.parametrize("stats_cls", [PixelStats, FusedPixelStats])
-def test_update_graphed_matches_streaming_update_varying_hyp_batch_size(stats_cls):
+@pytest.mark.parametrize("fused", [False, True])
+def test_update_graphed_matches_streaming_update_varying_hyp_batch_size(fused):
     """Feed batches of DIFFERENT hypothesis-batch sizes through the same captured
     graph -- accumulate's own cost (and thus its graph) doesn't depend on
     hyp_batch size, so one capture must stay correct across all of them."""
@@ -247,10 +248,10 @@ def test_update_graphed_matches_streaming_update_varying_hyp_batch_size(stats_cl
     ]
 
     expected = _run_streaming(
-        stats_cls, spectra, hyp_idx_batches, num_psi, device="cuda"
+        spectra, hyp_idx_batches, num_psi, device="cuda", fused=fused
     )
 
-    graphed = stats_cls(num_pixels, device=torch.device("cuda"))
+    graphed = PixelStats(num_pixels, device=torch.device("cuda"), fused=fused)
     for spectrum, off in zip(spectra, offsets, strict=False):
         graphed.update_graphed(spectrum, off, num_psi=num_psi, reverse_psi_axis=True)
     actual = graphed.finalize()
@@ -262,8 +263,8 @@ def test_update_graphed_matches_streaming_update_varying_hyp_batch_size(stats_cl
 @pytest.mark.skipif(
     torch.cuda.device_count() < 2, reason="requires a second CUDA device"
 )
-@pytest.mark.parametrize("stats_cls", [PixelStats, FusedPixelStats])
-def test_update_graphed_matches_streaming_update_on_non_default_device(stats_cls):
+@pytest.mark.parametrize("fused", [False, True])
+def test_update_graphed_matches_streaming_update_on_non_default_device(fused):
     """Graph capture/replay must target `device`, not current device."""
     num_pixels, hyp_batch, n_freq, num_psi = 6, 10, 9, 16
     device = torch.device("cuda:1")
@@ -272,9 +273,9 @@ def test_update_graphed_matches_streaming_update_on_non_default_device(stats_cls
     spectrum = _make_spectrum(num_pixels, hyp_batch, n_freq, device=device, seed=7)
     hyp_idx = torch.arange(hyp_batch, device=device)
 
-    expected = _run_streaming(stats_cls, [spectrum], [hyp_idx], num_psi, device=device)
+    expected = _run_streaming([spectrum], [hyp_idx], num_psi, device=device, fused=fused)
 
-    graphed = stats_cls(num_pixels, device=device)
+    graphed = PixelStats(num_pixels, device=device, fused=fused)
     graphed.update_graphed(
         spectrum, hyp_offset=0, num_psi=num_psi, reverse_psi_axis=True
     )
@@ -313,3 +314,30 @@ def test_update_graphed_falls_back_to_update_on_cpu_spectrum():
 
     _assert_results_match(streaming.finalize(), graphed.finalize())
     assert graphed.hypothesis_count == streaming.hypothesis_count
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.parametrize("num_psi", [128, 256, 512])
+def test_fused_inkernel_accumulate_matches_plain_update(num_psi):
+    """The register-resident kernel's in-kernel path (moments + packed best, folded by
+    merge_packed) equals the plain torch accumulate at every supported n_psi, with
+    NumFreq past the 64-bin base transform so the fold pass is exercised."""
+    if fused_kernel_loader._try_compile() is None:
+        pytest.skip("fused kernel did not compile")
+    num_pixels, hyp_batch, n_freq, offset = 8, 12, num_psi // 4 + 1, 5
+    torch.manual_seed(num_psi)
+    native = torch.randn(n_freq, num_pixels, hyp_batch, dtype=torch.complex64, device="cuda")
+    spectrum = native.permute(1, 2, 0)  # (P, N, F) view of the kernel-native layout
+
+    fused = PixelStats(num_pixels, device=torch.device("cuda"), fused=True)
+    fused.update_graphed(spectrum, hyp_offset=offset, num_psi=num_psi)
+    assert fused._packed_num_psi == num_psi  # the in-kernel path ran
+    plain = PixelStats(num_pixels, device=torch.device("cuda"))
+    plain.update(spectrum, torch.arange(offset, offset + hyp_batch, device="cuda"), num_psi)
+
+    got, want = fused.finalize(), plain.finalize()
+    for key in ("mip", "mean", "variance", "zscore"):
+        torch.testing.assert_close(got[key], want[key], rtol=1e-4, atol=1e-4)
+    assert torch.equal(got["best_index"], want["best_index"])
+    assert torch.equal(got["best_psi"], want["best_psi"])
+    assert fused._packed_num_psi is None  # merged and reset

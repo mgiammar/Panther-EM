@@ -45,7 +45,7 @@ def test_image_set_promotes_single_image_and_validates_filters():
     assert s.images.shape == (1, 30, 32)
     assert s.n_defocus == 1 and s.filter_plane(0) is None
 
-    shared = ImageSet(img, filters=torch.ones(3, 30, 17))
+    shared = ImageSet.single(img, filters=torch.ones(3, 30, 17))
     assert shared.n_defocus == 3 and not shared.per_image_filters
     assert shared.filter_plane(2, 0).shape == (30, 17)
 
@@ -53,7 +53,7 @@ def test_image_set_promotes_single_image_and_validates_filters():
     assert per_image.n_defocus == 2 and per_image.per_image_filters
 
     with pytest.raises(ValueError):
-        ImageSet(img, filters=torch.ones(3, 30, 16))
+        ImageSet.single(img, filters=torch.ones(3, 30, 16))
     with pytest.raises(ValueError):
         ImageSet(torch.zeros(4, 30, 32), filters=torch.ones(3, 2, 30, 17))
     with pytest.raises(ValueError):
@@ -114,40 +114,3 @@ def test_pixel_selection_all_subset_scatter():
 
     from_mask = PixelSelection.from_mask(geo, None)
     assert from_mask.is_full
-
-
-def test_pixel_maps_validation_and_broadcast():
-    images = ImageSet.from_stack(
-        torch.zeros(2, 30, 30), pixel_maps={"image_norm": torch.ones(11, 11)}
-    )
-    geo = SearchGeometry.from_images(images, (20, 20))
-    maps = geo.validate_pixel_maps(images.pixel_maps)
-    assert (
-        maps["image_norm"].shape == (2, 11, 11)
-        and maps["image_norm"].dtype == torch.float32
-    )
-    per_image = geo.validate_pixel_map("noise_variance", torch.rand(2, 11, 11).double())
-    assert per_image.shape == (2, 11, 11) and per_image.dtype == torch.float32
-    assert geo.validate_pixel_maps(None) == {}
-    with pytest.raises(ValueError, match="noise_variance"):
-        geo.validate_pixel_map("noise_variance", torch.ones(5, 5))
-    with pytest.raises(ValueError):
-        SearchGeometry.from_images(
-            ImageSet.from_stack(
-                torch.zeros(2, 30, 30), pixel_maps={"x": torch.ones(5, 5)}
-            ),
-            (20, 20),
-        )
-    with pytest.raises(ValueError):
-        ImageSet.single(torch.zeros(30, 30), pixel_maps={"x": torch.ones(2, 2, 2, 2)})
-    with pytest.raises(ValueError):
-        ImageSet.single(
-            torch.zeros(30, 30),
-            pixel_maps={"x": torch.ones(11, 11, dtype=torch.complex64)},
-        )
-
-    boxes = ImageSet.from_boxes(
-        torch.zeros(5, 20, 20), pixel_maps={"image_norm": torch.arange(5.0)}
-    )
-    center = SearchGeometry.from_images(boxes, (20, 20))
-    assert center.validate_pixel_maps(boxes.pixel_maps)["image_norm"].shape == (5, 1)
