@@ -68,7 +68,8 @@ def rectangles_disjoint(rectangles: Sequence[Rectangle]) -> bool:
 
 class LayoutPart(NamedTuple):
     """One rectangle's contribution to a :class:`KRun`: its index into
-    :attr:`FeatureLayout.rectangles` and its global eigenvector range."""
+    :attr:`FeatureLayout.rectangles` and its global eigenvector range.
+    """
 
     rect: int
     m_start: int

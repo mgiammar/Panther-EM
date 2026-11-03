@@ -5,12 +5,13 @@ A :class:`Stage` is a frozen value: build it with :meth:`Stage.create` (which
 coerces loose inputs) and read its derived state (``k_stop``, ``num_features``,
 ``layout()``, ``hypothesis_ids()``). ``stage_to_json`` / ``stage_from_json`` give
 the HDF5 attribute form used by :class:`~.results.SearchResult`; a saved decision
-keeps its bound as a :class:`FixedError` (the relative error the stage ran with).
+records its threshold test's calibration and tables but is restored without the
+test (the tables are a separate file).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -85,7 +86,8 @@ class Stage:
         name: str = "",
     ) -> Stage:
         """Build a stage from loose inputs: one rectangle or many, precision by name,
-        planes in any order, orientation ids as any int sequence or tensor."""
+        planes in any order, orientation ids as any int sequence or tensor.
+        """
         rects: tuple[Rectangle, ...]
         if len(rectangles) > 0 and isinstance(rectangles[0], int):
             rects = (as_rectangle(cast("Sequence[int]", rectangles)),)
@@ -197,14 +199,17 @@ def stage_to_json(stage: Stage) -> dict:
         orientations = stage.orientations.tolist()
     decision = None
     if stage.decision is not None:
+        test = None
+        if stage.decision.test is not None:
+            test = {
+                **asdict(stage.decision.test.calibration),
+                "tables": stage.decision.test.tables.summary(),
+            }
         decision = {
             "threshold": stage.decision.threshold,
+            "accept": stage.decision.accept,
             "absorb_radius": stage.decision.absorb_radius,
-            "rho": (
-                None
-                if stage.decision.bound is None
-                else float(stage.decision.bound.rho(stage.rectangles))
-            ),
+            "test": test,
         }
     return {
         "rectangles": [list(r) for r in stage.rectangles],
@@ -218,13 +223,20 @@ def stage_to_json(stage: Stage) -> dict:
 
 
 def stage_from_json(data: dict) -> Stage:
-    """Inverse of :func:`stage_to_json` (the decision's bound model is not restored:
-    a saved ``rho`` becomes a fixed-error bound)."""
+    """Inverse of :func:`stage_to_json`.
+
+    The decision's threshold test is not restored; its calibration and tables stay
+    readable in the saved description.
+    """
     decision = None
     if data.get("decision") is not None:
         d = data["decision"]
-        bound = None if d.get("rho") is None else FixedError(float(d["rho"]))
-        decision = Decision(float(d["threshold"]), bound, int(d.get("absorb_radius", 0)))
+        decision = Decision(
+            float(d["threshold"]),
+            None,
+            bool(d.get("accept", True)),
+            int(d.get("absorb_radius", 0)),
+        )
     orientations = data.get("orientations")
     return Stage.create(
         [tuple(r) for r in data["rectangles"]],
@@ -236,18 +248,3 @@ def stage_from_json(data: dict) -> Stage:
         name=data.get("name", ""),
     )
 
-
-@dataclass(frozen=True)
-class FixedError:
-    """An error bound with one relative error for every rectangle set."""
-
-    value: float
-
-    def rho(self, rectangles: Sequence[Rectangle]) -> float:
-        """The fixed relative error."""
-        return float(self.value)
-
-
-# --------------------------------------------------------------------------- #
-# Execution knobs
-# --------------------------------------------------------------------------- #

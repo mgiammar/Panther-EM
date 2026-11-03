@@ -192,25 +192,37 @@ class ImageSpectra:
                         f"needs 1 or {want}"
                     )
 
+    def write_group(self, group: h5py.Group) -> None:
+        """Write the curves and the level map into an open HDF5 group."""
+        for name in ("freq", "noise", "signal", "level"):
+            group.create_dataset(name, data=getattr(self, name).numpy())
+        group.attrs["pixel_size"] = float(self.pixel_size)
+
+    @classmethod
+    def read_group(cls, group: h5py.Group) -> ImageSpectra:
+        """Read a group written by :meth:`write_group`."""
+        data = {
+            name: torch.from_numpy(np.asarray(group[name]))
+            for name in ("freq", "noise", "signal", "level")
+        }
+        return cls.create(
+            data["freq"],
+            data["noise"],
+            data["signal"],
+            data["level"],
+            float(group.attrs["pixel_size"]),
+        )
+
     def save(self, path: str | Path) -> None:
         """Write the curves and the level map to an HDF5 file."""
         with h5py.File(path, "w") as f:
-            for name in ("freq", "noise", "signal", "level"):
-                f.create_dataset(name, data=getattr(self, name).numpy())
-            f.attrs["pixel_size"] = float(self.pixel_size)
+            self.write_group(f)
 
     @classmethod
     def load(cls, path: str | Path) -> ImageSpectra:
         """Read a file written by :meth:`save`."""
         with h5py.File(path, "r") as f:
-            data = {
-                name: torch.from_numpy(np.asarray(f[name]))
-                for name in ("freq", "noise", "signal", "level")
-            }
-            pixel_size = float(f.attrs["pixel_size"])
-        return cls.create(
-            data["freq"], data["noise"], data["signal"], data["level"], pixel_size
-        )
+            return cls.read_group(f)
 
 
 @dataclass(frozen=True, eq=False)

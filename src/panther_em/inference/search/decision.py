@@ -1,36 +1,37 @@
-"""The per-pixel decision: accept, reject, or leave ambiguous, with an error bound.
+"""The per-pixel decision: the threshold test rejects, the z-score threshold accepts.
 
-Every stage ends with the same rule. A pixel's z-score ``z = (mip - mean) / std`` is
-widened into a worst-case interval by the stage's reconstruction error (the rank-r
-features reconstruct the true correlations only approximately), and the interval is
-compared with the threshold: entirely above it is ACCEPTED, entirely below it is
-REJECTED, straddling it is AMBIGUOUS. Without a bound the interval collapses to the
-z-score itself and the rule is a plain threshold. An optional post-step ABSORBS
-ambiguous pixels within a radius of an accepted one (the same particle's neighbours).
+Every stage ends with a :class:`Decision`. With a :class:`ThresholdTest` it applies the
+per-pixel rule of the coloured-noise model: from the stage's maximum correlation, its
+orientation, the pixel's mean and variance, the orientation's radial tables
+(:class:`~.noise.RadialTables`) and the micrograph's spectra
+(:class:`~.types.ImageSpectra`), it predicts the exact correlation of the particle
+branch and REJECTS the pixel when the probability that it crosses the (lowered)
+threshold is at most ``alpha``. Survivors are ACCEPTED where the stage's own z-score
+exceeds the threshold -- when ``accept`` is set, the final stage -- and AMBIGUOUS
+otherwise. Without a test the rule is the plain threshold: REJECTED below it,
+ACCEPTED above it. An optional post-step ABSORBS ambiguous pixels within a radius of
+an accepted one (the same particle's neighbours).
 
-The bound is pluggable: :class:`ErrorModel` derives the relative error from the
-decomposition's singular values; any object with ``rho(rectangles) -> float`` (and
-optionally ``intervals(zscore, rho) -> (lower, upper)``) can replace it.
+The distance ``D`` of every tested pixel is kept as its ``score``.
 """
 
 from __future__ import annotations
 
 import enum
-import math
-import warnings
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-import numpy as np
 import torch
+from scipy.special import ndtri  # type: ignore[import-untyped]
+
+from panther_em.inference.search.noise import NoiseScales, RadialTables
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-    from panther_em.decomposition.result import DecompositionResult
+    from panther_em.inference.search.hypotheses import HypothesisSet
     from panther_em.inference.search.results import PixelLedger
-    from panther_em.inference.search.stage import Stage
-    from panther_em.inference.search.types import Rectangle
+    from panther_em.inference.search.types import ImageSpectra, SearchGeometry
+
+SD_FLOOR = 1e-30  # the variance of the particle branch at full rank is exactly 0
 
 
 class PixelLabel(enum.IntEnum):
@@ -54,155 +55,210 @@ class PixelLabel(enum.IntEnum):
 
 
 # --------------------------------------------------------------------------- #
-# Worst-case z-score intervals
+# The threshold test
 # --------------------------------------------------------------------------- #
-
-
-def zscore_error_intervals(
-    error: float,
-    corr: torch.Tensor,  # (P,)
-    mu: torch.Tensor,  # (P,)
-    sigma: torch.Tensor,  # (P,)
-) -> torch.Tensor:  # (P, 2)
-    r"""Compute worst-case intervals for z-scores for a fixed reconstruction error.
-
-    Parameters
-    ----------
-    error : float
-        Estimated reconstruction error, in the same units as ``corr``/``sigma``.
-    corr, mu, sigma : torch.Tensor
-        Per-pixel correlation, mean and standard deviation, shape ``(P,)``, estimated
-        from the low-rank features.
-
-    Returns
-    -------
-    torch.Tensor
-        ``(P, 2)`` ``[lower, upper]`` intervals; if ``error`` is correct the interval
-        contains the true z-score of every pixel.
-    """
-    sigma_min = sigma - error
-    sigma_max = torch.sqrt(sigma**2 + 2 * error**2) + error
-    sigma_min = torch.clamp(sigma_min, min=1e-6)
-    sigma_max = torch.clamp(sigma_max, min=1e-6)
-
-    a_max = 2 * error / sigma_min
-    b_max = error * (2 * sigma_max + error) / (sigma * (sigma_min + sigma))
-
-    zscore = (corr - mu) / sigma
-    delta_z = (a_max + b_max * torch.abs(zscore)) / (1 - b_max)
-
-    return torch.stack([zscore - delta_z, zscore + delta_z], dim=-1)
-
-
-def zscore_bound_is_vacuous(error: float) -> bool:
-    """Whether the relative-error z-score bound carries no information."""
-    if error <= 0.0:
-        return False
-    sigma = torch.tensor(1.0, dtype=torch.float64)
-    sigma_min = torch.clamp(sigma - error, min=1e-6)
-    sigma_max = torch.sqrt(sigma**2 + 2 * error**2) + error
-    b_max = error * (2 * sigma_max + error) / (sigma * (sigma_min + sigma))
-    return bool(b_max >= 1.0)
-
-
-def classify_zscore_interval(
-    interval: torch.Tensor,  # (..., 2), [lower, upper]
-    threshold: float,
-) -> torch.Tensor:  # (...,) int8
-    """Labels from worst-case z-score intervals against a fixed threshold.
-
-    ``REJECTED`` where ``upper < threshold``, ``ACCEPTED`` where ``lower >
-    threshold``, ``AMBIGUOUS`` otherwise.
-    """
-    lower = interval[..., 0]
-    upper = interval[..., 1]
-    label = torch.full_like(lower, int(PixelLabel.AMBIGUOUS), dtype=torch.int8)
-    label.masked_fill_(upper < threshold, int(PixelLabel.REJECTED))
-    label.masked_fill_(lower > threshold, int(PixelLabel.ACCEPTED))
-    return label
-
-
-# --------------------------------------------------------------------------- #
-# Error bound models
-# --------------------------------------------------------------------------- #
-
-
-class ErrorBound(Protocol):
-    """What a decision needs from an error model."""
-
-    def rho(self, rectangles: Sequence[Rectangle]) -> float:
-        """Relative L2 reconstruction error of the rectangles' features."""
 
 
 @dataclass(frozen=True)
-class ErrorModel:
-    """Spectral relative reconstruction error of a feature selection.
-
-    ``rho^2 = 1 - (1 - tail) * energy(rectangles) / total_energy``, with the energy
-    the Parseval-weighted sum of the squared singular values over the selected
-    cells.
+class Calibration:
+    """Calibrated constants of the threshold test.
 
     Parameters
     ----------
-    S2 : torch.Tensor
-        ``(K, E)`` float64 squared singular values.
-    parseval : torch.Tensor
-        ``(K,)`` float64 weight of each angular frequency block (2 for the
-        conjugate-symmetric blocks of a real projection, 1 at k=0 and Nyquist).
-    tail : float, optional
-        Fraction of the energy the decomposition itself discarded. Defaults to 0.
+    alpha : float
+        Tolerated probability of discarding a pixel whose exact correlation would
+        have crossed the threshold. Defaults to ``5e-3``.
+    zeta : float
+        ``zeta_beta <= 1``: the lower quantile of ``sigma / sigma_hat`` measured on a
+        reference search (:func:`~.noise.zeta_quantile`); it lowers the threshold to
+        ``mu + T zeta sigma_hat``. Defaults to 1 (no lowering).
+    eps_rho : float
+        Relative uncertainty of the signal loss ``rho``. Defaults to ``0.1``.
+    b_factor : float
+        B-factor envelope (``A^2``) on the signal weight, see
+        :meth:`~.noise.RadialTables.scales`. Defaults to 0.
     """
 
-    S2: torch.Tensor
-    parseval: torch.Tensor
-    tail: float = 0.0
+    alpha: float = 5e-3
+    zeta: float = 1.0
+    eps_rho: float = 0.1
+    b_factor: float = 0.0
 
     def __post_init__(self) -> None:
-        """Validate shapes and the tail fraction."""
-        if self.S2.dim() != 2 or tuple(self.parseval.shape) != (self.S2.shape[0],):
-            raise ValueError("S2 must be (K, E) and parseval (K,)")
-        if not (0.0 <= self.tail < 1.0):
-            raise ValueError("tail must lie in [0, 1)")
+        """Validate the ranges."""
+        if not 0.0 < self.alpha < 1.0:
+            raise ValueError("alpha must lie in (0, 1)")
+        if not 0.0 < self.zeta <= 1.0:
+            raise ValueError("zeta must lie in (0, 1]")
+        if self.eps_rho < 0.0:
+            raise ValueError("eps_rho must be >= 0")
+        if self.b_factor < 0.0:
+            raise ValueError("b_factor must be >= 0")
 
-    @classmethod
-    def from_result(cls, result: DecompositionResult, *, tail: float = 0.0) -> ErrorModel:
-        """Spectral model from a decomposition's singular values."""
-        try:
-            s = np.asarray(result.S)
-        except AttributeError:  # SparseDecompositionResult hides S; densify
-            s = np.asarray(result.to_dense().S)
-        s2 = torch.as_tensor(s, dtype=torch.float64) ** 2
-        k_blocks = int(s2.shape[0])
-        if result.is_complex_projection:
-            weights = torch.ones(k_blocks, dtype=torch.float64)
+    @property
+    def z_alpha(self) -> float:
+        """``Phi^-1(1 - alpha)``: the distance at which a pixel is discarded."""
+        return float(-ndtri(self.alpha))
+
+
+@dataclass(frozen=True, eq=False)
+class ThresholdTest:
+    """The per-pixel test of one feature selection.
+
+    Parameters
+    ----------
+    tables : RadialTables
+        The selection's radial tables, built for the stage's rectangles.
+    calibration : Calibration, optional
+        The test's constants.
+    """
+
+    tables: RadialTables
+    calibration: Calibration = field(default_factory=Calibration)
+
+    def __post_init__(self) -> None:
+        """Validate the types."""
+        if not isinstance(self.tables, RadialTables):
+            raise ValueError("tables must be a RadialTables")
+        if not isinstance(self.calibration, Calibration):
+            raise ValueError("calibration must be a Calibration")
+
+    def scales(
+        self, spectra: ImageSpectra, hyps: HypothesisSet | None = None
+    ) -> NoiseScales:
+        """The micrograph's scales under this test's B-factor (see the tables)."""
+        return self.tables.scales(
+            spectra, hyps=hyps, b_factor=self.calibration.b_factor
+        )
+
+    @torch.no_grad()
+    def distance(
+        self,
+        threshold: float,
+        spectra: ImageSpectra,
+        geometry: SearchGeometry,
+        pixel_index: torch.Tensor,
+        mip: torch.Tensor,
+        mean: torch.Tensor,
+        variance: torch.Tensor,
+        best_index: torch.Tensor,
+        *,
+        hyps: HypothesisSet | None = None,
+        scales: NoiseScales | None = None,
+    ) -> torch.Tensor:
+        """``D``: lowered threshold minus predicted exact correlation, per pixel.
+
+        In standard deviations of the particle branch.
+
+        Parameters
+        ----------
+        threshold : float
+            The stage's z-score threshold ``T``.
+        spectra : ImageSpectra
+            The image set's curves and level maps.
+        geometry : SearchGeometry
+            The grid ``pixel_index`` addresses.
+        pixel_index : torch.Tensor
+            ``(P,)`` flat pixel ids.
+        mip, mean, variance : torch.Tensor
+            ``(P,)`` the stage's maximum, mean and variance at those pixels.
+        best_index : torch.Tensor
+            ``(P,)`` global hypothesis ids of the maxima (``-1`` gives NaN).
+        hyps : HypothesisSet, optional
+            The stage's hypotheses (``qbar_perp`` averages over them).
+        scales : NoiseScales, optional
+            Precomputed :meth:`scales`; computed here when omitted.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(P,)`` float32 on ``mip``'s device.
+        """
+        device = mip.device
+        n_templates = self.tables.n_templates
+        if scales is None:
+            scales = self.scales(spectra, hyps)
+        if scales.n_templates != n_templates:
+            raise ValueError(
+                f"scales hold {scales.n_templates} template rows; the tables "
+                f"{n_templates}"
+            )
+        scales = scales.to(device)
+        idx = pixel_index.to(device, torch.long)
+        zeros = torch.zeros_like(idx)
+
+        # the pixel's image and the centre of its template window
+        per_image = geometry.n_pixels_per_image
+        image = idx // per_image
+        within = idx % per_image
+        if geometry.mode == "grid":
+            width = int(geometry.grid[1])
+            row, col = within // width, within % width
         else:
-            weights = torch.full((k_blocks,), 2.0, dtype=torch.float64)
-            weights[0] = 1.0
-            n_ang = int(result.num_angular_components)
-            if n_ang % 2 == 0 and n_ang // 2 < k_blocks:
-                weights[n_ang // 2] = 1.0
-        return cls(S2=s2, parseval=weights, tail=float(tail))
+            row, col = zeros, zeros
+        k_h, k_w = geometry.template_shape
+        row = row + (k_h - 1) // 2
+        col = col + (k_w - 1) // 2
+        level = spectra.level.to(device)
+        ell = level[
+            image if level.shape[0] > 1 else zeros,
+            row if level.shape[1] > 1 else zeros,
+            col if level.shape[2] > 1 else zeros,
+        ].to(torch.float64)
 
-    def energy(self, rectangles: Sequence[Rectangle]) -> float:
-        """Parseval-weighted sum of ``S^2`` over the rectangles' cells."""
-        total = 0.0
-        k_blocks, e_max = self.S2.shape
-        for k0, m0, k_ext, m_ext in rectangles:
-            k1, m1 = min(k0 + k_ext, k_blocks), min(m0 + m_ext, e_max)
-            if k1 <= k0 or m1 <= m0:
-                continue
-            block = self.S2[k0:k1, m0:m1] * self.parseval[k0:k1, None]
-            total += float(block.sum())
-        return total
+        # the maximum's plane and template row
+        best = best_index.to(device, torch.long)
+        valid = best >= 0
+        safe = torch.where(valid, best, zeros)
+        plane, template = safe // n_templates, safe % n_templates
+        b_axis = image if scales.q_kept.shape[0] > 1 else zeros
+        d_axis = plane if scales.q_kept.shape[1] > 1 else zeros
+        q_kept = scales.q_kept[b_axis, d_axis, template]
+        q_perp = scales.q_perp[b_axis, d_axis, template]
+        lam = scales.lam[b_axis, d_axis, template]
+        rho = scales.rho[b_axis, d_axis, template]
+        qbar_perp = scales.qbar_perp[b_axis]
 
-    def total_energy(self) -> float:
-        """Energy of everything stored."""
-        return float((self.S2 * self.parseval[:, None]).sum())
+        cal = self.calibration
+        mu = mean.to(torch.float64)
+        x = mip.to(torch.float64) - mu
+        a = rho / (1.0 - rho)
+        sigma_hat = (variance.to(torch.float64) + ell * qbar_perp).clamp_min(0.0).sqrt()
+        t_lo = mu + threshold * cal.zeta * sigma_hat
+        mean_p = mu + x / (1.0 - rho)
+        sd2 = (a - lam) ** 2 * ell * q_kept + ell * q_perp + (cal.eps_rho * a * x) ** 2
+        dist = (t_lo - mean_p) / sd2.clamp_min(SD_FLOOR).sqrt()
+        nan = torch.full_like(dist, float("nan"))
+        return torch.where(valid, dist, nan).to(torch.float32)
 
-    def rho(self, rectangles: Sequence[Rectangle]) -> float:
-        """Relative reconstruction error of a rectangle set."""
-        frac = self.energy(rectangles) / self.total_energy()
-        return math.sqrt(max(0.0, 1.0 - (1.0 - self.tail) * frac))
+    def reject(
+        self,
+        threshold: float,
+        spectra: ImageSpectra,
+        geometry: SearchGeometry,
+        pixel_index: torch.Tensor,
+        mip: torch.Tensor,
+        mean: torch.Tensor,
+        variance: torch.Tensor,
+        best_index: torch.Tensor,
+        *,
+        hyps: HypothesisSet | None = None,
+        scales: NoiseScales | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(rejected, D)``: the pixels with ``D >= z_alpha`` and the distances."""
+        dist = self.distance(
+            threshold,
+            spectra,
+            geometry,
+            pixel_index,
+            mip,
+            mean,
+            variance,
+            best_index,
+            hyps=hyps,
+            scales=scales,
+        )
+        return dist >= self.calibration.z_alpha, dist
 
 
 # --------------------------------------------------------------------------- #
@@ -212,54 +268,83 @@ class ErrorModel:
 
 @dataclass(frozen=True)
 class Decision:
-    """Accept / reject / leave ambiguous by a z-score threshold under an error bound.
+    """Reject by the threshold test (or the plain threshold), accept by the threshold.
 
     Parameters
     ----------
     threshold : float
-        z-score detection threshold.
-    bound : ErrorBound, optional
-        Error model giving the stage's relative reconstruction error; ``None``
-        applies the threshold to the z-score itself (no interval).
+        z-score detection threshold ``T``.
+    test : ThresholdTest, optional
+        Rejects pixels under the coloured-noise model; ``None`` rejects below the
+        threshold itself.
+    accept : bool, optional
+        Label survivors with ``zscore > threshold`` ACCEPTED (the final stage);
+        ``False`` leaves every survivor AMBIGUOUS for the next stage. Defaults to
+        True.
     absorb_radius : int, optional
         After labelling, AMBIGUOUS pixels within this Euclidean radius of an ACCEPTED
         pixel become ABSORBED (grid mode only). ``0`` disables the step.
     """
 
     threshold: float
-    bound: ErrorBound | None = None
+    test: ThresholdTest | None = None
+    accept: bool = True
     absorb_radius: int = 0
 
     def __post_init__(self) -> None:
-        """Validate the radius."""
+        """Validate the test and the radius."""
+        if self.test is not None and not isinstance(self.test, ThresholdTest):
+            raise ValueError("test must be a ThresholdTest or None")
         if self.absorb_radius < 0:
             raise ValueError("absorb_radius must be >= 0")
 
-    def intervals(self, zscore: torch.Tensor, rho: float) -> torch.Tensor:
-        """``(P, 2)`` worst-case z-score intervals for a relative error ``rho``."""
-        if rho <= 0.0:
-            return torch.stack([zscore, zscore], dim=-1)
-        return zscore_error_intervals(
-            rho, zscore, torch.zeros_like(zscore), torch.ones_like(zscore)
-        )
-
     @torch.no_grad()
-    def apply(self, ledger: PixelLedger, pixel_index: torch.Tensor, stage: Stage) -> None:
-        """Label the stage's pixels on the ledger (and absorb, when configured)."""
+    def apply(
+        self,
+        ledger: PixelLedger,
+        pixel_index: torch.Tensor,
+        hyps: HypothesisSet,
+        spectra: ImageSpectra | None = None,
+    ) -> None:
+        """Label the stage's pixels on the ledger (and absorb, when configured).
+
+        Parameters
+        ----------
+        ledger : PixelLedger
+            Holds the stage's maps at ``pixel_index``.
+        pixel_index : torch.Tensor
+            ``(P,)`` the pixels the stage searched.
+        hyps : HypothesisSet
+            The stage's hypotheses.
+        spectra : ImageSpectra, optional
+            The image set's spectra; required by a threshold test.
+        """
         idx = pixel_index.to(ledger.device, torch.long)
-        rho = 0.0 if self.bound is None else float(self.bound.rho(stage.rectangles))
-        if zscore_bound_is_vacuous(rho):
-            warnings.warn(
-                f"stage {stage.name!r}: relative error {rho:.3f} makes the z-score "
-                "bound vacuous (>= ~0.431); every pixel stays AMBIGUOUS",
-                UserWarning,
-                stacklevel=2,
+        zscore = ledger.zscore[idx]
+        if self.test is None:
+            rejected = zscore < self.threshold
+        else:
+            if spectra is None:
+                raise ValueError(
+                    "the decision's threshold test needs the image set's spectra "
+                    "(estimate_spectra, then ImageSet.with_spectra)"
+                )
+            rejected, score = self.test.reject(
+                self.threshold,
+                spectra,
+                ledger.geometry,
+                idx,
+                ledger.mip[idx],
+                ledger.mean[idx],
+                ledger.variance[idx],
+                ledger.best_index[idx],
+                hyps=hyps,
             )
-            ledger.set_labels(
-                idx, torch.full_like(idx, int(PixelLabel.AMBIGUOUS), dtype=torch.int8)
-            )
-            return
-        interval = self.intervals(ledger.zscore[idx], rho)
-        ledger.set_labels(idx, classify_zscore_interval(interval, self.threshold))
+            ledger.set_scores(idx, score)
+        labels = torch.full_like(idx, int(PixelLabel.AMBIGUOUS), dtype=torch.int8)
+        labels[rejected] = int(PixelLabel.REJECTED)
+        if self.accept:
+            labels[~rejected & (zscore > self.threshold)] = int(PixelLabel.ACCEPTED)
+        ledger.set_labels(idx, labels)
         if self.absorb_radius > 0:
             ledger.absorb_near_accepted(self.absorb_radius)

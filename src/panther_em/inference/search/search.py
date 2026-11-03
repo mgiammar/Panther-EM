@@ -3,20 +3,32 @@ lives in :mod:`.stage`).
 
 ::
 
-    template = Template.from_hdf5("decomp.h5", device="cuda:0")
-    bound = ErrorModel.from_result(template.result)
+    template = Template.from_hdf5("decomp.h5", device="cuda:0")  # under W_avg
+    coarse, full = [(0, 0, 32, 32)], [(0, 0, 64, 128)]
+    tables = {r[0]: RadialTables.load(path) for r, path in ...}  # .build once
+    calibration = Calibration(alpha=5e-3, zeta=0.95, eps_rho=0.1, b_factor=40.0)
     stages = [
         Stage.create(
-            [(0, 0, 32, 32)],
+            coarse,
             precision="fp16",
             orientations=1,
             planes=(5,),
-            decision=Decision(7.8, bound, absorb_radius=1),
+            decision=Decision(
+                7.8, ThresholdTest(tables[coarse[0]], calibration), accept=False
+            ),
         ),
-        Stage.create([(0, 0, 64, 128)], decision=Decision(7.8, bound)),
+        Stage.create(
+            full, decision=Decision(7.8, ThresholdTest(tables[full[0]], calibration))
+        ),
     ]
     searcher = Searcher(template, stages, n_defocus=11)
-    result = searcher.run(ImageSet.single(micrograph, filters=ctf_planes))
+    images = ImageSet.single(micrograph, filters=ctf_planes)
+    images = images.with_spectra(
+        estimate_spectra(
+            images, tables[coarse[0]], correction=whitening.correction_1d(name)
+        )
+    )
+    result = searcher.run(images)
     result.save("search.h5")
 
 A :class:`Searcher` is bound to one template and one list of stages and owns the
@@ -24,7 +36,9 @@ execution resources that amortise across image sets (kernels and spectra on the
 template, prepared weights and captured hypothesis loops on the executor). A
 :class:`SearchSession` runs the stages over one :class:`ImageSet`: stage 0 searches
 every unmasked pixel, each later stage re-scores the pixels the previous decision
-left AMBIGUOUS or ACCEPTED, and the session stops early when that set is empty.
+left AMBIGUOUS or ACCEPTED, and the session stops early when that set is empty. A
+stage whose decision runs the threshold test needs the image set's spectra
+(``ImageSet.spectra``); the session refuses to start without them.
 """
 
 from __future__ import annotations
@@ -227,6 +241,26 @@ class Searcher:
                 and int(template_ids.max()) >= self.space.n_templates
             ):
                 raise ValueError(f"stage {i}: orientation ids exceed the template's")
+            if stage.decision is not None and stage.decision.test is not None:
+                tables = stage.decision.test.tables
+                if tables.n_templates != self.space.n_templates:
+                    raise ValueError(
+                        f"stage {i}: the threshold test's tables hold "
+                        f"{tables.n_templates} template rows; the template has "
+                        f"{self.space.n_templates}"
+                    )
+                if tables.template_shape != self.template.template_shape:
+                    raise ValueError(
+                        f"stage {i}: the threshold test's tables were built on a "
+                        f"{tables.template_shape} box; the template's is "
+                        f"{self.template.template_shape}"
+                    )
+                if sorted(tables.rectangles) != sorted(stage.rectangles):
+                    raise ValueError(
+                        f"stage {i}: the threshold test's tables were built for "
+                        f"rectangles {tables.rectangles}, not the stage's "
+                        f"{stage.rectangles}"
+                    )
 
     @property
     def device(self) -> torch.device:
@@ -272,6 +306,14 @@ class SearchSession:
                 f"image set carries {images.n_defocus} defocus plane(s); the searcher "
                 f"expects {searcher.space.n_defocus}"
             )
+        if images.spectra is None:
+            for i, stage in enumerate(searcher.stages):
+                if stage.decision is not None and stage.decision.test is not None:
+                    raise ValueError(
+                        f"stage {i}: its decision runs the threshold test, which "
+                        "needs the image set's spectra (estimate_spectra, then "
+                        "ImageSet.with_spectra)"
+                    )
         self.searcher = searcher
         self.images = images
         self.geometry = SearchGeometry.from_images(
@@ -459,10 +501,14 @@ class SearchSession:
         self.ledger.write(maps, column_index, index, hyps)
         self._mark(f"stage{index}:ledger")
         if stage.decision is not None:
-            stage.decision.apply(self.ledger, column_index, stage)
+            stage.decision.apply(
+                self.ledger, column_index, hyps, self.images.spectra
+            )
         self.pixels = self.ledger.next_stage_pixels()
         self._mark(f"stage{index}:decided")
-        labels_after = self.ledger.label[column_index.to(self.ledger.device)].clone()
+        ledger_index = column_index.to(self.ledger.device)
+        labels_after = self.ledger.label[ledger_index].clone()
+        score = self.ledger.score[ledger_index].clone()
         n_ambiguous = int(self.ledger.pixels_with(PixelLabel.AMBIGUOUS).numel())
         elapsed = time.perf_counter() - t0
         self.elapsed_s += elapsed
@@ -473,6 +519,7 @@ class SearchSession:
             maps=maps,
             best_index=hyps.decode(maps.best_virtual),
             labels_after=labels_after,
+            score=score,
             n_ambiguous_after=n_ambiguous,
             elapsed_s=elapsed,
             featurize_s=t_featurized - t0,
@@ -508,4 +555,5 @@ class SearchSession:
             self.searcher.stages,
             stage_results=self.stage_results,
             elapsed_s=self.elapsed_s,
+            spectra=self.images.spectra,
         )

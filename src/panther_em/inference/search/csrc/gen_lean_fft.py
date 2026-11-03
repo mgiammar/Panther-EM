@@ -45,7 +45,8 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Butterfly:
     """One radix-``len(indices)`` butterfly: inputs at ``indices``, input ``q`` pre-multiplied
-    by ``twiddles[q]`` (``twiddles[0] == 1``), outputs written back to ``indices``."""
+    by ``twiddles[q]`` (``twiddles[0] == 1``), outputs written back to ``indices``.
+    """
 
     indices: tuple[int, ...]
     twiddles: tuple[complex, ...]
@@ -364,7 +365,7 @@ def _check_plans(sizes: tuple[int, ...]) -> None:
         assert err < 1e-11 * n
 
 
-def lean_corr_reference(c, n_psi: int) -> "np.ndarray":
+def lean_corr_reference(c, n_psi: int) -> np.ndarray:
     """Pure-numpy model of the kernel's maths (fold + residue twiddle + Hermitian pack)."""
     import numpy as np
 

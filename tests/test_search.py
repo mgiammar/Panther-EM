@@ -8,12 +8,22 @@ import pytest
 import torch
 
 from panther_em.inference.correlation import compute_feature_stack
-from panther_em.inference.search.decision import Decision, ErrorModel, PixelLabel
-from panther_em.inference.search.results import SearchResult, StageResult
+from panther_em.inference.search.decision import (
+    Calibration,
+    Decision,
+    PixelLabel,
+    ThresholdTest,
+)
+from panther_em.inference.search.noise import (
+    RadialTables,
+    SpectraConfig,
+    estimate_spectra,
+)
+from panther_em.inference.search.results import MAP_NAMES, SearchResult, StageResult
 from panther_em.inference.search.search import ExecutionConfig, Searcher
-from panther_em.inference.search.stage import FixedError, Stage
+from panther_em.inference.search.stage import Stage
 from panther_em.inference.search.template import Template
-from panther_em.inference.search.types import BatchShape, ImageSet
+from panther_em.inference.search.types import BatchShape, ImageSet, ImageSpectra
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",
@@ -66,6 +76,12 @@ def template(synthetic_result):
 
 def _image(h=30, w=30, seed=0):
     return torch.randn(h, w, generator=torch.Generator().manual_seed(seed))
+
+
+def _with_spectra(images, tables, level="none"):
+    """The image set carrying its spectra (level map off unless asked)."""
+    spectra = estimate_spectra(images, tables, SpectraConfig(level=level))
+    return images.with_spectra(spectra)
 
 
 def _dense_reference(template, image, rects, n_psi, planes=None, filters=None):
@@ -139,44 +155,51 @@ def test_single_stage_matches_dense_reference_and_decides(template, tmp_path):
     # no decision: every searched pixel stays AMBIGUOUS
     assert torch.all(res.label == int(PixelLabel.AMBIGUOUS)) and torch.all(res.last_stage == 0)
 
-    # a plain threshold decides every pixel; the spectral bound leaves some ambiguous
+    # a plain threshold decides every pixel and scores none
     decided = Searcher(
         template, [Stage.create(rects, n_psi=16, decision=Decision(threshold))], execution=EXEC
     ).run(ImageSet.single(image))
     accepted = decided.label[0] == int(PixelLabel.ACCEPTED)
     assert torch.equal(accepted, zscore > threshold)
     assert not (decided.label == int(PixelLabel.AMBIGUOUS)).any()
-    # the flat synthetic spectrum makes the spectral bound vacuous below full rank
-    # (see test_full_rank_bound_decides_everything); a fixed bound exercises the rule
-    assert ErrorModel.from_result(template.result).rho(tuple(rects)) > 0.43
-    rho = 0.1
-    bound = FixedError(rho)
-    bounded = Searcher(
+    assert torch.isnan(decided.score).all() and decided.spectra is None
+
+    # the threshold test rejects under the coloured-noise model, scores every pixel,
+    # and leaves acceptance to the plain threshold on the survivors
+    tables = RadialTables.build(template, rects)
+    images = _with_spectra(ImageSet.single(image), tables, level="disk")
+    test = ThresholdTest(tables, Calibration(alpha=0.2))
+    tested = Searcher(
         template,
-        [Stage.create(rects, n_psi=16, decision=Decision(threshold, bound))],
+        [Stage.create(rects, n_psi=16, decision=Decision(threshold, test))],
         execution=EXEC,
         keep_stage_results=True,
-    ).run(ImageSet.single(image))
-    labels = bounded.label[0]
-    assert (labels == int(PixelLabel.AMBIGUOUS)).any()
-    # the bound only widens the call: it never flips a side, it only abstains
-    assert torch.all(accepted[labels == int(PixelLabel.ACCEPTED)])
-    assert not accepted[labels == int(PixelLabel.REJECTED)].any()
+    ).run(images)
+    labels = tested.label[0]
+    rejected = labels == int(PixelLabel.REJECTED)
+    assert rejected.any() and (labels == int(PixelLabel.AMBIGUOUS)).any()
+    assert torch.equal(labels == int(PixelLabel.ACCEPTED), accepted & ~rejected)
+    assert torch.isfinite(tested.score).all() and tested.spectra is images.spectra
+    assert torch.equal(tested.stage_results[0].score, tested.score.reshape(-1))
 
-    # the result file carries the final maps and the per-stage group
+    # the result file carries the final maps, the spectra and the per-stage group
     path = tmp_path / "single.h5"
-    bounded.save(path)
+    tested.save(path)
     loaded = SearchResult.load(path)
-    torch.testing.assert_close(loaded.mip, bounded.mip, equal_nan=True)
-    torch.testing.assert_close(loaded.label, bounded.label)
+    torch.testing.assert_close(loaded.mip, tested.mip, equal_nan=True)
+    torch.testing.assert_close(loaded.label, tested.label)
+    torch.testing.assert_close(loaded.score, tested.score)
+    assert isinstance(loaded.spectra, ImageSpectra)
+    torch.testing.assert_close(loaded.spectra.level, images.spectra.level)
+    torch.testing.assert_close(loaded.spectra.noise, images.spectra.noise)
     assert len(loaded.stage_results) == 1
     stage = loaded.stage_results[0]
-    torch.testing.assert_close(stage.maps.mip, bounded.stage_results[0].maps.mip)
-    assert torch.equal(stage.labels_after, bounded.stage_results[0].labels_after)
+    torch.testing.assert_close(stage.maps.mip, tested.stage_results[0].maps.mip)
+    assert torch.equal(stage.labels_after, tested.stage_results[0].labels_after)
+    torch.testing.assert_close(stage.score, tested.stage_results[0].score)
     assert stage.stage.rectangles == tuple(rects) and stage.n_pixels == 121
     assert loaded.stages[0].decision.threshold == threshold
-    assert loaded.stages[0].decision.bound.rho(tuple(rects)) == pytest.approx(rho)
-    assert isinstance(loaded.stages[0].decision.bound, FixedError)
+    assert loaded.stages[0].decision.test is None and loaded.stages[0].decision.accept
 
 
 # --------------------------------------------------------------------------- #
@@ -188,25 +211,32 @@ def test_two_stage_rescored_pixels_match_fresh_searches(template):
     """Each stage equals a single-stage search of its rectangles on its pixels, and
     stage 1 searches exactly the pixels stage 0 accepted or left ambiguous."""
     image = _image(seed=3)
-    rects0, rects1 = [(0, 0, 2, 2)], [(0, 0, 4, 5)]
+    rects0, rects1 = [(0, 0, 3, 3)], [(0, 0, 4, 5)]
     mip0, mean0, var0, *_ = _dense_reference(template, image, rects0, 16)
     z0 = (mip0 - mean0) / var0.clamp_min(0).sqrt()
-    t0 = float(z0.flatten().quantile(0.6))
+    t0 = float(z0.flatten().quantile(0.6)) + 1.0  # the test rejects a fifth
+    tables0 = RadialTables.build(template, rects0)
+    tables1 = RadialTables.build(template, rects1)
+    # stage 0 rejects or abstains under the test; stage 1 (full rank) decides
+    test0 = Decision(t0, ThresholdTest(tables0), accept=False)
     stages = [
-        Stage.create(rects0, n_psi=16, decision=Decision(t0, FixedError(0.1), absorb_radius=1)),
-        Stage.create(rects1, n_psi=16, decision=Decision(1.5)),
+        Stage.create(rects0, n_psi=16, decision=test0),
+        Stage.create(rects1, n_psi=16, decision=Decision(1.5, ThresholdTest(tables1))),
     ]
     searcher = Searcher(template, stages, execution=EXEC, keep_stage_results=True)
-    session = searcher.session(ImageSet.single(image))
+    session = searcher.session(_with_spectra(ImageSet.single(image), tables0))
     results = list(session)
     assert len(results) == 2 and results[0].n_pixels == 121
     after0 = results[0].labels_after
-    survivors = results[0].pixel_index[
-        (after0 == int(PixelLabel.ACCEPTED)) | (after0 == int(PixelLabel.AMBIGUOUS))
-    ]
+    assert not (after0 == int(PixelLabel.ACCEPTED)).any()  # stage 0 never accepts
+    survivors = results[0].pixel_index[after0 == int(PixelLabel.AMBIGUOUS)]
     assert 0 < survivors.numel() < 121
-    assert torch.equal(torch.sort(results[1].pixel_index).values, torch.sort(survivors).values)
-    assert (after0 == int(PixelLabel.ABSORBED)).any() or (after0 == int(PixelLabel.REJECTED)).any()
+    assert torch.equal(
+        torch.sort(results[1].pixel_index).values, torch.sort(survivors).values
+    )
+    assert (after0 == int(PixelLabel.REJECTED)).any()
+    assert torch.isfinite(results[0].score).all()
+    assert torch.isfinite(results[1].score).all()
 
     for stage, rects in zip(results, (rects0, rects1), strict=True):
         mip, mean, var, best, _psi, unique = _dense_reference(template, image, rects, 16)
@@ -233,22 +263,30 @@ def test_two_stage_healpix_level_and_planes(synthetic_result):
     result = synthetic_result(s2_nside=2, n_filters=2)  # 48 orientations x 2 filters
     template = Template(result, device="cpu")
     stub = StubFeaturizer()
-    bound = ErrorModel.from_result(result)
+    tables0 = RadialTables.build(template, [(0, 0, 3, 3)])
+    tables1 = RadialTables.build(template, [(0, 0, 4, 5)])
+    test0 = Decision(0.0, ThresholdTest(tables0), accept=False, absorb_radius=1)
+    test1 = Decision(0.5, ThresholdTest(tables1))
     stages = [
         Stage.create(
-            [(0, 0, 3, 3)],
-            n_psi=16,
-            orientations=1,
-            planes=(1,),
-            decision=Decision(0.0, FixedError(0.2), absorb_radius=1),
+            [(0, 0, 3, 3)], n_psi=16, orientations=1, planes=(1,), decision=test0
         ),
-        Stage.create([(0, 0, 4, 5)], n_psi=16, decision=Decision(0.5, bound)),  # rho = 0
+        Stage.create([(0, 0, 4, 5)], n_psi=16, decision=test1),
     ]
     searcher = Searcher(template, stages, execution=EXEC, featurize=stub, n_defocus=3)
     assert searcher.ipix is not None and searcher.ipix.tolist() == list(range(48))
     t_ids, d_ids = stages[0].hypothesis_ids(searcher.space, searcher.ipix)
     assert t_ids.numel() == 12 * 2 and d_ids.tolist() == [1]  # one child per parent pixel
-    images = ImageSet.from_stack(torch.zeros(1, 30, 30), filters=torch.ones(3, 30, 16))
+    # per-plane curves for the three CTF planes and a level map of the image
+    spectra = ImageSpectra.create(
+        tables0.freq,
+        torch.tensor([1.0, 2.0, 3.0])[None, :, None] * torch.ones(1, 3, tables0.n_bins),
+        torch.ones(1, 3, tables0.n_bins),
+        torch.ones(1, 30, 30),
+    )
+    images = ImageSet.from_stack(
+        torch.zeros(1, 30, 30), filters=torch.ones(3, 30, 16), spectra=spectra
+    )
     session = searcher.session(images)
     results = list(session)
     # stage 1's larger rectangle is a new group, so it is produced on all three planes
@@ -258,6 +296,7 @@ def test_two_stage_healpix_level_and_planes(synthetic_result):
     assert results[1].maps.n_evaluated == 3 * 96 * 16
     final = session.snapshot()
     assert not (final.label == int(PixelLabel.AMBIGUOUS)).any()  # full rank decides all
+    assert torch.isfinite(final.score).all() and final.spectra is spectra
     decoded = final.decode()
     o = decoded["orientation_index"][final.last_stage == 0]
     assert set(o[o >= 0].tolist()) <= set(range(0, 48, 4))
@@ -307,17 +346,41 @@ def test_searcher_validation(template):
         Searcher(template, [])
 
 
-def test_full_rank_bound_decides_everything(template):
-    bound = ErrorModel.from_result(template.result)
-    assert bound.rho(((0, 0, 4, 5),)) == pytest.approx(0.0, abs=1e-12)
+def test_searcher_validates_the_threshold_test(template, synthetic_result):
+    rect = (0, 0, 2, 2)
+    tables = RadialTables.build(template, [rect])
+
+    def stage(t):
+        return Stage.create([rect], n_psi=16, decision=Decision(3.0, ThresholdTest(t)))
+
+    with pytest.raises(ValueError, match="rectangles"):
+        Searcher(template, [stage(RadialTables.build(template, [(0, 0, 2, 3)]))])
+    other = Template(synthetic_result(n_orientations=4), device="cpu")
+    with pytest.raises(ValueError, match="template rows"):
+        Searcher(template, [stage(RadialTables.build(other, [rect]))])
+    small = Template(synthetic_result(box=16), device="cpu")
+    with pytest.raises(ValueError, match="box"):
+        Searcher(template, [stage(RadialTables.build(small, [rect]))])
+    searcher = Searcher(
+        template, [stage(tables)], execution=EXEC, featurize=StubFeaturizer()
+    )
+    with pytest.raises(ValueError, match=r"stage 0: .*spectra"):
+        searcher.session(ImageSet.single(_image()))
+    searcher.run(_with_spectra(ImageSet.single(_image()), tables))
+
+
+def test_full_rank_test_decides_everything(template):
+    tables = RadialTables.build(template, [(0, 0, 4, 5)])
+    decision = Decision(3.0, ThresholdTest(tables))
     searcher = Searcher(
         template,
-        [Stage.create([(0, 0, 4, 5)], n_psi=16, decision=Decision(3.0, bound))],
+        [Stage.create([(0, 0, 4, 5)], n_psi=16, decision=decision)],
         execution=EXEC,
         featurize=StubFeaturizer(),
     )
-    res = searcher.run(ImageSet.single(torch.zeros(30, 30)))
-    assert not (res.label == int(PixelLabel.AMBIGUOUS)).any()  # zero error: all decided
+    res = searcher.run(_with_spectra(ImageSet.single(_image()), tables))
+    assert not (res.label == int(PixelLabel.AMBIGUOUS)).any()  # no residual: decided
+    assert torch.equal(res.label[0] == int(PixelLabel.ACCEPTED), res.zscore[0] > 3.0)
 
 
 def test_center_mode_orientation_subset_and_run_many(template):
@@ -368,6 +431,7 @@ def test_search_result_round_trip_and_masked_pixels(template, tmp_path):
     res = searcher.run(ImageSet.single(torch.zeros(30, 30), mask=mask))
     assert (res.label[0][~mask] == int(PixelLabel.MASKED)).all()
     assert torch.isnan(res.mip[0][~mask]).all() and (res.last_stage[0][~mask] == -1).all()
+    assert torch.isnan(res.score).all()  # plain thresholds score nothing
     n_rescored = int((z > threshold).sum())
     assert n_rescored == 10
     assert (res.last_stage == 1).sum() == n_rescored
@@ -379,9 +443,10 @@ def test_search_result_round_trip_and_masked_pixels(template, tmp_path):
     path = tmp_path / "result.h5"
     res.save(path)
     loaded = SearchResult.load(path)
-    for name in ("mip", "zscore", "mean", "variance", "best_index", "best_psi", "label", "last_stage"):
+    for name in MAP_NAMES:
         torch.testing.assert_close(getattr(loaded, name), getattr(res, name), equal_nan=True)
     assert loaded.geometry == res.geometry and loaded.n_psi_of_stage == res.n_psi_of_stage
+    assert loaded.spectra is None
     assert [s.rectangles for s in loaded.stages] == [s.rectangles for s in res.stages]
     assert loaded.stages[0].decision.threshold == threshold and loaded.stages[1].decision is None
     torch.testing.assert_close(loaded.decode()["psi"], res.decode()["psi"], equal_nan=True)

@@ -1,11 +1,12 @@
 """Per-pixel state and results: the dense ledger, one stage's maps, the final maps.
 
-* :class:`PixelLedger` -- dense ``(n_pixels,)`` labels and last-known statistics,
-  written once per stage; the search's working state.
+* :class:`PixelLedger` -- dense ``(n_pixels,)`` labels, last-known statistics and
+  the threshold test's score, written once per stage; the search's working state.
 * :class:`StageResult` -- one stage's maps in its compact pixel order, with the
-  labels after its decision and timings.
+  labels and scores after its decision and timings.
 * :class:`SearchResult` -- dense final maps with decoding (orientation angles,
-  in-plane angle, defocus) and HDF5 I/O, including optional per-stage groups.
+  in-plane angle, defocus), the image set's spectra and HDF5 I/O, including
+  optional per-stage groups.
 """
 
 from __future__ import annotations
@@ -23,7 +24,11 @@ from panther_em.inference.search.decision import PixelLabel
 from panther_em.inference.search.executor import StageMaps
 from panther_em.inference.search.hypotheses import HypothesisSpace
 from panther_em.inference.search.stage import Stage, stage_from_json, stage_to_json
-from panther_em.inference.search.types import PixelSelection, SearchGeometry
+from panther_em.inference.search.types import (
+    ImageSpectra,
+    PixelSelection,
+    SearchGeometry,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -39,6 +44,7 @@ MAP_NAMES = (
     "best_psi",
     "label",
     "last_stage",
+    "score",
 )
 STAGE_MAP_NAMES = ("mip", "mean", "variance", "zscore", "best_index", "best_psi")
 
@@ -53,7 +59,9 @@ class PixelLedger:
 
     Statistics are *per stage* (a different rank is a different estimator), so the
     last stage to search a pixel overwrites its values; ``last_stage`` says which.
-    Hypothesis ids are stored as **global** ids (see :mod:`.hypotheses`).
+    Hypothesis ids are stored as **global** ids (see :mod:`.hypotheses`). ``score``
+    is the threshold test's distance ``D`` of the last decision that tested the
+    pixel (NaN where none did).
 
     Parameters
     ----------
@@ -65,7 +73,16 @@ class PixelLedger:
         Pixels eligible for the search; everything else is ``MASKED``.
     """
 
-    FIELDS = ("mip", "mean", "variance", "zscore", "best_index", "best_psi", "last_stage")
+    FIELDS = (
+        "mip",
+        "mean",
+        "variance",
+        "zscore",
+        "best_index",
+        "best_psi",
+        "last_stage",
+        "score",
+    )
 
     def __init__(
         self,
@@ -88,6 +105,7 @@ class PixelLedger:
         self.best_index = torch.full((n,), -1, dtype=torch.int64, device=self.device)
         self.best_psi = torch.full((n,), -1, dtype=torch.int64, device=self.device)
         self.last_stage = torch.full((n,), -1, dtype=torch.int16, device=self.device)
+        self.score = torch.full((n,), nan, dtype=torch.float32, device=self.device)
         self.n_psi_of_stage: list[int] = []
         if initial is not None and not initial.is_full:
             self.label.fill_(int(PixelLabel.MASKED))
@@ -108,7 +126,8 @@ class PixelLedger:
     ) -> None:
         """Record a stage's maps at ``pixel_index`` (same order as the maps).
 
-        Written pixels are labelled AMBIGUOUS; the stage's decision relabels them.
+        Written pixels are labelled AMBIGUOUS and their score is cleared; the stage's
+        decision relabels (and scores) them.
         """
         idx = pixel_index.to(self.device, torch.long)
         self.mip[idx] = maps.mip.to(self.device)
@@ -119,6 +138,7 @@ class PixelLedger:
         self.best_psi[idx] = maps.best_psi.to(self.device)
         self.last_stage[idx] = int(stage_index)
         self.label[idx] = int(PixelLabel.AMBIGUOUS)
+        self.score[idx] = float("nan")
         while len(self.n_psi_of_stage) <= stage_index:
             self.n_psi_of_stage.append(0)
         self.n_psi_of_stage[stage_index] = int(hyps.n_psi)
@@ -127,6 +147,12 @@ class PixelLedger:
         """Overwrite labels at ``pixel_index``."""
         self.label[pixel_index.to(self.device, torch.long)] = labels.to(
             self.device, torch.int8
+        )
+
+    def set_scores(self, pixel_index: torch.Tensor, scores: torch.Tensor) -> None:
+        """Overwrite the threshold test's distances at ``pixel_index``."""
+        self.score[pixel_index.to(self.device, torch.long)] = scores.to(
+            self.device, torch.float32
         )
 
     def pixels_with(self, *labels: PixelLabel) -> torch.Tensor:
@@ -185,6 +211,9 @@ class StageResult:
         ``(P_stage,)`` global hypothesis ids.
     labels_after : torch.Tensor
         ``(P_stage,)`` int8 labels after the stage's decision ran.
+    score : torch.Tensor
+        ``(P_stage,)`` float32 distances of the decision's threshold test (NaN
+        without one).
     n_ambiguous_after : int
         Pixels left AMBIGUOUS on the whole ledger after the decision.
     elapsed_s : float
@@ -198,6 +227,7 @@ class StageResult:
     maps: StageMaps
     best_index: torch.Tensor
     labels_after: torch.Tensor
+    score: torch.Tensor
     n_ambiguous_after: int
     elapsed_s: float
     featurize_s: float = 0.0
@@ -227,6 +257,7 @@ class StageResult:
             maps=moved,
             best_index=self.best_index.to(device),
             labels_after=self.labels_after.to(device),
+            score=self.score.to(device),
             n_ambiguous_after=self.n_ambiguous_after,
             elapsed_s=self.elapsed_s,
             featurize_s=self.featurize_s,
@@ -239,9 +270,10 @@ class SearchResult:
     """Dense per-pixel maps of a finished (or snapshotted) search.
 
     Maps are ``(B, *grid)``: ``(B, out_h, out_w)`` in grid mode, ``(B, 1)`` in center
-    mode. ``mip/zscore/mean/variance`` are NaN and ``best_index/best_psi/last_stage``
-    are ``-1`` where a pixel was never searched; ``label`` holds
-    :class:`~panther_em.inference.search.decision.PixelLabel` values.
+    mode. ``mip/zscore/mean/variance/score`` are NaN and ``best_index/best_psi/
+    last_stage`` are ``-1`` where a pixel was never searched; ``label`` holds
+    :class:`~panther_em.inference.search.decision.PixelLabel` values and ``score``
+    the threshold test's distance of the last stage that tested the pixel.
 
     Attributes
     ----------
@@ -250,6 +282,8 @@ class SearchResult:
     stage_results : list[StageResult]
         Per-stage maps, kept when the searcher was built with
         ``keep_stage_results=True``.
+    spectra : ImageSpectra, optional
+        The image set's spectra the threshold tests ran with.
     """
 
     geometry: SearchGeometry
@@ -263,9 +297,11 @@ class SearchResult:
     best_psi: torch.Tensor
     label: torch.Tensor
     last_stage: torch.Tensor
+    score: torch.Tensor
     n_psi_of_stage: tuple[int, ...]
     stage_results: list[StageResult] = field(default_factory=list)
     elapsed_s: float = 0.0
+    spectra: ImageSpectra | None = None
 
     @classmethod
     def from_ledger(
@@ -276,6 +312,7 @@ class SearchResult:
         *,
         stage_results: list[StageResult] | None = None,
         elapsed_s: float = 0.0,
+        spectra: ImageSpectra | None = None,
     ) -> SearchResult:
         """Snapshot a ledger (clones every field)."""
         g = ledger.geometry
@@ -291,9 +328,11 @@ class SearchResult:
             best_psi=g.unflatten(ledger.best_psi.clone()),
             label=g.unflatten(ledger.label.clone()),
             last_stage=g.unflatten(ledger.last_stage.clone()),
+            score=g.unflatten(ledger.score.clone()),
             n_psi_of_stage=tuple(ledger.n_psi_of_stage),
             stage_results=list(stage_results or []),
             elapsed_s=elapsed_s,
+            spectra=spectra,
         )
 
     # -- derived -----------------------------------------------------------------
@@ -353,11 +392,12 @@ class SearchResult:
             n_psi_of_stage=self.n_psi_of_stage,
             stage_results=[s.to(device) for s in self.stage_results],
             elapsed_s=self.elapsed_s,
+            spectra=self.spectra,
             **moved,
         )
 
     def to_numpy(self) -> dict[str, np.ndarray]:
-        """The eight maps as NumPy arrays (CPU)."""
+        """The nine maps as NumPy arrays (CPU)."""
         return {name: getattr(self, name).detach().cpu().numpy() for name in MAP_NAMES}
 
     # -- I/O -------------------------------------------------------------------
@@ -365,13 +405,14 @@ class SearchResult:
     def save(self, path: str | Path) -> None:
         """Write the maps plus enough metadata for :meth:`load` and :meth:`decode`.
 
-        Layout: the eight dense maps and the space's angle/defocus tables as root
+        Layout: the nine dense maps and the space's angle/defocus tables as root
         datasets; ``geometry``, ``space``, ``stages``, ``n_psi_of_stage`` and
-        ``elapsed_s`` as attributes; and, when stage results were kept, one group
-        ``stages/stage{i}`` per stage holding the compact ``pixel_index``, the six
-        stage maps (``best_index`` global), ``labels_after`` and timing attributes.
+        ``elapsed_s`` as attributes; a ``spectra`` group (:meth:`ImageSpectra.save`'s
+        layout) when the image set carried spectra; and, when stage results were
+        kept, one group ``stages/stage{i}`` per stage holding the compact
+        ``pixel_index``, the six stage maps (``best_index`` global), ``labels_after``,
+        ``score`` and timing attributes.
         """
-
         with h5py.File(path, "w") as f:
             for name, array in self.to_numpy().items():
                 f.create_dataset(name, data=array)
@@ -399,6 +440,8 @@ class SearchResult:
             f.attrs["n_psi_of_stage"] = json.dumps(list(self.n_psi_of_stage))
             f.attrs["stages"] = json.dumps([stage_to_json(s) for s in self.stages])
             f.attrs["elapsed_s"] = float(self.elapsed_s)
+            if self.spectra is not None:
+                self.spectra.write_group(f.create_group("spectra"))
             if self.stage_results:
                 root = f.create_group("stages")
                 for r in self.stage_results:
@@ -408,6 +451,7 @@ class SearchResult:
                         source = r.best_index if name == "best_index" else getattr(r.maps, name)
                         grp.create_dataset(name, data=source.detach().cpu().numpy())
                     grp.create_dataset("labels_after", data=r.labels_after.cpu().numpy())
+                    grp.create_dataset("score", data=r.score.detach().cpu().numpy())
                     grp.attrs["n_pixels"] = r.n_pixels
                     grp.attrs["n_evaluated"] = int(r.maps.n_evaluated)
                     grp.attrs["n_ambiguous_after"] = int(r.n_ambiguous_after)
@@ -418,9 +462,11 @@ class SearchResult:
     @classmethod
     def load(cls, path: str | Path) -> SearchResult:
         """Read a result written by :meth:`save` (stage decisions are not restored)."""
-
         with h5py.File(path, "r") as f:
             maps = {name: torch.from_numpy(np.asarray(f[name])) for name in MAP_NAMES}
+            spectra = None
+            if "spectra" in f:
+                spectra = ImageSpectra.read_group(f["spectra"])
             geo = json.loads(f.attrs["geometry"])
             geometry = SearchGeometry(
                 n_images=int(geo["n_images"]),
@@ -471,6 +517,7 @@ class SearchResult:
                             ),
                             best_index=best_index,
                             labels_after=torch.from_numpy(np.asarray(grp["labels_after"])),
+                            score=torch.from_numpy(np.asarray(grp["score"])),
                             n_ambiguous_after=int(grp.attrs["n_ambiguous_after"]),
                             elapsed_s=float(grp.attrs["elapsed_s"]),
                             featurize_s=float(grp.attrs["featurize_s"]),
@@ -489,7 +536,9 @@ class SearchResult:
             best_psi=maps["best_psi"],
             label=maps["label"],
             last_stage=maps["last_stage"],
+            score=maps["score"],
             n_psi_of_stage=n_psi_of_stage,
             stage_results=stage_results,
             elapsed_s=elapsed,
+            spectra=spectra,
         )
