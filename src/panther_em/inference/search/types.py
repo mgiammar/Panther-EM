@@ -9,10 +9,15 @@ from __future__ import annotations
 
 import enum
 import math
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Literal
 
+import h5py  # type: ignore[import-untyped]
+import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # (k_start, m_start, k_extent, m_extent) block of ``(angular frequency, eigenvector)``
 # feature space.
@@ -83,6 +88,131 @@ class BatchShape:
             raise ValueError(f"batch sizes must be positive, got {self}")
 
 
+def _with_leading_axes(t: torch.Tensor, rank: int) -> torch.Tensor:
+    """``t`` with unit axes prepended up to ``rank``."""
+    while t.dim() < rank:
+        t = t.unsqueeze(0)
+    return t
+
+
+@dataclass(frozen=True, eq=False)
+class ImageSpectra:
+    """Per-image curves and maps of the colored-noise model.
+
+    Parameters
+    ----------
+    freq : torch.Tensor
+        ``(F,)`` float32 frequency axis of the curves (cycles per pixel).
+    noise : torch.Tensor
+        ``(B'|1, D'|1, F)`` float64 noise power per ring of each image's search image
+        on each CTF plane (the note's ``kappa^2 P(f)``; grid mean = variance).
+    signal : torch.Tensor
+        ``(B'|1, D'|1, F)`` float64 signal weight per ring: the filter a particle
+        carries in the search image beyond the template's (the note's ``G_i``,
+        ``C_i^2 |CTF|^2``).
+    level : torch.Tensor
+        ``(B'|1, H|1, W|1)`` float32 relative noise level at each image pixel
+        (mean 1).
+    pixel_size : float
+        Angstrom per pixel, for the B-factor envelope.
+    """
+
+    freq: torch.Tensor
+    noise: torch.Tensor
+    signal: torch.Tensor
+    level: torch.Tensor
+    pixel_size: float = 1.0
+
+    @classmethod
+    def create(
+        cls,
+        freq: torch.Tensor,
+        noise: torch.Tensor,
+        signal: torch.Tensor | None = None,
+        level: torch.Tensor | None = None,
+        pixel_size: float = 1.0,
+    ) -> ImageSpectra:
+        """Coerce curves of rank 1 to 3 and maps of rank 0 to 3 (CPU tensors)."""
+        f = torch.as_tensor(freq).reshape(-1).to(torch.float32).cpu()
+        n = _with_leading_axes(torch.as_tensor(noise).to(torch.float64).cpu(), 3)
+        s = (
+            torch.ones((1, 1, f.numel()), dtype=torch.float64)
+            if signal is None
+            else _with_leading_axes(torch.as_tensor(signal).to(torch.float64).cpu(), 3)
+        )
+        lv = (
+            torch.ones((1, 1, 1), dtype=torch.float32)
+            if level is None
+            else _with_leading_axes(torch.as_tensor(level).to(torch.float32).cpu(), 3)
+        )
+        return cls(f, n, s, lv, float(pixel_size))
+
+    def __post_init__(self) -> None:
+        """Validate (never coerce); see :meth:`create`."""
+        if self.freq.dim() != 1 or self.freq.dtype is not torch.float32:
+            raise ValueError(
+                "freq must be a 1-D float32 tensor; see ImageSpectra.create()"
+            )
+        if self.freq.numel() < 2 or not bool(torch.all(self.freq[1:] > self.freq[:-1])):
+            raise ValueError("freq must be increasing with at least two bins")
+        n_bins = self.freq.numel()
+        for name, t in (("noise", self.noise), ("signal", self.signal)):
+            if t.dim() != 3 or t.dtype is not torch.float64 or t.shape[-1] != n_bins:
+                raise ValueError(
+                    f"{name} must be a float64 (B', D', {n_bins}) tensor, got "
+                    f"{tuple(t.shape)} {t.dtype}; see ImageSpectra.create()"
+                )
+            if not bool(torch.isfinite(t).all()) or bool((t < 0).any()):
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.level.dim() != 3 or self.level.dtype is not torch.float32:
+            raise ValueError("level must be a float32 (B', H', W') tensor")
+        if not bool(torch.isfinite(self.level).all()) or bool((self.level <= 0).any()):
+            raise ValueError("level must be finite and positive")
+        if not self.pixel_size > 0.0:
+            raise ValueError("pixel_size must be positive")
+
+    @property
+    def n_bins(self) -> int:
+        """``F``."""
+        return int(self.freq.numel())
+
+    def validate_for(
+        self, n_images: int, n_defocus: int, image_shape: tuple[int, int]
+    ) -> None:
+        """Check every non-unit axis against an image set's ``B``, ``D``, ``(H, W)``."""
+        for name, t, sizes in (
+            ("noise", self.noise, (n_images, n_defocus)),
+            ("signal", self.signal, (n_images, n_defocus)),
+            ("level", self.level, (n_images, int(image_shape[0]), int(image_shape[1]))),
+        ):
+            for axis, (got, want) in enumerate(zip(t.shape, sizes, strict=False)):
+                if got not in (1, want):
+                    raise ValueError(
+                        f"spectra.{name} axis {axis} has size {got}; the image set "
+                        f"needs 1 or {want}"
+                    )
+
+    def save(self, path: str | Path) -> None:
+        """Write the curves and the level map to an HDF5 file."""
+        with h5py.File(path, "w") as f:
+            for name in ("freq", "noise", "signal", "level"):
+                f.create_dataset(name, data=getattr(self, name).numpy())
+            f.attrs["pixel_size"] = float(self.pixel_size)
+
+    @classmethod
+    def load(cls, path: str | Path) -> ImageSpectra:
+        """Read a file written by :meth:`save`."""
+        with h5py.File(path, "r") as f:
+            data = {
+                name: torch.from_numpy(np.asarray(f[name]))
+                for name in ("freq", "noise", "signal", "level")
+            }
+            pixel_size = float(f.attrs["pixel_size"])
+        return cls.create(
+            data["freq"], data["noise"], data["signal"], data["level"], pixel_size
+        )
+
+
 @dataclass(frozen=True, eq=False)
 class ImageSet:
     """A batch of already-preprocessed images plus optional per-image inputs.
@@ -104,12 +234,16 @@ class ImageSet:
     center_only : bool, optional
         Force the 1x1 (center pixel only) evaluation mode. ``None`` (default) selects
         it automatically when the image box equals the template box.
+    spectra : ImageSpectra, optional
+        The images' noise/signal curves and level maps, needed by a stage whose
+        decision runs the coloured-noise threshold test (see :meth:`with_spectra`).
     """
 
     images: torch.Tensor
     filters: torch.Tensor | None = None
     mask: torch.Tensor | None = None
     center_only: bool | None = None
+    spectra: ImageSpectra | None = None
 
     def __post_init__(self) -> None:
         """Validate (never coerce): a real ``(B, H, W)`` stack and matching filters."""
@@ -146,6 +280,8 @@ class ImageSet:
                 )
             if f.shape[-3] < 1:
                 raise ValueError("filters must have at least one defocus plane")
+        if self.spectra is not None:
+            self.spectra.validate_for(b, self.n_defocus, (h, w))
 
     @property
     def n_images(self) -> int:
@@ -185,6 +321,7 @@ class ImageSet:
         filters: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
         center_only: bool | None = None,
+        spectra: ImageSpectra | None = None,
     ) -> ImageSet:
         """One ``(H, W)`` image."""
         if image.dim() != 2:
@@ -192,7 +329,11 @@ class ImageSet:
                 f"single() expects an (H, W) image, got {tuple(image.shape)}"
             )
         return cls(
-            image.unsqueeze(0), filters=filters, mask=mask, center_only=center_only
+            image.unsqueeze(0),
+            filters=filters,
+            mask=mask,
+            center_only=center_only,
+            spectra=spectra,
         )
 
     @classmethod
@@ -203,13 +344,20 @@ class ImageSet:
         filters: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
         center_only: bool | None = None,
+        spectra: ImageSpectra | None = None,
     ) -> ImageSet:
         """A ``(B, H, W)`` stack of same-size images (micrographs or particle boxes)."""
         if images.dim() != 3:
             raise ValueError(
                 f"from_stack() expects a (B, H, W) stack, got {tuple(images.shape)}"
             )
-        return cls(images, filters=filters, mask=mask, center_only=center_only)
+        return cls(
+            images, filters=filters, mask=mask, center_only=center_only, spectra=spectra
+        )
+
+    def with_spectra(self, spectra: ImageSpectra | None) -> ImageSet:
+        """A copy carrying ``spectra`` (validated against this set)."""
+        return replace(self, spectra=spectra)
 
     # Alias with the particle-stack vocabulary.
     from_boxes = from_stack

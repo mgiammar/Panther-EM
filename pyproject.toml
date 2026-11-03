@@ -47,6 +47,8 @@ dependencies = [
     "h5py",
     "ttsim3d",
     "torch-fourier-slice>=0.6.0",
+    "torch-fourier-filter",  # 1-D spectra, whitening and curve-to-grid helpers
+    "torch-grid-utils",  # fftfreq_grid
     "torch-so3>=0.6.0",  # HierarchicalS2Grid: HEALPix orientation grids
     "healpy; platform_system != 'Windows'",
     "roma",

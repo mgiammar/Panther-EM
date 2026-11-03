@@ -6,8 +6,13 @@ lives in :mod:`.stage`).
     template = Template.from_hdf5("decomp.h5", device="cuda:0")
     bound = ErrorModel.from_result(template.result)
     stages = [
-        Stage.create([(0, 0, 32, 32)], precision="fp16", orientations=1, planes=(5,),
-                     decision=Decision(7.8, bound, absorb_radius=1)),
+        Stage.create(
+            [(0, 0, 32, 32)],
+            precision="fp16",
+            orientations=1,
+            planes=(5,),
+            decision=Decision(7.8, bound, absorb_radius=1),
+        ),
         Stage.create([(0, 0, 64, 128)], decision=Decision(7.8, bound)),
     ]
     searcher = Searcher(template, stages, n_defocus=11)
@@ -26,11 +31,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Literal, TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
+from tqdm import tqdm
 
-from panther_em.inference.search.decision import Decision, PixelLabel
+from panther_em.inference.search.decision import PixelLabel
 from panther_em.inference.search.executor import Executor, plan_memory, plan_stage
 from panther_em.inference.search.features import FeatureStore
 from panther_em.inference.search.featurize import featurize as _featurize
@@ -47,8 +53,6 @@ from panther_em.inference.search.types import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
-
-    import numpy as np
 
     from panther_em.inference.search.features import Residency
     from panther_em.inference.search.featurize import Featurize, LoopOrder
@@ -192,7 +196,9 @@ class Searcher:
             found = healpix_ipix(self.space)
             self.ipix = None if found is None else found[1]
         self.executor = Executor(
-            template.device, template.weights, prepared_budget=self.execution.prepared_budget
+            template.device,
+            template.weights,
+            prepared_budget=self.execution.prepared_budget,
         )
         self._validate()
 
@@ -208,12 +214,18 @@ class Searcher:
             if stage.precision is Precision.FP16 and not self.executor.is_cuda:
                 raise ValueError(f"stage {i}: fp16 needs a CUDA device")
             template_ids, defocus_ids = stage.hypothesis_ids(self.space, self.ipix)
-            if defocus_ids is not None and int(defocus_ids.max()) >= self.space.n_defocus:
+            if (
+                defocus_ids is not None
+                and int(defocus_ids.max()) >= self.space.n_defocus
+            ):
                 raise ValueError(
                     f"stage {i}: planes {stage.planes} exceed the {self.space.n_defocus} "
                     "defocus plane(s) of the searcher"
                 )
-            if template_ids is not None and int(template_ids.max()) >= self.space.n_templates:
+            if (
+                template_ids is not None
+                and int(template_ids.max()) >= self.space.n_templates
+            ):
                 raise ValueError(f"stage {i}: orientation ids exceed the template's")
 
     @property
@@ -262,7 +274,9 @@ class SearchSession:
             )
         self.searcher = searcher
         self.images = images
-        self.geometry = SearchGeometry.from_images(images, searcher.template.template_shape)
+        self.geometry = SearchGeometry.from_images(
+            images, searcher.template.template_shape
+        )
         exe = searcher.execution
         initial = PixelSelection.from_mask(self.geometry, images.mask)
         self.ledger = PixelLedger(
@@ -340,18 +354,25 @@ class SearchSession:
             )
             store.copy_stream = executor.copy
         else:
-            keep = torch.isin(store.column_index, pixels.index.to(store.column_index.device))
+            keep = torch.isin(
+                store.column_index, pixels.index.to(store.column_index.device)
+            )
             if (
                 not bool(keep.all())
                 or store.block_pixels != block_pixels
                 or store.residency != residency
             ):
-                store = store.subset(keep, block_pixels=block_pixels, residency=residency)
+                store = store.subset(
+                    keep, block_pixels=block_pixels, residency=residency
+                )
                 store.copy_stream = executor.copy
             if not torch.equal(
-                schedule.column_index, store.column_index.to(schedule.column_index.device)
+                schedule.column_index,
+                store.column_index.to(schedule.column_index.device),
             ):
-                raise RuntimeError("featurization column order diverged from the store's")
+                raise RuntimeError(
+                    "featurization column order diverged from the store's"
+                )
         self._store_tile = tile
         self._mark("store:ready")
         missing = [
@@ -372,7 +393,9 @@ class SearchSession:
                 store.writer(group),
                 schedule,
                 chunk=exe.cell_chunk,
-                order=exe.loop_order if store.residency == "pinned_host" else "cell_major",
+                order=(
+                    exe.loop_order if store.residency == "pinned_host" else "cell_major"
+                ),
                 stream=executor.featurize,
             )
         if missing and executor.featurize is not None:
@@ -421,9 +444,9 @@ class SearchSession:
         self._mark(f"stage{index}:planned")
         progress = None
         if exe.show_progress:
-            from tqdm import tqdm  # type: ignore[import-untyped]
-
-            bar = tqdm(total=store.n_pixels, desc=f"stage {index}", unit="px", unit_scale=True)
+            bar = tqdm(
+                total=store.n_pixels, desc=f"stage {index}", unit="px", unit_scale=True
+            )
             progress = bar.update
         maps = searcher.executor.run(store, plan, progress=progress)
         if exe.show_progress:
@@ -486,4 +509,3 @@ class SearchSession:
             stage_results=self.stage_results,
             elapsed_s=self.elapsed_s,
         )
-

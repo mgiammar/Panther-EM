@@ -254,6 +254,9 @@ def process_batch(
         projections_filtered_view,
         **warp_polar_kwargs,
     )
+    projections_polar = torch.as_tensor(
+        projections_polar, device=projections_filtered_view.device
+    )
 
     # NOTE: Pathing here for handling both real- and complex-valued projections
     # NOTE: Orthonormal transformation to preserve forward-backward scaling of features
