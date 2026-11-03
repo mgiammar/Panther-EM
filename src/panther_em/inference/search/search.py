@@ -43,6 +43,7 @@ stage whose decision runs the threshold test needs the image set's spectra
 
 from __future__ import annotations
 
+import functools
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -109,6 +110,11 @@ class ExecutionConfig:
         Featurization engine: tiled FFT correlation or box gather + planar GEMM.
         ``"auto"`` applies :func:`~panther_em.inference.search.featurize.choose_mode`
         (its constants ``DIRECT_MAX_DENSITY`` / ``DIRECT_MAX_BOX_EXCESS`` decide).
+    direct_precision : {"fp16", "tf32", "fp32"}
+        Operand precision of the direct engine's GEMM, independent of the stage's
+        (store) precision: fp16 operands accumulated and written in fp32 run on the
+        tensor cores at 3x the fp32 CUDA-core rate with 2.4e-5 relative feature
+        error; see ``featurize.DIRECT_GEMM_PRECISION``.
     loop_order : {"pixel_major", "cell_major"}
         Featurizer loop order of a pinned-host store (``pixel_major`` completes
         blocks tile by tile, which staging needs). A device-resident store is always
@@ -145,6 +151,7 @@ class ExecutionConfig:
     cell_chunk: int = 64
     image_batch: int = 1024
     featurize_mode: Literal["auto", "fft", "direct"] = "auto"
+    direct_precision: Literal["fp16", "tf32", "fp32"] = "fp16"
     loop_order: LoopOrder = "pixel_major"
     ledger_device: torch.device | str | None = None
     prepared_budget: int | None = None
@@ -202,7 +209,9 @@ class Searcher:
         self.space = HypothesisSpace.from_result(
             template.result, n_defocus=n_defocus, defocus_values=defocus_values
         )
-        self.featurize: Featurize = featurize or _featurize
+        self.featurize: Featurize = featurize or functools.partial(
+            _featurize, gemm_precision=self.execution.direct_precision
+        )
         # NESTED HEALPix ids of the template's orientations, when a stage samples
         # orientations by HEALPix level (None otherwise, or when not HEALPix)
         self.ipix = None

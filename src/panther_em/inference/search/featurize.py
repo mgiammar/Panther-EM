@@ -77,6 +77,12 @@ by bytes rather than by the kernel count ``chunk`` (32 cells would read the boxe
 DIRECT_IMAGE_CACHE = 8
 """Filtered images the direct engine keeps per plane (positions are image-major)."""
 
+DIRECT_GEMM_PRECISION: Precision = Precision.FP16
+"""Operand precision of the direct engine's GEMM, independent of the group's (store)
+precision: fp16 operands with fp32 accumulation and fp32 output run on the tensor
+cores at ~40 TMAC/s on an RTX 6000 Ada (2.4e-5 relative error on the features), tf32
+at ~27, the fp32 CUDA-core path at 13. On the CPU the GEMM is always fp32."""
+
 
 # --------------------------------------------------------------------------- #
 # Schedules
@@ -338,21 +344,40 @@ def _stream_scope(
     return torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
 
 
+def _gemm_dtype(precision: Precision, device: torch.device) -> torch.dtype:
+    """Operand dtype of the direct GEMM: fp16 for ``FP16`` on CUDA, else fp32."""
+    return (
+        torch.float16
+        if precision is Precision.FP16 and device.type == "cuda"
+        else torch.float32
+    )
+
+
 def _matmul(a: torch.Tensor, b: torch.Tensor, precision: Precision) -> torch.Tensor:
-    """``a @ b`` with tf32 enabled for that precision (CUDA only)."""
+    """``a @ b`` as float32.
+
+    On CUDA, fp16 operands are accumulated and written in fp32 (``out_dtype``) and
+    tf32 is enabled for ``TF32``; the CPU falls back to a plain ``@``.
+    """
+    if a.dtype is torch.float16 and a.is_cuda:
+        try:
+            return torch.mm(a, b, out_dtype=torch.float32)
+        except TypeError:  # torch without out_dtype: round the output to fp16 instead
+            return (a @ b).to(torch.float32)
     if precision is Precision.TF32 and a.is_cuda:
         prev = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = True
         try:
-            return a @ b
+            return (a @ b).to(torch.float32)
         finally:
             torch.backends.cuda.matmul.allow_tf32 = prev
-    return a @ b
+    return (a @ b).to(torch.float32)
 
 
 Featurize = Callable[..., None]
 """Signature of :func:`featurize`: ``(bank, images, group, writer, schedule, *, chunk,
-order, stream)``; tests inject stubs with the same signature."""
+order, stream)``; tests inject stubs with the same signature (engine-specific knobs
+such as ``gemm_precision`` are bound with ``functools.partial`` by the caller)."""
 
 
 def featurize(
@@ -365,11 +390,19 @@ def featurize(
     chunk: int = 64,
     order: LoopOrder = "pixel_major",
     stream: torch.cuda.Stream | None = None,
+    gemm_precision: Precision | str | None = None,
 ) -> None:
     """Featurize every cell of ``group`` for every scheduled column and plane."""
     if schedule.mode == "direct":
         featurize_direct(
-            bank, images, group, writer, schedule, chunk=chunk, stream=stream
+            bank,
+            images,
+            group,
+            writer,
+            schedule,
+            chunk=chunk,
+            stream=stream,
+            gemm_precision=gemm_precision,
         )
     else:
         featurize_grid(
@@ -547,10 +580,19 @@ class _BoxSource:
         n = int(tile.images.numel())
         if tuple(stack.shape[-2:]) == (self.k_h, self.k_w):
             return stack[inverse].reshape(n, -1)
-        rows = tile.rows.to(self.device)[:, None] + self._ar_h  # (B, kH)
-        cols = tile.cols.to(self.device)[:, None] + self._ar_w  # (B, kW)
-        boxes = stack[inverse[:, None, None], rows[:, :, None], cols[:, None, :]]
-        return boxes.reshape(n, -1)
+        rows = tile.rows.to(self.device)
+        cols = tile.cols.to(self.device)
+        if unique.numel() == 1:
+            windows = stack[0].unfold(0, self.k_h, 1).unfold(1, self.k_w, 1)
+            return windows[rows, cols].reshape(n, -1)
+        boxes = torch.empty(
+            (n, self.k_h * self.k_w), dtype=stack.dtype, device=self.device
+        )
+        for u in range(int(unique.numel())):
+            sel = inverse == u
+            windows = stack[u].unfold(0, self.k_h, 1).unfold(1, self.k_w, 1)
+            boxes[sel] = windows[rows[sel], cols[sel]].reshape(-1, self.k_h * self.k_w)
+        return boxes
 
 
 def _resident_planar(
@@ -586,23 +628,26 @@ def featurize_direct(
     chunk: int = 64,
     stream: torch.cuda.Stream | None = None,
     planar_fraction: float = DIRECT_PLANAR_FRACTION,
+    gemm_precision: Precision | str | None = None,
 ) -> None:
-    """``Y[p, cell] = sum_ij box_p[ij] conj(K_cell[ij])`` by one GEMM per position batch.
+    """``Y[p, cell] = sum_ij box_p[ij] conj(K_cell[ij])``, one GEMM per position batch.
 
-    The GEMM runs at the group's precision: fp32 (exact), tf32 (tensor cores, ~5e-4
-    relative error per product) or fp16 operands with fp32 accumulation (~4e-4
-    relative error on the features). With the rectangle's planar block resident in
-    the kernel bank (built once; see :data:`DIRECT_PLANAR_FRACTION` and
-    ``KernelBank.planar_block``) every batch is a single GEMM over all cells;
-    otherwise the cells are swept per batch in chunks of at least ``chunk`` cells,
-    widened to :data:`DIRECT_PLANAR_CHUNK_BYTES` of planar kernels.
+    The GEMM runs at ``gemm_precision`` (default :data:`DIRECT_GEMM_PRECISION`), not
+    at the group's precision, which only sets how the features are stored: fp16
+    operands with fp32 accumulation and output (tensor cores, 2.4e-5 relative error
+    on the features), tf32 (~5e-4 per product) or fp32 (CUDA cores, 3x slower than
+    fp16). With the rectangle's planar block resident in the kernel bank (built once;
+    see :data:`DIRECT_PLANAR_FRACTION` and ``KernelBank.planar_block``) every batch is
+    a single GEMM over all cells; otherwise the cells are swept per batch in chunks of
+    at least ``chunk`` cells, widened to :data:`DIRECT_PLANAR_CHUNK_BYTES` of planar
+    kernels.
     """
     if schedule.mode != "direct":
         raise ValueError("featurize_direct needs a direct-mode schedule")
     cells = group_cells(group)
     n_cells = int(cells.shape[0])
-    precision = group.precision
-    dtype = torch.float16 if precision is Precision.FP16 else torch.float32
+    precision = Precision.coerce(gemm_precision or DIRECT_GEMM_PRECISION)
+    dtype = _gemm_dtype(precision, bank.device)
     k_h, k_w = bank.template_shape
     planar_cell_bytes = 2 * k_h * k_w * torch.empty((), dtype=dtype).element_size()
     chunk = max(int(chunk), DIRECT_PLANAR_CHUNK_BYTES // planar_cell_bytes)
@@ -614,8 +659,7 @@ def featurize_direct(
                 boxes = source.boxes(batch)  # (B, kH kW)
                 columns = (batch.columns.start, batch.columns.stop)
                 if planar is not None:
-                    real_imag = _matmul(planar, boxes.T, precision).to(torch.float32)
-                    real_imag = real_imag.view(2, n_cells, -1)
+                    real_imag = _matmul(planar, boxes.T, precision).view(2, n_cells, -1)
                     features = torch.complex(real_imag[0], real_imag[1])
                     writer.write(slice(0, n_cells), columns, features, plane=plane)
                     continue
@@ -631,8 +675,10 @@ def _inner_products(
     bank: KernelBank, cells: torch.Tensor, boxes: torch.Tensor, precision: Precision
 ) -> torch.Tensor:
     """``(n_cells, B)`` complex inner products of boxes with the cells' kernels."""
-    dtype = torch.float16 if precision is Precision.FP16 else torch.float32
+    dtype = _gemm_dtype(precision, bank.device)
     planar = bank.planar(cells, dtype)  # (2, n_cells, kH*kW): [Re K ; -Im K]
     rhs = boxes.T.to(dtype)  # no copy when the caller already cast the boxes
-    real_imag = _matmul(planar, rhs, precision).to(torch.float32)  # (2, n_cells, B)
+    n_cells = planar.shape[1]
+    real_imag = _matmul(planar.reshape(2 * n_cells, -1), rhs, precision)
+    real_imag = real_imag.view(2, n_cells, -1)
     return torch.complex(real_imag[0], real_imag[1])

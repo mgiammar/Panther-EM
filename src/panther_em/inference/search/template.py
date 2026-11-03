@@ -598,13 +598,24 @@ class KernelBank:
         if cached is not None:
             return cached
         k0, m0, kx, mx = key[0]
-        cells = [(k, m) for k in range(k0, k0 + kx) for m in range(m0, m0 + mx)]
         n_pix = self.template_shape[0] * self.template_shape[1]
-        block = torch.empty((2, len(cells), n_pix), dtype=dtype, device=self.device)
-        for start in range(0, len(cells), self.build_chunk):
-            spatial = self.spatial(cells[start : start + self.build_chunk]).reshape(-1, n_pix)
-            block[0, start : start + spatial.shape[0]] = spatial.real.to(dtype)
-            block[1, start : start + spatial.shape[0]] = -spatial.imag.to(dtype)
+        block = torch.empty((2, kx * mx, n_pix), dtype=dtype, device=self.device)
+        # Kernels already in the spatial tiers are reused; the rest are built straight
+        # from the basis and not cached: a planar block is the only form the direct
+        # engine reads, so filling the spatial tier alongside (2 MiB per cell) would
+        # double the footprint and evict the FFT engine's kernels.
+        for ki, k in enumerate(range(k0, k0 + kx)):
+            ms = list(range(m0, m0 + mx))
+            found = {m: t for m in ms if (t := self._lookup((k, m))) is not None}
+            missing = [m for m in ms if m not in found]
+            for start in range(0, len(missing), self.build_chunk):
+                chunk = missing[start : start + self.build_chunk]
+                for m, kern in zip(chunk, self._build_group(k, chunk), strict=True):
+                    found[m] = kern
+            for mi, m in enumerate(ms):
+                flat = found[m].reshape(n_pix)
+                block[0, ki * mx + mi] = flat.real.to(dtype)
+                block[1, ki * mx + mi] = -flat.imag.to(dtype)
         if self._planar_enabled:
             self._planar_cache.put(key, block)  # evicted blocks are simply dropped
         return block

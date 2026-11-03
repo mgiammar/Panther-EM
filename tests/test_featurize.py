@@ -355,6 +355,38 @@ def test_direct_schedule_keeps_given_order(bank):
         schedule_tiles(geo, pixels, order=order[:-1])
 
 
+def test_direct_gemm_precision_and_planar_block_leave_the_spatial_tier_alone(bank):
+    from panther_em.inference.search.featurize import _gemm_dtype
+    from panther_em.inference.search.types import Precision
+
+    # fp16 operands only on CUDA; the CPU always multiplies in fp32
+    assert _gemm_dtype(Precision.FP16, torch.device("cpu")) is torch.float32
+    assert _gemm_dtype(Precision.FP32, torch.device("cpu")) is torch.float32
+    images, geo, pixels = _sparse_case(bank, n_selected=16)
+    bank.clear()
+    # the block is built straight from the basis: no spatial kernels are cached
+    sched, store, group = _run(bank, images, geo, pixels, RECT, block_pixels=8)
+    assert bank.has_planar_block(RECT, torch.float32)
+    assert bank.bytes() == (0, 0)
+    ref = _reference(bank, images.images, RECT)  # this does fill the spatial tier
+    expected = _expected_columns(ref, geo, sched.column_index).reshape(-1, 2, 3)
+    torch.testing.assert_close(
+        read_group(store, group, 0), expected, rtol=1e-4, atol=1e-5
+    )
+    # cells the spatial tier already holds are reused by a fresh block
+    bank._planar_cache.clear()
+    torch.testing.assert_close(
+        bank.planar_block(RECT, torch.float32).reshape(2, 6, -1)[0],
+        bank.spatial(_cells(RECT)).reshape(6, -1).real,
+    )
+    # an explicit precision is honoured (tf32 / fp32 are fp32 operands on the CPU)
+    sched, store2, group2 = _run(bank, images, geo, pixels, RECT, block_pixels=8)
+    featurize_direct(
+        bank, images, group2, store2.writer(group2), sched, gemm_precision="tf32"
+    )
+    torch.testing.assert_close(read_group(store2, group2, 0), expected, rtol=1e-4, atol=1e-5)
+
+
 def test_direct_engine_reuses_the_banks_planar_block(bank):
     images, geo, pixels = _sparse_case(bank, n_selected=20)
     sched, store, group = _run(bank, images, geo, pixels, RECT, block_pixels=8)
