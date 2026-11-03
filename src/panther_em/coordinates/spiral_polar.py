@@ -32,7 +32,7 @@ Derived constants
 ::
 
     t_max = 0.5 * (1 + 2 * c)
-    dt    = t_max / n_r
+    dt = t_max / n_r
 
 ``dt`` is the step size of a uniform parameter ``t`` from which physical radii are
 derived.
@@ -71,6 +71,7 @@ The first ring sits at ``t = dt`` so the Cartesian pixels nearest the centre map
 warp, :meth:`SpiralPolarTransform.pad_radial_axis` extends both axes.
 """
 
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -782,6 +783,26 @@ class SpiralPolarTransform(CoordinateTransform):
                 torch.as_tensor(a, device=device) for a in arrays
             )
         return self._continuation_cache[key]
+
+    def radial_continuation(
+        self, ks: Sequence[int], device: torch.device | str
+    ) -> torch.Tensor:
+        """``(len(ks), rows, n_nodes)`` complex64 continuation operators ``E_k``."""
+        untwist, nodes, weights, phases = self._continuation_tensors(
+            torch.device("cpu")
+        )
+        k_idx = torch.as_tensor(list(ks), dtype=torch.long)
+        rows, n_nodes = nodes.shape[0], untwist.shape[1]
+        out = torch.zeros((k_idx.numel(), rows, n_nodes), dtype=torch.complex128)
+
+        for j in range(nodes.shape[1]):
+            node = nodes[:, j]  # (rows,)
+            term = (
+                weights[None, :, j] * untwist[k_idx][:, node] * phases[k_idx]
+            )  # (K, rows)
+            out[:, torch.arange(rows), node] += term
+
+        return out.to(torch.complex64).to(device)
 
     def pad_radial_axis(
         self, image: np.ndarray | torch.Tensor

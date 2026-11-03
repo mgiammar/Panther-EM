@@ -23,6 +23,7 @@ from panther_em.decomposition.result import (
     SparseDecompositionResult,
 )
 from panther_em.inference.projection_reconstruction import ProjectionReconstructor
+from panther_em.inference.search.adjoint import AdjointBases, WarpAdjoint, build_bases
 from panther_em.inference.search.hypotheses import HypothesisSpace
 from panther_em.inference.search.types import KernelConfig, Rectangle
 
@@ -183,6 +184,10 @@ class KernelBank:
         # device-side pieces of the separable kernel build, resolved on first use
         self._sep: dict[str, Any] | None = None
         self._sep_resolved = False
+        # the adjoint-warp featurization (see adjoint.py), resolved on first use
+        self._adjoint: WarpAdjoint | None = None
+        self._adjoint_resolved = False
+        self._adjoint_bases: dict[tuple[int, int, int, int], AdjointBases] = {}
 
     # -- construction --------------------------------------------------------
 
@@ -625,6 +630,33 @@ class KernelBank:
         """Bytes of resident planar blocks."""
         return self._planar_cache.nbytes
 
+    # -- adjoint-warp featurization (features without Cartesian kernels) --------
+
+    def adjoint(self) -> WarpAdjoint | None:
+        """The transposed warp of this bank's kernels, or ``None`` if unsupported.
+
+        Built once per bank (one sparse ``(A2 R2, kH kW)`` matrix on the device); see
+        :mod:`panther_em.inference.search.adjoint`.
+        """
+        if not self._adjoint_resolved:
+            self._adjoint_resolved = True
+            self._adjoint = WarpAdjoint.build(
+                self.reconstructor.coordinate_transform, self.config, self.device
+            )
+        return self._adjoint
+
+    def adjoint_bases(self, rect: Rectangle) -> AdjointBases:
+        """Prefiltered polar vectors of ``rect`` for :meth:`adjoint` (cached)."""
+        adjoint = self.adjoint()
+        if adjoint is None:
+            raise ValueError("the adjoint-warp featurization is unsupported here")
+        key = (int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
+        bases = self._adjoint_bases.get(key)
+        if bases is None:
+            bases = build_bases(adjoint, self.reconstructor, key)
+            self._adjoint_bases[key] = bases
+        return bases
+
     def bytes(self) -> tuple[int, int]:
         """``(device_bytes, host_bytes)`` of cached spatial kernels."""
         return self._device_cache.nbytes, self._host_cache.nbytes
@@ -637,6 +669,7 @@ class KernelBank:
         self._host_cache.clear()
         self._spectral_cache.clear()
         self._planar_cache.clear()
+        self._adjoint_bases.clear()
 
 
 class WeightSource:

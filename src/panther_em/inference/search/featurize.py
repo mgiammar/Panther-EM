@@ -8,11 +8,14 @@ a store group for every scheduled item and defocus plane with that engine:
     Tiled overlap-save FFT correlation on image grids (:func:`featurize_grid`): one
     inverse FFT per cell and tile, whatever the number of selected pixels.
 ``direct``
-    Patch gather + planar GEMM (:func:`featurize_direct`): the template-sized box
-    under every selected position, from any image set -- a sparse selection in a
+    Patch gather + per-box contraction (:func:`featurize_direct`): the template-sized
+    box under every selected position, from any image set -- a sparse selection in a
     micrograph, a particle stack at its center pixel, or a slightly larger stack at
-    every valid offset -- times the ``[Re K; -Im K]`` kernels, at tensor-core rate.
-    Its cost is one GEMM row per position.
+    every valid offset. The ``adjoint`` engine scatters each box onto the polar grid
+    through the transposed kernel warp and contracts it with the prefiltered polar
+    vectors (:mod:`~panther_em.inference.search.adjoint`: no Cartesian kernels at
+    all); the ``planar`` engine multiplies by the ``[Re K; -Im K]`` kernels at
+    tensor-core rate. Both cost one row per position.
 
 :func:`choose_mode` picks between them from the constants at the top of this module.
 """
@@ -42,6 +45,7 @@ if TYPE_CHECKING:
 
 LoopOrder = Literal["pixel_major", "cell_major"]
 Mode = Literal["fft", "direct"]
+DirectEngine = Literal["adjoint", "planar"]
 
 # --------------------------------------------------------------------------- #
 # Engine selection constants
@@ -78,10 +82,22 @@ DIRECT_IMAGE_CACHE = 8
 """Filtered images the direct engine keeps per plane (positions are image-major)."""
 
 DIRECT_GEMM_PRECISION: Precision = Precision.FP16
-"""Operand precision of the direct engine's GEMM, independent of the group's (store)
-precision: fp16 operands with fp32 accumulation and fp32 output run on the tensor
-cores at ~40 TMAC/s on an RTX 6000 Ada (2.4e-5 relative error on the features), tf32
-at ~27, the fp32 CUDA-core path at 13. On the CPU the GEMM is always fp32."""
+"""Operand precision of the direct engine, independent of the group's (store)
+precision. Planar GEMM: fp16 operands with fp32 accumulation and fp32 output run on
+the tensor cores at ~40 TMAC/s on an RTX 6000 Ada (2.4e-5 relative error on the
+features), tf32 at ~27, the fp32 CUDA-core path at 13. Adjoint engine: fp16 runs the
+scatter and the angular GEMM in half precision (5e-4 relative on the features, 19 us
+per 512-box position at 5760 cells), fp32 is exact to 1e-6 (33 us). On the CPU
+everything is fp32."""
+
+DIRECT_ENGINE: DirectEngine = "adjoint"
+"""Default per-box contraction of the direct engine (see the module docstring); the
+adjoint falls back to the planar GEMM where the kernel warp is not mirrored."""
+
+DIRECT_ADJOINT_CHUNK = 64
+"""Positions per sparse scatter of the adjoint engine: its padded polar images are
+3 MB per position in fp32, and the scatter is fastest while a chunk's boxes stay in
+L2 (64: 17.6 us per position, 512: 22 us)."""
 
 
 # --------------------------------------------------------------------------- #
@@ -436,6 +452,7 @@ def featurize(
     order: LoopOrder = "pixel_major",
     stream: torch.cuda.Stream | None = None,
     gemm_precision: Precision | str | None = None,
+    direct_engine: DirectEngine = DIRECT_ENGINE,
 ) -> None:
     """Featurize every cell of ``group`` for every scheduled column and plane."""
     if schedule.mode == "direct":
@@ -448,6 +465,7 @@ def featurize(
             chunk=chunk,
             stream=stream,
             gemm_precision=gemm_precision,
+            engine=direct_engine,
         )
     else:
         featurize_grid(
@@ -701,18 +719,25 @@ def featurize_direct(
     stream: torch.cuda.Stream | None = None,
     planar_fraction: float = DIRECT_PLANAR_FRACTION,
     gemm_precision: Precision | str | None = None,
+    engine: DirectEngine = DIRECT_ENGINE,
 ) -> None:
-    """``Y[p, cell] = sum_ij box_p[ij] conj(K_cell[ij])``, one GEMM per position batch.
+    """``Y[p, cell] = sum_ij box_p[ij] conj(K_cell[ij])`` for every position batch.
 
-    The GEMM runs at ``gemm_precision`` (default :data:`DIRECT_GEMM_PRECISION`), not
-    at the group's precision, which only sets how the features are stored: fp16
-    operands with fp32 accumulation and output (tensor cores, 2.4e-5 relative error
-    on the features), tf32 (~5e-4 per product) or fp32 (CUDA cores, 3x slower than
-    fp16). With the rectangle's planar block resident in the kernel bank (built once;
-    see :data:`DIRECT_PLANAR_FRACTION` and ``KernelBank.planar_block``) every batch is
-    a single GEMM over all cells; otherwise the cells are swept per batch in chunks of
+    ``engine="adjoint"`` (the default) never forms the Cartesian kernels: each chunk of
+    :data:`DIRECT_ADJOINT_CHUNK` boxes is scattered onto the polar grid through the
+    bank's :meth:`~KernelBank.adjoint` and contracted with the rectangle's
+    :meth:`~KernelBank.adjoint_bases`. It falls back to ``"planar"`` when the bank
+    cannot mirror its warp (``KernelBank.adjoint()`` is ``None``).
+
+    ``engine="planar"`` multiplies the boxes by the ``[Re K; -Im K]`` kernels. With the
+    rectangle's planar block resident in the kernel bank (built once; see
+    :data:`DIRECT_PLANAR_FRACTION` and ``KernelBank.planar_block``) every batch is a
+    single GEMM over all cells; otherwise the cells are swept per batch in chunks of
     at least ``chunk`` cells, widened to :data:`DIRECT_PLANAR_CHUNK_BYTES` of planar
     kernels.
+
+    Both run at ``gemm_precision`` (default :data:`DIRECT_GEMM_PRECISION`), not at
+    the group's precision, which only sets how the features are stored.
     """
     if schedule.mode != "direct":
         raise ValueError("featurize_direct needs a direct-mode schedule")
@@ -723,13 +748,28 @@ def featurize_direct(
     k_h, k_w = bank.template_shape
     planar_cell_bytes = 2 * k_h * k_w * torch.empty((), dtype=dtype).element_size()
     chunk = max(int(chunk), DIRECT_PLANAR_CHUNK_BYTES // planar_cell_bytes)
+    adjoint = bank.adjoint() if engine == "adjoint" else None
+    bases = bank.adjoint_bases(group.rect) if adjoint is not None else None
     with _stream_scope(stream):
-        planar = _resident_planar(bank, group.rect, dtype, planar_fraction)
+        planar = (
+            None
+            if adjoint is not None
+            else _resident_planar(bank, group.rect, dtype, planar_fraction)
+        )
         for plane in group.planes:
             source = _BoxSource(bank, images, plane, dtype)
             for batch in schedule.items:
                 boxes = source.boxes(batch)  # (B, kH kW)
                 columns = (batch.columns.start, batch.columns.stop)
+                if adjoint is not None and bases is not None:
+                    for i0 in range(0, int(boxes.shape[0]), DIRECT_ADJOINT_CHUNK):
+                        part = boxes[i0 : i0 + DIRECT_ADJOINT_CHUNK]
+                        features = bases.features(
+                            adjoint.apply(part, precision), precision
+                        )
+                        cols = (columns[0] + i0, columns[0] + i0 + int(part.shape[0]))
+                        writer.write(slice(0, n_cells), cols, features, plane=plane)
+                    continue
                 if planar is not None:
                     real_imag = _matmul(planar, boxes.T, precision).view(2, n_cells, -1)
                     features = torch.complex(real_imag[0], real_imag[1])

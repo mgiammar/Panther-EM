@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import warnings
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -41,6 +41,9 @@ from panther_em.utils.warp_backends import (
     ensure_device,
     get_warp_function,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -410,6 +413,12 @@ class CoordinateTransform(ABC):
         """Largest radial coordinate inside the transform's support (``None`` = all)."""
         return None
 
+    def radial_continuation(
+        self, ks: Sequence[int], device: torch.device | str
+    ) -> torch.Tensor | None:
+        """Operator of the rows :meth:`pad_radial_axis` prepends to ``a_k (x) c``."""
+        return None
+
     def _pad_radial_axis(
         self, image: np.ndarray | torch.Tensor
     ) -> tuple[np.ndarray | torch.Tensor, int]:
@@ -776,6 +785,13 @@ class GridTransform(CoordinateTransform):
         """Delegate to :attr:`source_transform` (no masking without one)."""
         source = self.source_transform
         return None if source is None else source.outer_radius_index()
+
+    def radial_continuation(
+        self, ks: Sequence[int], device: torch.device | str
+    ) -> torch.Tensor | None:
+        """Delegate to :attr:`source_transform` (``None`` without one)."""
+        source = self.source_transform
+        return None if source is None else source.radial_continuation(ks, device)
 
     @classmethod
     def from_transform(cls, transform: CoordinateTransform) -> GridTransform:

@@ -71,6 +71,7 @@ def _run(
     mode=None,
     column_order=None,
     planar_fraction=None,
+    engine=None,
 ):
     sched = schedule_tiles(
         geo, pixels, tile=tile, image_batch=image_batch, mode=mode, order=column_order
@@ -84,10 +85,11 @@ def _run(
         device="cpu",
     )
     group = store.add_group(rect, "fp32")
-    if planar_fraction is not None:
+    if planar_fraction is not None or engine is not None:
+        kwargs = {} if planar_fraction is None else {"planar_fraction": planar_fraction}
         featurize_direct(
             bank, images, group, store.writer(group), sched, chunk=chunk,
-            planar_fraction=planar_fraction,
+            engine=engine or "planar", **kwargs,
         )
     else:
         featurize(bank, images, group, store.writer(group), sched, chunk=chunk, order=order)
@@ -399,7 +401,9 @@ def test_direct_gemm_precision_and_planar_block_leave_the_spatial_tier_alone(ban
     images, geo, pixels = _sparse_case(bank, n_selected=16)
     bank.clear()
     # the block is built straight from the basis: no spatial kernels are cached
-    sched, store, group = _run(bank, images, geo, pixels, RECT, block_pixels=8)
+    sched, store, group = _run(
+        bank, images, geo, pixels, RECT, block_pixels=8, engine="planar"
+    )
     assert bank.has_planar_block(RECT, torch.float32)
     assert bank.bytes() == (0, 0)
     ref = _reference(bank, images.images, RECT)  # this does fill the spatial tier
@@ -414,25 +418,68 @@ def test_direct_gemm_precision_and_planar_block_leave_the_spatial_tier_alone(ban
         bank.spatial(_cells(RECT)).reshape(6, -1).real,
     )
     # an explicit precision is honoured (tf32 / fp32 are fp32 operands on the CPU)
-    sched, store2, group2 = _run(bank, images, geo, pixels, RECT, block_pixels=8)
+    sched, store2, group2 = _run(
+        bank, images, geo, pixels, RECT, block_pixels=8, engine="planar"
+    )
     featurize_direct(
-        bank, images, group2, store2.writer(group2), sched, gemm_precision="tf32"
+        bank,
+        images,
+        group2,
+        store2.writer(group2),
+        sched,
+        gemm_precision="tf32",
+        engine="planar",
     )
     torch.testing.assert_close(read_group(store2, group2, 0), expected, rtol=1e-4, atol=1e-5)
 
 
 def test_direct_engine_reuses_the_banks_planar_block(bank):
     images, geo, pixels = _sparse_case(bank, n_selected=20)
-    sched, store, group = _run(bank, images, geo, pixels, RECT, block_pixels=8)
+    sched, store, group = _run(
+        bank, images, geo, pixels, RECT, block_pixels=8, engine="planar"
+    )
     assert sched.mode == "direct"
     assert bank.has_planar_block(RECT, torch.float32)
     block = bank.planar_block(RECT, torch.float32)
     nbytes = bank.planar_bytes
     # a second featurization (another store) reuses the block: nothing rebuilt
-    sched2, store2, group2 = _run(bank, images, geo, pixels, RECT, block_pixels=8)
+    _, store2, group2 = _run(
+        bank, images, geo, pixels, RECT, block_pixels=8, engine="planar"
+    )
     assert bank.planar_block(RECT, torch.float32) is block and bank.planar_bytes == nbytes
     torch.testing.assert_close(read_group(store2, group2, 0), read_group(store, group, 0))
     # planar_fraction=0 takes the chunked path and leaves the tier alone
     bank.clear()
     _run(bank, images, geo, pixels, RECT, block_pixels=8, planar_fraction=0.0)
     assert not bank.has_planar_block(RECT, torch.float32) and bank.planar_bytes == 0
+
+
+def test_direct_adjoint_engine_matches_the_planar_engine_and_reference(bank):
+    images, geo, pixels = _sparse_case(bank, n_selected=37)
+    bank.clear()
+    sched, store, group = _run(
+        bank, images, geo, pixels, RECT, block_pixels=8, image_batch=10,
+        engine="adjoint",
+    )
+    # no Cartesian kernels, no planar block: the boxes go through the warp's adjoint
+    assert bank.adjoint() is not None
+    assert not bank.has_planar_block(RECT, torch.float32) and bank.bytes() == (0, 0)
+    ref = _reference(bank, images.images, RECT)
+    expected = _expected_columns(ref, geo, sched.column_index).reshape(-1, 2, 3)
+    torch.testing.assert_close(
+        read_group(store, group, 0), expected, rtol=1e-4, atol=1e-5
+    )
+    _, store2, group2 = _run(
+        bank, images, geo, pixels, RECT, block_pixels=8, image_batch=10,
+        engine="planar",
+    )
+    torch.testing.assert_close(
+        read_group(store2, group2, 0), read_group(store, group, 0), rtol=1e-5, atol=1e-6
+    )
+    # the default engine of featurize() is the adjoint
+    _, store3, group3 = _run(
+        bank, images, geo, pixels, RECT, block_pixels=8, image_batch=10
+    )
+    torch.testing.assert_close(
+        read_group(store3, group3, 0), read_group(store, group, 0)
+    )

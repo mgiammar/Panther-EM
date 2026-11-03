@@ -79,7 +79,12 @@ if TYPE_CHECKING:
 
     from panther_em.inference.search.executor import MemoryPlan
     from panther_em.inference.search.features import Residency
-    from panther_em.inference.search.featurize import Featurize, LoopOrder, TileSpec
+    from panther_em.inference.search.featurize import (
+        DirectEngine,
+        Featurize,
+        LoopOrder,
+        TileSpec,
+    )
     from panther_em.inference.search.template import Template
     from panther_em.inference.search.types import BatchShape, Rectangle
 
@@ -122,11 +127,19 @@ class ExecutionConfig:
         Featurization engine: tiled FFT correlation or box gather + planar GEMM.
         ``"auto"`` applies :func:`~panther_em.inference.search.featurize.choose_mode`
         (its constants ``DIRECT_MAX_DENSITY`` / ``DIRECT_MAX_BOX_EXCESS`` decide).
+    direct_engine : {"adjoint", "planar"}
+        How the direct engine turns boxes into features: ``"adjoint"`` scatters each
+        box onto the polar grid through the transposed warp and contracts it with the
+        prefiltered polar vectors (no Cartesian kernels, 2-3.5x the planar GEMM's
+        speed; falls back to ``"planar"`` where the transform/config is not
+        mirrored), ``"planar"`` the ``[Re K; -Im K]`` kernel GEMM.
     direct_precision : {"fp16", "tf32", "fp32"}
-        Operand precision of the direct engine's GEMM, independent of the stage's
-        (store) precision: fp16 operands accumulated and written in fp32 run on the
-        tensor cores at 3x the fp32 CUDA-core rate with 2.4e-5 relative feature
-        error; see ``featurize.DIRECT_GEMM_PRECISION``.
+        Operand precision of the direct engine, independent of the stage's (store)
+        precision. Planar GEMM: fp16 operands accumulated and written in fp32 run on
+        the tensor cores at 3x the fp32 CUDA-core rate with 2.4e-5 relative feature
+        error. Adjoint engine: fp16 runs the scatter and the angular GEMM in half
+        precision (5e-4 relative, 1.7x the fp32 path), fp32 is exact to 1e-6; see
+        ``featurize.DIRECT_GEMM_PRECISION``.
     loop_order : {"pixel_major", "cell_major"}
         Featurizer loop order of a pinned-host store (``pixel_major`` completes
         blocks tile by tile, which staging needs). A device-resident store is always
@@ -173,6 +186,7 @@ class ExecutionConfig:
     cell_chunk: int = 64
     image_batch: int = 1024
     featurize_mode: Literal["auto", "fft", "direct"] = "auto"
+    direct_engine: DirectEngine = "adjoint"
     direct_precision: Literal["fp16", "tf32", "fp32"] = "fp16"
     loop_order: LoopOrder = "pixel_major"
     ledger_device: torch.device | str | None = None
@@ -246,7 +260,9 @@ class Searcher:
             template.result, n_defocus=n_defocus, defocus_values=defocus_values
         )
         self.featurize: Featurize = featurize or functools.partial(
-            _featurize, gemm_precision=self.execution.direct_precision
+            _featurize,
+            gemm_precision=self.execution.direct_precision,
+            direct_engine=self.execution.direct_engine,
         )
         # NESTED HEALPix ids of the template's orientations, when a stage samples
         # orientations by HEALPix level (None otherwise, or when not HEALPix)
