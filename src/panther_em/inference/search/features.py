@@ -534,7 +534,9 @@ class ReadyBlock:
             self._release(done)
 
 
-def _direct_blocks(store: FeatureStore, groups: Sequence[ColumnGroup]) -> Iterator[ReadyBlock]:
+def _direct_blocks(
+    store: FeatureStore, groups: Sequence[ColumnGroup]
+) -> Iterator[ReadyBlock]:
     """Device residency: the store's blocks *are* the operands (no copy)."""
     for i in range(store.n_blocks):
         start, stop = store.block_range(i)
@@ -547,7 +549,9 @@ def _direct_blocks(store: FeatureStore, groups: Sequence[ColumnGroup]) -> Iterat
         )
 
 
-def _pinned_blocks(store: FeatureStore, groups: Sequence[ColumnGroup]) -> Iterator[ReadyBlock]:
+def _pinned_blocks(
+    store: FeatureStore, groups: Sequence[ColumnGroup]
+) -> Iterator[ReadyBlock]:
     """Pinned-host residency: blocks stream through ``store.n_slots`` device slots.
 
     Block ``i`` is copied (on the store's copy stream) into slot ``i % n_slots`` as
@@ -556,7 +560,9 @@ def _pinned_blocks(store: FeatureStore, groups: Sequence[ColumnGroup]) -> Iterat
     """
     n_slots, n_blocks = store.n_slots, store.n_blocks
     slots = {
-        g.id: [torch.empty_like(g.blocks[0], device=store.device) for _ in range(n_slots)]
+        g.id: [
+            torch.empty_like(g.blocks[0], device=store.device) for _ in range(n_slots)
+        ]
         for g in groups
     }
     free: list[torch.cuda.Event | None] = [None] * n_slots
@@ -726,7 +732,9 @@ class FeatureStore:
         residency: Residency = "device",
     ) -> None:
         if residency not in ("device", "pinned_host"):
-            raise ValueError(f"residency must be 'device' or 'pinned_host', got {residency!r}")
+            raise ValueError(
+                f"residency must be 'device' or 'pinned_host', got {residency!r}"
+            )
         if column_index.dim() != 1 or int(column_index.numel()) != len(pixels):
             raise ValueError("column_index must be a (P,) permutation of pixels.index")
         if block_pixels < 1:
@@ -861,6 +869,22 @@ class FeatureStore:
     def writer(self, group: ColumnGroup) -> BlockWriter:
         """A writer for ``group``."""
         return BlockWriter(self, group)
+
+    def drop_group(self, group: ColumnGroup) -> None:
+        """Release ``group``'s blocks (and staging) and forget it.
+
+        Ids are positions in ``groups``, so only the last group can be dropped: a
+        plane-by-plane stage adds and drops one group per pass, and the next pass's
+        group takes the same id (which keeps the captured hypothesis loop valid).
+        """
+        if not self.groups or self.groups[-1] is not group:
+            raise ValueError("only the most recently added group can be dropped")
+        for key in [k for k in self._staging if k[0] == group.id]:
+            self._staging.pop(key)
+            self._staged_written.pop(key, None)
+        group.blocks = []
+        group.complete = False
+        self.groups.pop()
 
     def blocks(self, groups: Sequence[ColumnGroup]) -> Iterator[ReadyBlock]:
         """Iterate the blocks of ``groups`` in order, each ready on the device."""

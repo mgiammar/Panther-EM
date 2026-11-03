@@ -299,8 +299,13 @@ class HypothesisSet:
         return self.template_ids is None
 
     @property
-    def signature(self) -> tuple:
-        """Hashable identity for caches (graphs, prepared weights)."""
+    def template_signature(self) -> tuple:
+        """Hashable identity of the selected template rows (plane independent).
+
+        Prepared weights and captured hypothesis loops depend on which rows are
+        searched and how they are batched, not on which defocus planes: single-plane
+        passes of a plane-by-plane stage share them.
+        """
         t = (
             None
             if self.template_ids is None
@@ -311,12 +316,15 @@ class HypothesisSet:
                 hash(self.template_ids.numpy().tobytes()),
             )
         )
+        return (self.space.n_filters, self.space.n_orientations, t)
+
+    @property
+    def signature(self) -> tuple:
+        """Hashable identity for caches (graphs, prepared weights)."""
         d = None if self.defocus_ids is None else tuple(self.defocus_ids.tolist())
         return (
             self.space.n_defocus,
-            self.space.n_filters,
-            self.space.n_orientations,
-            t,
+            *self.template_signature,
             d,
             self.hyp_batch,
             self.n_psi,

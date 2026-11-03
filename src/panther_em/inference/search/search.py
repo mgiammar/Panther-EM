@@ -52,7 +52,15 @@ import torch
 from tqdm import tqdm
 
 from panther_em.inference.search.decision import PixelLabel
-from panther_em.inference.search.executor import Executor, plan_memory, plan_stage
+from panther_em.inference.search.executor import (
+    Executor,
+    StageMaps,
+    feature_bytes_per_pixel,
+    merge_stage_maps,
+    plan_memory,
+    plan_stage,
+    resident_groups,
+)
 from panther_em.inference.search.features import FeatureStore
 from panther_em.inference.search.featurize import featurize as _featurize
 from panther_em.inference.search.featurize import schedule_tiles
@@ -69,6 +77,7 @@ from panther_em.inference.search.types import (
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
 
+    from panther_em.inference.search.executor import MemoryPlan
     from panther_em.inference.search.features import Residency
     from panther_em.inference.search.featurize import Featurize, LoopOrder, TileSpec
     from panther_em.inference.search.template import Template
@@ -130,16 +139,26 @@ class ExecutionConfig:
     show_progress : bool
         Print per-stage progress bars.
     store_residency : {"auto", "device", "pinned_host"}
-        Where a stage's feature store lives; ``"auto"`` keeps it on the device when it
-        fits ``device_store_fraction`` of the free memory and otherwise pins it on
-        the host and streams blocks.
+        Where a stage's feature store lives. ``"auto"`` keeps it on the device: a
+        stage whose store would exceed ``device_store_fraction`` of the free memory
+        runs in *bands*, row-contiguous chunks of its pixels whose store fits, each
+        featurized (one band-shaped FFT per cell) and reduced in turn, and the maps
+        are concatenated before the decision. ``"pinned_host"`` instead pins one
+        whole-selection store on the host and streams its blocks.
     l2_target : int, optional
         Bytes of spectrum per contraction to keep L2-resident (the hypothesis batch
-        follows from it); defaults to two thirds of the device's L2.
+        follows from it); defaults to a quarter of the device's L2.
     block_bytes_max : int
         Byte budget of one feature-store block (256 MiB).
     device_store_fraction : float
         See ``store_residency``.
+    plane_major : bool
+        Search a multi-plane stage one defocus plane at a time: each pass treats the
+        plane as its own image, featurizing and holding only that plane's features
+        (a third of a three-plane store), and the per-pixel maxima, means and
+        variances are merged across passes outside the kernel. The captured loop and
+        prepared weights are shared by the passes. Off, every plane is resident at
+        once and the kernel sweeps them in one loop.
     trace : bool
         Synchronise the device at every session mark (``SearchSession.marks``) so
         the marks' wall-clock deltas are per-phase device times.
@@ -163,7 +182,21 @@ class ExecutionConfig:
     l2_target: int | None = None
     block_bytes_max: int = 256 << 20
     device_store_fraction: float = 0.5
+    plane_major: bool = True
     trace: bool = False
+
+
+def _concat_stage_maps(parts: Sequence[StageMaps]) -> StageMaps:
+    """Maps of disjoint pixel bands, concatenated in band order."""
+    return StageMaps(
+        mip=torch.cat([p.mip for p in parts]),
+        mean=torch.cat([p.mean for p in parts]),
+        variance=torch.cat([p.variance for p in parts]),
+        zscore=torch.cat([p.zscore for p in parts]),
+        best_virtual=torch.cat([p.best_virtual for p in parts]),
+        best_psi=torch.cat([p.best_psi for p in parts]),
+        n_evaluated=parts[0].n_evaluated,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -364,11 +397,15 @@ class SearchSession:
         rectangles: Sequence[Rectangle],
         planes: Sequence[int],
         residency: Residency = "device",
+        pixels: PixelSelection | None = None,
     ) -> FeatureStore:
-        """Re-block / compact the store to the current pixels; featurize what is new."""
+        """Re-block / compact the store to ``pixels`` (default: the current ones).
+
+        Featurizes whatever the store does not hold yet.
+        """
         exe = self.searcher.execution
         executor = self.searcher.executor
-        pixels = self.pixels
+        pixels = self.pixels if pixels is None else pixels
         store = self.store
         rects = tuple(tuple(int(v) for v in r) for r in rectangles)
         reusable = store is not None and any(
@@ -459,6 +496,47 @@ class SearchSession:
         self.store = store
         return store
 
+    def _bands(
+        self, stage: Stage, pass_planes: Sequence[int], gemm_pixels: int
+    ) -> list[PixelSelection]:
+        """Row-contiguous chunks of the stage's pixels whose store fits the device.
+
+        One band (the whole selection) unless the store is ``"auto"`` resident on a
+        CUDA device and a pass's store would exceed ``device_store_fraction`` of the
+        free memory; then the sorted selection is cut into equal chunks of a multiple
+        of ``gemm_pixels`` pixels that fit, each a band of rows the FFT engine covers
+        with one fitted tile.
+        """
+        exe = self.searcher.execution
+        executor = self.searcher.executor
+        pixels = self.pixels
+        if (
+            exe.store_residency != "auto"
+            or not executor.is_cuda
+            or len(pixels) == 0
+            or not executor.free_bytes
+        ):
+            return [pixels]
+        per_pixel = feature_bytes_per_pixel(
+            resident_groups(stage, pass_planes, self.store)
+        )
+        limit = int(executor.free_bytes * exe.device_store_fraction)
+        if per_pixel * len(pixels) <= limit:
+            return [pixels]
+        fit = max(
+            gemm_pixels, (limit // max(1, per_pixel)) // gemm_pixels * gemm_pixels
+        )
+        n_bands = -(-len(pixels) // fit)
+        per_band = -(-len(pixels) // n_bands)
+        per_band = -(-per_band // gemm_pixels) * gemm_pixels
+        index = pixels.index
+        if not bool(torch.all(index[1:] >= index[:-1])):
+            index = torch.sort(index).values
+        return [
+            PixelSelection(index[i : i + per_band], self.geometry)
+            for i in range(0, int(index.numel()), per_band)
+        ]
+
     def _run_stage(self, index: int) -> StageResult:
         searcher = self.searcher
         exe = searcher.execution
@@ -466,57 +544,121 @@ class SearchSession:
         t0 = time.perf_counter()
         self._mark(f"stage{index}:start")
         template_ids, defocus_ids = stage.hypothesis_ids(searcher.space, searcher.ipix)
-        memory = plan_memory(
-            searcher.executor,
-            stage,
-            n_pixels=len(self.pixels),
-            space=searcher.space,
-            template_ids=template_ids,
-            defocus_ids=defocus_ids,
-            batch=exe.batch,
-            block_pixels=exe.block_pixels,
-            use_cuda_graph=exe.use_cuda_graph,
-            use_fused_kernel=exe.use_fused_kernel,
-            store=self.store,
-            residency=exe.store_residency,
-            l2_target=exe.l2_target,
-            block_bytes_max=exe.block_bytes_max,
-            device_store_fraction=exe.device_store_fraction,
-        )
+
+        searcher.executor.refresh_free_bytes()
+
+        def memory_for(
+            planes: torch.Tensor | None, n_pixels: int | None = None
+        ) -> MemoryPlan:
+            return plan_memory(
+                searcher.executor,
+                stage,
+                n_pixels=len(self.pixels) if n_pixels is None else n_pixels,
+                space=searcher.space,
+                template_ids=template_ids,
+                defocus_ids=planes,
+                batch=exe.batch,
+                block_pixels=exe.block_pixels,
+                use_cuda_graph=exe.use_cuda_graph,
+                use_fused_kernel=exe.use_fused_kernel,
+                store=self.store,
+                residency=exe.store_residency,
+                l2_target=exe.l2_target,
+                block_bytes_max=exe.block_bytes_max,
+                device_store_fraction=exe.device_store_fraction,
+            )
+
+        memory = memory_for(defocus_ids)
         hyps = memory.hyps
-        store = self._prepare_store(
-            memory.block_pixels,
-            stage.precision,
-            stage.rectangles,
-            hyps.defocus_planes(),
-            memory.residency,
-        )
-        if searcher.executor.is_cuda:
-            torch.cuda.synchronize(searcher.device)
-        t_featurized = time.perf_counter()
-        self._mark(f"stage{index}:featurized")
-        plan = plan_stage(searcher.executor, index, stage, store, memory)
-        self._mark(f"stage{index}:planned")
+        planes = hyps.defocus_planes()
+        # One pass per plane (the plane's features alone are resident), or one pass
+        # over every plane; a reused store already holding every plane runs in one.
+        passes: list[tuple[int, ...]]
+        if (
+            exe.plane_major
+            and len(planes) > 1
+            and (
+                self.store is None
+                or any(
+                    self.store.missing_planes(r, stage.precision, planes)
+                    for r in stage.rectangles
+                )
+            )
+        ):
+            passes = [(p,) for p in planes]
+        else:
+            passes = [planes]
+        bands = self._bands(stage, passes[0], memory.gemm_pixels)
         progress = None
         if exe.show_progress:
             bar = tqdm(
-                total=store.n_pixels, desc=f"stage {index}", unit="px", unit_scale=True
+                total=len(self.pixels) * len(passes),
+                desc=f"stage {index}",
+                unit="px",
+                unit_scale=True,
             )
             progress = bar.update
-        maps = searcher.executor.run(store, plan, progress=progress)
-        if exe.show_progress:
-            bar.close()
-        if searcher.executor.is_cuda:
-            torch.cuda.synchronize(searcher.device)
-        t_executed = time.perf_counter()
-        self._mark(f"stage{index}:executed")
-        column_index = store.column_index
+        featurize_s = 0.0
+        execute_s = 0.0
+        band_maps: list[StageMaps] = []
+        band_columns: list[torch.Tensor] = []
+        for band in bands:
+            parts: list[StageMaps] = []
+            column_index: torch.Tensor | None = None
+            for pass_planes in passes:
+                t_pass = time.perf_counter()
+                pass_memory = (
+                    memory
+                    if len(passes) == 1 and len(bands) == 1
+                    else memory_for(
+                        torch.tensor(pass_planes, dtype=torch.long), len(band)
+                    )
+                )
+                before = (id(self.store), len(self.store.groups) if self.store else 0)
+                store = self._prepare_store(
+                    pass_memory.block_pixels,
+                    stage.precision,
+                    stage.rectangles,
+                    pass_planes,
+                    pass_memory.residency,
+                    pixels=band,
+                )
+                n_kept = before[1] if id(store) == before[0] else 0
+                if column_index is None:
+                    column_index = store.column_index
+                elif not torch.equal(column_index, store.column_index):
+                    raise RuntimeError("column order changed between plane passes")
+                if searcher.executor.is_cuda:
+                    torch.cuda.synchronize(searcher.device)
+                t_featurized = time.perf_counter()
+                self._mark(f"stage{index}:featurized")
+                plan = plan_stage(searcher.executor, index, stage, store, pass_memory)
+                self._mark(f"stage{index}:planned")
+                parts.append(searcher.executor.run(store, plan, progress=progress))
+                if searcher.executor.is_cuda:
+                    torch.cuda.synchronize(searcher.device)
+                t_executed = time.perf_counter()
+                self._mark(f"stage{index}:executed")
+                featurize_s += t_featurized - t_pass
+                execute_s += t_executed - t_featurized
+                if len(passes) > 1:
+                    # the groups this pass added are not read again: free them for
+                    # the next pass (groups an earlier stage left stay for reuse)
+                    while len(store.groups) > n_kept:
+                        store.drop_group(store.groups[-1])
+            assert column_index is not None
+            band_maps.append(merge_stage_maps(parts, hyps.n_selected))
+            band_columns.append(column_index)
+            if len(bands) > 1:
+                self.store = None  # a band's store serves no later stage
+        maps = band_maps[0] if len(band_maps) == 1 else _concat_stage_maps(band_maps)
+        column_index = (
+            band_columns[0] if len(band_columns) == 1 else torch.cat(band_columns)
+        )
         self.ledger.write(maps, column_index, index, hyps)
         self._mark(f"stage{index}:ledger")
         if stage.decision is not None:
-            stage.decision.apply(
-                self.ledger, column_index, hyps, self.images.spectra
-            )
+            stage.decision.apply(self.ledger, column_index, hyps, self.images.spectra)
         self.pixels = self.ledger.next_stage_pixels()
         self._mark(f"stage{index}:decided")
         ledger_index = column_index.to(self.ledger.device)
@@ -535,8 +677,8 @@ class SearchSession:
             score=score,
             n_ambiguous_after=n_ambiguous,
             elapsed_s=elapsed,
-            featurize_s=t_featurized - t0,
-            execute_s=t_executed - t_featurized,
+            featurize_s=featurize_s,
+            execute_s=execute_s,
         )
 
     # -- public ------------------------------------------------------------------

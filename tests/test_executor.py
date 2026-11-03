@@ -426,3 +426,34 @@ def test_cuda_pinned_host_store_streams_blocks_and_matches_device(synthetic_resu
     torch.testing.assert_close(runs["pinned_host"].mip, runs["device"].mip)
     torch.testing.assert_close(runs["pinned_host"].mean, runs["device"].mean)
     assert torch.equal(runs["pinned_host"].best_virtual, runs["device"].best_virtual)
+
+
+def test_merge_stage_maps_matches_the_joint_statistics():
+    from panther_em.inference.search.executor import StageMaps, merge_stage_maps
+
+    gen = torch.Generator().manual_seed(3)
+    n_planes, n_sel, n_psi, n_px = 3, 5, 4, 7
+    corr = torch.randn(n_planes, n_sel * n_psi, n_px, generator=gen)  # per-plane (hyp*psi, pixel)
+    parts = []
+    for d in range(n_planes):
+        x = corr[d]
+        mip, arg = x.max(dim=0)
+        mean = x.mean(dim=0)
+        var = x.var(dim=0, unbiased=False)
+        parts.append(StageMaps(mip, mean, var, (mip - mean) / var.sqrt(), arg // n_psi, arg % n_psi, n_sel * n_psi))
+    merged = merge_stage_maps(parts, n_sel)
+    joint = corr.permute(1, 0, 2).reshape(-1, n_px)  # hyp-major within plane? no: planes outer
+    joint = corr.reshape(-1, n_px)  # virtual id = d * n_sel + j, psi inner -> row = (d*n_sel + j)*n_psi + psi
+    mip, arg = joint.max(dim=0)
+    torch.testing.assert_close(merged.mip, mip)
+    torch.testing.assert_close(merged.mean, joint.mean(dim=0))
+    torch.testing.assert_close(merged.variance, joint.var(dim=0, unbiased=False), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(merged.zscore, (mip - joint.mean(dim=0)) / joint.var(dim=0, unbiased=False).sqrt(), rtol=1e-4, atol=1e-5)
+    assert torch.equal(merged.best_virtual, arg // n_psi) and torch.equal(merged.best_psi, arg % n_psi)
+    assert merged.n_evaluated == n_planes * n_sel * n_psi
+    # an unsearched pixel (NaN everywhere) stays NaN / -1; a single part is returned as is
+    for p in parts:
+        p.mip[0] = float("nan"); p.mean[0] = float("nan"); p.variance[0] = float("nan"); p.best_virtual[0] = -1
+    merged = merge_stage_maps(parts, n_sel)
+    assert torch.isnan(merged.mip[0]) and int(merged.best_virtual[0]) == -1 and int(merged.best_psi[0]) == -1
+    assert merge_stage_maps(parts[:1], n_sel) is parts[0]

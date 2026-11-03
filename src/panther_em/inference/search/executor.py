@@ -191,8 +191,10 @@ def plan_memory(
         Lets the per-pixel byte estimate count the groups that will actually be
         resident, including planes held beyond the stage's own.
     l2_target : int, optional
-        Bytes of spectrum per contraction to keep L2-resident; defaults to two thirds
-        of the device's L2 (64 MiB when unknown).
+        Bytes of spectrum per contraction to keep L2-resident; defaults to a quarter
+        of the device's L2 (24 MiB when unknown). Measured on an RTX 6000 Ada (96 MiB
+        L2), the loop is fastest with the spectrum at 10-20 MiB and loses 7-20 %
+        once it passes a third of L2.
     block_bytes_max : int, optional
         Byte budget of one store block.
     device_store_fraction : float, optional
@@ -222,9 +224,7 @@ def plan_memory(
     )
 
     elem = torch.empty((), dtype=engine.spectrum_dtype).element_size()
-    target = l2_target or (
-        (2 * executor.l2_bytes) // 3 if executor.l2_bytes else 64 * MIB
-    )
+    target = l2_target or (executor.l2_bytes // 4 if executor.l2_bytes else 24 * MIB)
     multiple = hyp_batch_multiple(spec.n_psi)
     if batch is not None:
         gemm_pixels, hyp_batch = batch.pixel, batch.hyp
@@ -365,13 +365,17 @@ def plan_stage(
     signature = (
         layout.rectangles,
         spec.precision,
-        tuple((g.id, g.rect, g.precision, g.planes) for g in groups),
+        # a group's block shape is set by its plane count, not by which planes
+        tuple((g.id, g.rect, g.precision, g.n_defocus) for g in groups),
         tuple(lookup),
         memory.gemm_pixels,
         memory.block_pixels,
         memory.hyp_batch,
         spec.n_psi,
-        memory.hyps.signature,
+        # which planes a pass searches is irrelevant to the loop: it reads the
+        # groups/lookup above, and the batches depend on the plane *count* only
+        memory.hyps.template_signature,
+        memory.hyps.n_defocus_selected,
         memory.fused,
         memory.loop,
         str(executor.device),
@@ -432,6 +436,47 @@ class StageMaps:
         return int(self.mip.numel())
 
 
+def merge_stage_maps(parts: Sequence[StageMaps], n_selected: int) -> StageMaps:
+    """Maps of a stage searched plane by plane, from the single-plane maps.
+
+    ``parts[d_local]`` searched the stage's ``d_local``-th plane over the same
+    ``n_selected`` template rows, so its virtual ids ``j`` become ``d_local *
+    n_selected + j`` in the stage's own enumeration (planes outer). The maximum and
+    its hypothesis are taken across planes, the mean and variance pooled (every plane
+    evaluated the same number of hypotheses), and the z-score recomputed, exactly as
+    the fused kernel would have accumulated them in one pass.
+    """
+    if not parts:
+        raise ValueError("merge_stage_maps needs at least one part")
+    if len(parts) == 1:
+        return parts[0]
+    mips = torch.stack([p.mip for p in parts])  # (D, P)
+    means = torch.stack([p.mean for p in parts])
+    second = torch.stack([p.variance + p.mean * p.mean for p in parts])
+    best_virtual = torch.stack(
+        [p.best_virtual + d * n_selected for d, p in enumerate(parts)]
+    )
+    best_psi = torch.stack([p.best_psi for p in parts])
+    # NaN-safe argmax: an unsearched pixel is NaN in every part and stays -1
+    mip, which = torch.nan_to_num(mips, nan=-float("inf")).max(dim=0)
+    searched = torch.isfinite(mips).any(dim=0)
+    mip = torch.where(searched, mip, torch.full_like(mip, float("nan")))
+    mean = means.mean(dim=0)
+    variance = (second.mean(dim=0) - mean * mean).clamp_min_(0.0)
+    zscore = (mip - mean) / variance.sqrt().clamp_min(1e-12)
+    gather = which[None]
+    none = torch.full_like(mip, -1, dtype=torch.long)
+    return StageMaps(
+        mip=mip,
+        mean=mean,
+        variance=variance,
+        zscore=zscore,
+        best_virtual=torch.where(searched, best_virtual.gather(0, gather)[0], none),
+        best_psi=torch.where(searched, best_psi.gather(0, gather)[0], none),
+        n_evaluated=sum(p.n_evaluated for p in parts),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # The hypothesis loop
 # --------------------------------------------------------------------------- #
@@ -490,7 +535,9 @@ def _loop_body(
                             p1,
                         )
                     )
-                engine.contract(a_parts, [prepared[(run_index, batch_index)]], run, spectrum)
+                engine.contract(
+                    a_parts, [prepared[(run_index, batch_index)]], run, spectrum
+                )
             stats.consume(spectrum.pnf(), batch, sub)
 
 
@@ -579,7 +626,9 @@ class HypLoop:
     def run(self, operands: Mapping[int, torch.Tensor], n_valid: int) -> None:
         """Reduce a block given its group tensors (``group.id -> block``)."""
         if self.graph is None:
-            _loop_body(self.plan, self.prepared, operands, self.stats, self.spectra, n_valid)
+            _loop_body(
+                self.plan, self.prepared, operands, self.stats, self.spectra, n_valid
+            )
             return
         for gid, static in self.statics.items():
             static.copy_(operands[gid])
@@ -655,6 +704,17 @@ class Executor:
             self.featurize = torch.cuda.Stream(device=self.device)  # type: ignore[no-untyped-call]
             self.copy = torch.cuda.Stream(device=self.device)  # type: ignore[no-untyped-call]
 
+    def refresh_free_bytes(self) -> int | None:
+        """Re-measure ``free_bytes``: driver-free plus the allocator's idle reserve."""
+        if self.is_cuda:
+            index = self.device.index
+            free, _total = torch.cuda.mem_get_info(index)
+            idle = torch.cuda.memory_reserved(index) - torch.cuda.memory_allocated(
+                index
+            )
+            self.free_bytes = int(free) + int(idle)
+        return self.free_bytes
+
     # -- prepared weights --------------------------------------------------------
 
     @staticmethod
@@ -669,7 +729,15 @@ class Executor:
         parts = tuple(
             (layout.rectangles[p.rect], p.m_start, p.m_stop) for p in run.parts
         )
-        return (parts, run.k_start, run.k_stop, engine.precision, rows_key, batch.j0, batch.j1)
+        return (
+            parts,
+            run.k_start,
+            run.k_stop,
+            engine.precision,
+            rows_key,
+            batch.j0,
+            batch.j1,
+        )
 
     def prepared(
         self,
@@ -737,7 +805,7 @@ class Executor:
         """Reduce every block of ``store`` for ``plan``; ``progress(n_pixels_done)``."""
         hyps = plan.hyps
         rows = hyps.template_rows(self.device) if not hyps.is_contiguous else None
-        rows_key = hyps.signature if rows is not None else None
+        rows_key = hyps.template_signature if rows is not None else None
         prepared = {
             (run_index, batch_index): self.prepared(
                 plan.layout, run, batch, plan.engine, rows, rows_key

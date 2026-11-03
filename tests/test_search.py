@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+from dataclasses import replace
 
 import pytest
 import torch
@@ -31,6 +32,8 @@ pytestmark = pytest.mark.filterwarnings(
 )
 
 EXEC = ExecutionConfig(batch=BatchShape(8, 5), cell_chunk=4, use_cuda_graph=False)
+# every plane resident at once, one kernel sweep over all of them
+EXEC_JOINT = replace(EXEC, plane_major=False)
 
 
 class StubFeaturizer:
@@ -273,7 +276,7 @@ def test_two_stage_healpix_level_and_planes(synthetic_result):
         ),
         Stage.create([(0, 0, 4, 5)], n_psi=16, decision=test1),
     ]
-    searcher = Searcher(template, stages, execution=EXEC, featurize=stub, n_defocus=3)
+    searcher = Searcher(template, stages, execution=EXEC_JOINT, featurize=stub, n_defocus=3)
     assert searcher.ipix is not None and searcher.ipix.tolist() == list(range(48))
     t_ids, d_ids = stages[0].hypothesis_ids(searcher.space, searcher.ipix)
     assert t_ids.numel() == 12 * 2 and d_ids.tolist() == [1]  # one child per parent pixel
@@ -390,7 +393,7 @@ def test_center_mode_orientation_subset_and_run_many(template):
     searcher = Searcher(
         template,
         stages,
-        execution=EXEC,
+        execution=EXEC_JOINT,
         featurize=stub,
         n_defocus=2,
         defocus_values=torch.tensor([-500.0, 500.0]),
@@ -509,7 +512,7 @@ def test_stage_planes_are_featurized_only_where_needed(template):
         Stage.create([rect], n_psi=16),
     ]
     searcher = Searcher(
-        template, stages, execution=EXEC, featurize=stub, n_defocus=3, keep_stage_results=True
+        template, stages, execution=EXEC_JOINT, featurize=stub, n_defocus=3, keep_stage_results=True
     )
     images = ImageSet.from_stack(torch.zeros(1, 30, 30), filters=torch.ones(3, 30, 16))
     session = searcher.session(images)
@@ -552,3 +555,36 @@ def test_session_store_is_released_after_the_session(template):
     assert store_ref() is None  # only the session owned the store
     assert block_ref() is None  # and nothing (the cached loop's plan) kept its blocks
     assert searcher.executor.loops  # the loop cache survives for the next image set
+
+
+def test_plane_major_passes_match_the_joint_search(template):
+    """Plane-by-plane passes (one plane resident at a time) reproduce the joint maps."""
+    rect = (0, 0, 3, 4)
+    image = ImageSet.single(_image(seed=11), filters=torch.rand(3, 30, 16))
+    stage = Stage.create([rect], n_psi=16, planes=(0, 2), decision=Decision(0.5))
+
+    def run(exe, stub):
+        searcher = Searcher(template, [stage], execution=exe, featurize=stub, n_defocus=3, keep_stage_results=True)
+        session = searcher.session(image)
+        result = session.run_all()
+        return session, result
+
+    joint_stub, major_stub = StubFeaturizer(), StubFeaturizer()
+    joint_session, joint = run(EXEC_JOINT, joint_stub)
+    major_session, major = run(EXEC, major_stub)
+    assert joint_stub.calls == 1 and joint_stub.planes_produced == 2
+    assert major_stub.calls == 2 and major_stub.planes_produced == 2  # one pass per plane
+    assert major_session.store.groups == []  # each pass dropped its plane's group
+    for name in MAP_NAMES:
+        torch.testing.assert_close(getattr(major, name), getattr(joint, name), rtol=1e-5, atol=1e-5, equal_nan=True)
+    torch.testing.assert_close(major.stage_results[0].best_index, joint.stage_results[0].best_index)
+    assert major.stage_results[0].maps.n_evaluated == joint.stage_results[0].maps.n_evaluated
+    # the two passes shared one loop and the prepared weights of the hypotheses
+    assert len(major_session.searcher.executor.loops) == 1
+    # a later stage over the same planes starts from an empty store (featurizes again)
+    stages = [stage, Stage.create([rect], n_psi=16, planes=(0, 2), decision=Decision(0.5))]
+    stub = StubFeaturizer()
+    searcher = Searcher(template, stages, execution=EXEC, featurize=stub, n_defocus=3, keep_stage_results=True)
+    two = searcher.run(image)
+    assert stub.calls == 4
+    torch.testing.assert_close(two.stage_results[1].maps.mip, joint.stage_results[0].maps.mip)
