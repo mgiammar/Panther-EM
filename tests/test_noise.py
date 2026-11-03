@@ -33,6 +33,7 @@ pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",
     "ignore:.*__array__ implementation doesn't accept.*:DeprecationWarning",
 )
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 RECTS = [(0, 0, 2, 3)]  # a low-rank selection of the synthetic (k 4, e 5) template
 FULL = [(0, 0, 4, 5)]
@@ -434,3 +435,21 @@ def test_threshold_and_zeta_helpers():
     )  # ratios 1, .8, .5, 2
     with pytest.raises(ValueError):
         zeta_quantile(sigma, sigma_hat, 1.0)
+
+
+@requires_cuda
+def test_estimate_spectra_on_cuda_matches_cpu(template):
+    """A CUDA ``rfft2`` is not contiguous; the curves and level map must not care."""
+    t = RadialTables.build(template, RECTS)
+    gen = torch.Generator().manual_seed(11)
+    images = torch.randn(2, 48, 40, generator=gen)
+    filters = torch.rand(2, 48, 21, generator=gen) + 0.5
+    config = SpectraConfig(level="disk", band_cutoff=0.4)
+    cpu = estimate_spectra(ImageSet.from_stack(images, filters=filters), t, config)
+    gpu = estimate_spectra(
+        ImageSet.from_stack(images.cuda(), filters=filters.cuda()), t, config
+    )
+    for name in ("noise", "signal", "level"):
+        got, want = getattr(gpu, name), getattr(cpu, name)
+        assert got.device.type == "cpu"
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)

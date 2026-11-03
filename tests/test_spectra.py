@@ -18,6 +18,8 @@ from panther_em.spectra import (
     whitening_curve,
 )
 
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
 
 def _image(h, w, seed=0, scale=1.0):
     return scale * torch.randn(h, w, generator=torch.Generator().manual_seed(seed))
@@ -165,3 +167,16 @@ def test_whitening_filter_validation():
         WhiteningFilter(freq, spectra[:, :-1], ("x", "y"))
     with pytest.raises(ValueError):
         WhiteningFilter(freq, spectra, ("x", "y"), max_freq=0.0)
+
+
+@requires_cuda
+def test_cuda_images_give_the_cpu_spectra():
+    """A CUDA ``rfft2`` is not contiguous; the spectra must still bin it."""
+    x = _image(96, 80, seed=4, scale=2.0)
+    freq, cpu = amplitude_spectrum_1d(x)
+    freq_gpu, gpu = amplitude_spectrum_1d(x.cuda())
+    torch.testing.assert_close(gpu.cpu(), cpu, rtol=1e-4, atol=1e-3)
+    torch.testing.assert_close(freq_gpu.cpu(), freq)
+    wf = WhiteningFilter.from_images([("a", x.cuda()), ("b", _image(96, 80, seed=5))])
+    assert wf.spectra.device.type == "cpu"
+    torch.testing.assert_close(wf.spectra[0], cpu, rtol=1e-4, atol=1e-3)

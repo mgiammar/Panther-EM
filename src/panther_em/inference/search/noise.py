@@ -809,7 +809,7 @@ class SpectraConfig:
 def _ring_power(dft: torch.Tensor, n_bins: int) -> torch.Tensor:
     """Ring mean of ``|dft|^2`` on the standard axis (float64, CPU)."""
     return (
-        power_spectral_density(dft, rfft=True, num_freq_bins=n_bins)
+        power_spectral_density(dft.contiguous(), rfft=True, num_freq_bins=n_bins)
         .double()
         .square()
         .cpu()

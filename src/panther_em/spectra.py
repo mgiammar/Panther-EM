@@ -56,7 +56,8 @@ def amplitude_spectrum_1d(
     if num_freq_bins is None:
         num_freq_bins = calculate_num_freq_bins(shape)
 
-    dft = torch.fft.rfft2(image.to(torch.float32))
+    # a CUDA rfft2 result is not contiguous; power_spectral_density flattens with view
+    dft = torch.fft.rfft2(image.to(torch.float32)).contiguous()
     dft[0, 0] = 0.0
     spectrum = power_spectral_density(dft, rfft=True, num_freq_bins=num_freq_bins)
 
