@@ -8,7 +8,11 @@ import torch
 from torch_fourier_filter.bandpass import low_pass_filter
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
-from panther_em.inference.search.noise_model.whitening import WhiteningFilter
+from panther_em.inference.search.noise_model import whitening as whitening_module
+from panther_em.inference.search.noise_model.whitening import (
+    WhiteningFilter,
+    canonical_device,
+)
 from panther_em.spectra import WhiteningFilter as LegacyWhiteningFilter
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -137,6 +141,37 @@ def test_round_trip_and_validation(whitening, tmp_path):
             WhiteningFilter(**{**fields, **bad})
 
 
+def test_shared_grids_are_built_once_and_safe_to_modify(monkeypatch):
+    whitening = WhiteningFilter.from_images(micrographs(), band_cutoff=BAND[0])
+    calls = {"curve_to_grid": 0, "low_pass_filter": 0}
+
+    def counting(name, fn):
+        def wrapped(*args, **kwargs):
+            calls[name] += 1
+            return fn(*args, **kwargs)
+
+        return wrapped
+
+    for name in calls:
+        monkeypatch.setattr(
+            whitening_module, name, counting(name, getattr(whitening_module, name))
+        )
+
+    first = whitening.image_filter("m0", SHAPE)
+    whitening.image_filter("m1", SHAPE)
+    whitening.template_filter(SHAPE)
+    # W_avg once, the band once, each micrograph's own C_i every time
+    assert calls == {"curve_to_grid": 3, "low_pass_filter": 1}
+    whitening.template_filter(BOX)  # another shape: its own grids
+    assert calls == {"curve_to_grid": 4, "low_pass_filter": 2}
+
+    average = whitening.average_filter(SHAPE)
+    average.zero_()  # the caller's copy, not the cache
+    whitening.band_grid(SHAPE).zero_()
+    torch.testing.assert_close(whitening.image_filter("m0", SHAPE), first)
+    assert float(whitening.template_filter(SHAPE).abs().sum()) > 0
+
+
 @requires_cuda
 def test_check_image_accepts_a_cuda_micrograph(whitening):
     image = dict(micrographs())["m0"].cuda()
@@ -145,3 +180,13 @@ def test_check_image_accepts_a_cuda_micrograph(whitening):
         float(whitening.image_filter("m0", SHAPE, "cuda").cpu().sum()),
         float(whitening.image_filter("m0", SHAPE).sum()),
     )
+
+
+@requires_cuda
+def test_cuda_and_its_index_share_one_cache_entry():
+    assert canonical_device("cuda") == canonical_device(torch.cuda.current_device())
+    assert canonical_device(None) == canonical_device("cpu") == torch.device("cpu")
+    whitening = WhiteningFilter.from_images(micrographs(), band_cutoff=BAND[0])
+    whitening.template_filter(SHAPE, "cuda")
+    whitening.template_filter(SHAPE, f"cuda:{torch.cuda.current_device()}")
+    assert len(whitening._shared_grids) == 2  # W_avg and the band, once each

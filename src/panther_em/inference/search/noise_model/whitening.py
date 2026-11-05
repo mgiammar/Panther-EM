@@ -41,7 +41,7 @@ from panther_em.spectra import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
     from pathlib import Path
 
 # Relative L2 tolerance to check amplitude spectra of micrograph against stored filter.
@@ -50,6 +50,14 @@ SPECTRUM_TOLERANCE = 1e-3
 # Agreement of a decomposition's Fourier filter with template_filter (float32 grids).
 FILTER_RTOL = 1e-4
 FILTER_ATOL = 1e-6
+
+
+def canonical_device(device: torch.device | str | None) -> torch.device:
+    """``device`` as a cache key: ``None`` is the CPU, ``"cuda"`` the current GPU."""
+    resolved = torch.device("cpu") if device is None else torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    return resolved
 
 
 @dataclass(frozen=True, eq=False)
@@ -215,37 +223,67 @@ class WhiteningFilter:
 
     # -- grids (rfft layout, unshifted, float32) --------------------------------
 
-    def _grid(
+    @cached_property
+    def _shared_grids(
         self,
-        curve: torch.Tensor,
+    ) -> dict[tuple[str, tuple[int, int], torch.device], torch.Tensor]:
+        return {}
+
+    def _shared_grid(
+        self,
+        kind: str,
         shape: tuple[int, int],
         device: torch.device | str | None,
+        build: Callable[[tuple[int, int], torch.device], torch.Tensor],
     ) -> torch.Tensor:
-        return curve_to_grid(curve, self.frequencies, shape, device=device)
+        key = (kind, (int(shape[0]), int(shape[1])), canonical_device(device))
+        grid = self._shared_grids.get(key)
+        if grid is None:
+            grid = build(key[1], key[2])
+            self._shared_grids[key] = grid
+        return grid
+
+    def _average_grid(
+        self, shape: tuple[int, int], device: torch.device | str | None
+    ) -> torch.Tensor:
+        return self._shared_grid(
+            "average",
+            shape,
+            device,
+            lambda s, d: curve_to_grid(
+                self.average_curve, self.frequencies, s, device=d
+            ),
+        )
+
+    def _band_grid(
+        self, shape: tuple[int, int], device: torch.device | str | None
+    ) -> torch.Tensor:
+        return self._shared_grid(
+            "band",
+            shape,
+            device,
+            lambda s, d: low_pass_filter(
+                self.band_cutoff, self.band_falloff, s, rfft=True, fftshift=False
+            ).to(device=d, dtype=torch.float32),
+        )
 
     def band_grid(
         self, shape: tuple[int, int], device: torch.device | str | None = None
     ) -> torch.Tensor:
         """The band on the rfft grid of the real-space ``shape``."""
-        return low_pass_filter(
-            self.band_cutoff,
-            self.band_falloff,
-            (int(shape[0]), int(shape[1])),
-            rfft=True,
-            fftshift=False,
-        ).to(device=device, dtype=torch.float32)
+        return self._band_grid(shape, device).clone()
 
     def average_filter(
         self, shape: tuple[int, int], device: torch.device | str | None = None
     ) -> torch.Tensor:
         """``W_avg``: the filter of a particle's signal in the search image."""
-        return self._grid(self.average_curve, shape, device)
+        return self._average_grid(shape, device).clone()
 
     def template_filter(
         self, shape: tuple[int, int], device: torch.device | str | None = None
     ) -> torch.Tensor:
         """``W_avg * band``: the decomposition's Fourier filter on the template box."""
-        return self.average_filter(shape, device) * self.band_grid(shape, device)
+        return self._average_grid(shape, device) * self._band_grid(shape, device)
 
     def image_filter(
         self,
@@ -255,7 +293,7 @@ class WhiteningFilter:
     ) -> torch.Tensor:
         """``W_avg * C_i^2``: the search-image filter of micrograph ``name``."""
         return (
-            self.average_filter(shape, device)
+            self._average_grid(shape, device)
             * self.correction_grid(name, shape, device).square()
         )
 
@@ -265,8 +303,10 @@ class WhiteningFilter:
         shape: tuple[int, int],
         device: torch.device | str | None = None,
     ) -> torch.Tensor:
-        """``C_i`` of micrograph ``name``."""
-        return self._grid(self.correction_curve(name), shape, device)
+        """``C_i`` of micrograph ``name`` (its own; not cached)."""
+        return curve_to_grid(
+            self.correction_curve(name), self.frequencies, shape, device=device
+        )
 
     # -- guards ----------------------------------------------------------------
 

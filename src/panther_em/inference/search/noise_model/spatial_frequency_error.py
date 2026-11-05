@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING
 
 import h5py  # type: ignore[import-untyped]
@@ -24,6 +25,7 @@ from panther_em.decomposition.pipeline_projections import (
     precompute_volume_dft,
 )
 from panther_em.inference.search.noise import NoiseScales
+from panther_em.inference.search.noise_model.whitening import canonical_device
 from panther_em.spectra import frequency_axis
 
 if TYPE_CHECKING:
@@ -153,6 +155,37 @@ class PerSpatialFrequencyErrorTable:
     def template_shape(self) -> tuple[int, int]:
         """``(kH, kW)``."""
         return int(self.support.shape[0]), int(self.support.shape[1])
+
+    # -- image binning ---------------------------------------------------------
+
+    @cached_property
+    def _image_bins(self) -> dict[tuple[tuple[int, int], torch.device], RadialBins]:
+        return {}
+
+    def image_bins(
+        self, shape: tuple[int, int], device: torch.device | str | None = None
+    ) -> RadialBins:
+        """float64 bins of the rfft grid of an image ``shape`` onto this table's axis.
+
+        Raises
+        ------
+        ValueError
+            If a bin of the axis holds no frequency of the grid (an image smaller
+            than the padded template box).
+        """
+        key = ((int(shape[0]), int(shape[1])), canonical_device(device))
+        bins = self._image_bins.get(key)
+        if bins is None:
+            bins = RadialBins.create(
+                key[0], self.frequencies, device=key[1], dtype=torch.float64
+            )
+            if bool((bins.counts <= 0).any()):
+                raise ValueError(
+                    f"the frequency axis has bins no frequency of a {key[0]} grid "
+                    "falls in"
+                )
+            self._image_bins[key] = bins
+        return bins
 
     # -- scales ----------------------------------------------------------------
 
@@ -313,6 +346,22 @@ class RadialBins:
         out.index_add_(1, self.left, flat * self.w_left)
         out.index_add_(1, self.right, flat * self.w_right)
         return out
+
+    @cached_property
+    def counts(self) -> torch.Tensor:
+        """``(F,)`` total weight of each bin (the binning of a grid of ones)."""
+        out = self.w_left.new_zeros(self.n_bins)
+        out.index_add_(0, self.left, self.w_left)
+        out.index_add_(0, self.right, self.w_right)
+        return out
+
+    def ring_mean(self, values: torch.Tensor) -> torch.Tensor:
+        """``(B, h, w // 2 + 1)`` -> ``(B, F)`` means over the full grid's rings.
+
+        The Hermitian weights cancel, so each rfft column counts as often as it
+        appears in the full spectrum.
+        """
+        return self(values) / self.counts
 
 
 # --------------------------------------------------------------------------- #

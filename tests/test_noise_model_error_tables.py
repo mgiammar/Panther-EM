@@ -17,6 +17,7 @@ from panther_em.inference.search.noise_model.image_set import ImageSet
 from panther_em.inference.search.noise_model.spatial_frequency_error import (
     TABLE_NAMES,
     PerSpatialFrequencyErrorTable,
+    RadialBins,
     compute_error_tables,
     template_support,
 )
@@ -220,3 +221,29 @@ def test_round_trip_and_validation(whitening, decomposition, tmp_path):
     ):
         with pytest.raises(ValueError):
             PerSpatialFrequencyErrorTable(**{**fields, **bad})
+
+
+def test_image_bins_are_shared_and_reused(whitening, decomposition, monkeypatch):
+    volume, template = decomposition
+    table = compute_error_tables(volume, template, [(0, 0, 3, 4)], whitening)
+    bins = table.image_bins(SHAPE)
+    assert table.image_bins(SHAPE, "cpu") is bins
+    assert table.image_bins((SHAPE[0], SHAPE[1] - 2)) is not bins
+    ones = torch.ones((2, SHAPE[0], SHAPE[1] // 2 + 1), dtype=torch.float64)
+    torch.testing.assert_close(
+        bins.ring_mean(ones), torch.ones(2, table.n_bins).double()
+    )
+    with pytest.raises(ValueError, match="no frequency"):
+        table.image_bins((8, 8))  # coarser than the padded template box's axis
+
+    # preparing more micrographs builds no further bins
+    built = []
+    create = RadialBins.create
+    monkeypatch.setattr(
+        RadialBins,
+        "create",
+        classmethod(lambda cls, *a, **k: built.append(a) or create(*a, **k)),
+    )
+    for name in ("m0", "m1", "m2"):
+        prepare(whitening, table, name)
+    assert built == []

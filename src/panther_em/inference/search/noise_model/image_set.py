@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from panther_em.inference.search.noise_model.spatial_frequency_error import RadialBins
 from panther_em.inference.search.types import ImageSet as SearchImageSet
 from panther_em.inference.search.types import ImageSpectra
 from panther_em.spectra import curve_to_grid
@@ -214,20 +213,11 @@ class ImageSet:
         image = (filtered - filtered.mean()) / filtered.std()
         spectrum = torch.fft.rfft2(image)
 
-        # ring means on the tables' axis: bins(v) / bins(1) (Hermitian weights cancel)
-        bins = RadialBins.create(shape, freq, device=device, dtype=torch.float64)
-        counts = bins(
-            torch.ones((1, h, w // 2 + 1), dtype=torch.float64, device=device)
-        )
-
-        if bool((counts <= 0).any()):
-            raise ValueError(
-                f"the frequency axis has bins no frequency of a {shape} grid falls in"
-            )
+        # full-grid ring means on the table's axis (bins shared by every micrograph)
+        bins = table.image_bins(shape, device)
 
         def ring_mean(values: torch.Tensor) -> torch.Tensor:
-            """Return mean at each frequency bin, weighted by Hermitian multiplicity."""
-            return (bins(values[None].to(torch.float64)) / counts)[0].cpu()
+            return bins.ring_mean(values[None].to(torch.float64))[0].cpu()
 
         power = spectrum.abs().square().to(torch.float64)
         correction = whitening.correction_grid(name, shape, device).square()
