@@ -3,7 +3,9 @@
 A search applies the whitening in three places, and all three must agree:
 
 - the decomposition's Fourier filter, ``W_avg * band`` on the template box
-  (:meth:`WhiteningFilter.template_filter`);
+  (:meth:`WhiteningFilter.template_filter`), and the noise model's signal projection
+  under ``W_avg`` alone (:meth:`WhiteningFilter.average_filter`; the micrograph is
+  not band-limited);
 - the search image, ``W_avg * C_i^2`` on the micrograph
   (:meth:`WhiteningFilter.image_filter`), so that template and image together carry
   the micrograph's own ``W_i^2``;
@@ -231,16 +233,19 @@ class WhiteningFilter:
             (int(shape[0]), int(shape[1])),
             rfft=True,
             fftshift=False,
-            device=device,
-        ).to(torch.float32)
+        ).to(device=device, dtype=torch.float32)
+
+    def average_filter(
+        self, shape: tuple[int, int], device: torch.device | str | None = None
+    ) -> torch.Tensor:
+        """``W_avg``: the filter of a particle's signal in the search image."""
+        return self._grid(self.average_curve, shape, device)
 
     def template_filter(
         self, shape: tuple[int, int], device: torch.device | str | None = None
     ) -> torch.Tensor:
         """``W_avg * band``: the decomposition's Fourier filter on the template box."""
-        return self._grid(self.average_curve, shape, device) * self.band_grid(
-            shape, device
-        )
+        return self.average_filter(shape, device) * self.band_grid(shape, device)
 
     def image_filter(
         self,
@@ -250,7 +255,7 @@ class WhiteningFilter:
     ) -> torch.Tensor:
         """``W_avg * C_i^2``: the search-image filter of micrograph ``name``."""
         return (
-            self._grid(self.average_curve, shape, device)
+            self.average_filter(shape, device)
             * self.correction_grid(name, shape, device).square()
         )
 

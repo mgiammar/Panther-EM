@@ -1,9 +1,10 @@
 """Per-spatial-frequency reconstruction error tables of an SVD template.
 
 - reconstruction ``m~``: the SVD template restricted to the feature rectangles,
-- exact template ``m``: the volume's projection, filtered, normalized and masked,
+- exact template ``m``: the volume's projection under the decomposition's filter
+  ``W_avg * band``, normalized and masked to the template support,
 - residual ``delta = m - m~``,
-- signal ``p``: the same projection under the signal filter.
+- signal ``p``: the same projection under ``W_avg`` alone.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import h5py  # type: ignore[import-untyped]
+import numpy as np
 import torch
 from torch_fourier_filter.whitening import calculate_num_freq_bins
 from torch_grid_utils.fftfreq_grid import fftfreq_grid  # type: ignore[import-untyped]
@@ -21,10 +23,17 @@ from panther_em.decomposition.pipeline_projections import (
     generate_projection_batch,
     precompute_volume_dft,
 )
+from panther_em.inference.search.noise import NoiseScales
 from panther_em.spectra import frequency_axis
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from pathlib import Path
+
     from panther_em.coordinates.transform_base import CoordinateTransform
+    from panther_em.inference.search.hypotheses import HypothesisSet
+    from panther_em.inference.search.noise_model.image_set import ImageSet
+    from panther_em.inference.search.noise_model.whitening import WhiteningFilter
     from panther_em.inference.search.template import Template
     from panther_em.inference.search.types import KernelConfig, Rectangle
 
@@ -37,34 +46,33 @@ TABLE_NAMES = (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class PerSpatialFrequencyErrorTable:
     """Helper class for spatial frequency profiles of error and overlap.
 
     Parameters
     ----------
     frequencies : torch.Tensor
-        Shape ``(F,)`` float32 tensor defining frequency axis (cycles/pixel).
+        ``(F,)`` float32 CPU frequency axis (cycles per pixel).
     reconstruction_autocorr : torch.Tensor
-        Shape ``(N, F)`` float32 tensor, where ``N`` is the number of orientations, for
-        the autocorrelation (power) of the reconstruction at each frequency.
+        ``(N, F)`` float32 power of the reconstruction ``m~`` per ring, ``N`` the
+        template rows.
     residual_autocorr : torch.Tensor
-        Shape ``(N, F)`` float32 tensor, where ``N`` is the number of orientations, for
-        the autocorrelation (power) of the residual at each frequency.
+        ``(N, F)`` float32 power of the residual ``delta`` per ring.
     reconstruction_residual_corr : torch.Tensor
-        Shape ``(N, F)`` float32 tensor for the cross-correlation of the reconstruction
-        and residual at each frequency.
+        ``(N, F)`` float32 cross-spectrum of ``m~`` and ``delta`` per ring.
     signal_reconstruction_corr : torch.Tensor
-        Shape ``(N, F)`` float32 tensor for the cross-correlation of the signal and
-        reconstruction at each frequency.
+        ``(N, F)`` float32 cross-spectrum of the signal ``p`` and ``m~`` per ring.
     signal_residual_corr : torch.Tensor
-        Shape ``(N, F)`` float32 tensor for the cross-correlation of the signal and
-        residual at each frequency.
+        ``(N, F)`` float32 cross-spectrum of ``p`` and ``delta`` per ring.
+    support : torch.Tensor
+        ``(kH, kW)`` bool template support disk.
+    template_filter : torch.Tensor
+        ``(kH, kW // 2 + 1)`` float32 ``W_avg * band`` the tables were built under.
     rectangles : tuple of Rectangle
-        The rectangular feature regions used for reconstructions and residuals.
+        The kept ``(k_start, m_start, k_extent, m_extent)`` feature regions.
     pad : int
-        Zero-padding factor of the spectra the tables were binned from. By default 2.
-
+        Zero-padding factor of the spectra the tables were binned from. Default 2.
     """
 
     frequencies: torch.Tensor
@@ -73,26 +81,172 @@ class PerSpatialFrequencyErrorTable:
     reconstruction_residual_corr: torch.Tensor
     signal_reconstruction_corr: torch.Tensor
     signal_residual_corr: torch.Tensor
+    support: torch.Tensor
+    template_filter: torch.Tensor
     rectangles: tuple[Rectangle, ...]
     pad: int = 2
 
-    def save(self, path: str) -> None:
+    def __post_init__(self) -> None:
+        """Validate (never coerce); see :func:`compute_error_tables`."""
+        f = self.frequencies
+        if f.dim() != 1 or f.dtype is not torch.float32 or f.device.type != "cpu":
+            raise ValueError("frequencies must be a 1-D float32 CPU tensor")
+        if f.numel() < 2 or not bool(torch.all(f[1:] > f[:-1])):
+            raise ValueError("frequencies must increase over at least two bins")
+
+        n_rows = int(self.reconstruction_autocorr.shape[0])
+        for name in TABLE_NAMES:
+            t = getattr(self, name)
+            if (
+                tuple(t.shape) != (n_rows, f.numel())
+                or t.dtype is not torch.float32
+                or t.device.type != "cpu"
+            ):
+                raise ValueError(
+                    f"{name} must be a float32 CPU ({n_rows}, {f.numel()}) tensor"
+                )
+
+        s = self.support
+        if s.dim() != 2 or s.dtype is not torch.bool or s.device.type != "cpu":
+            raise ValueError("support must be a 2-D bool CPU tensor")
+        k_h, k_w = int(s.shape[0]), int(s.shape[1])
+
+        g = self.template_filter
+        if (
+            tuple(g.shape) != (k_h, k_w // 2 + 1)
+            or g.dtype is not torch.float32
+            or g.device.type != "cpu"
+        ):
+            raise ValueError(
+                f"template_filter must be a float32 CPU ({k_h}, {k_w // 2 + 1}) tensor"
+            )
+
+        if not isinstance(self.rectangles, tuple) or not self.rectangles:
+            raise ValueError("rectangles must be a non-empty tuple")
+        for r in self.rectangles:
+            if (
+                not isinstance(r, tuple)
+                or len(r) != 4
+                or not all(isinstance(v, int) for v in r)
+                or min(r) < 0
+                or r[2] < 1
+                or r[3] < 1
+            ):
+                raise ValueError(f"bad rectangle {r!r}; see compute_error_tables")
+
+        if self.pad < 1:
+            raise ValueError("pad must be >= 1")
+
+    # -- sizes -----------------------------------------------------------------
+
+    @property
+    def n_templates(self) -> int:
+        """Template rows ``N``."""
+        return int(self.reconstruction_autocorr.shape[0])
+
+    @property
+    def n_bins(self) -> int:
+        """``F``."""
+        return int(self.frequencies.numel())
+
+    @property
+    def template_shape(self) -> tuple[int, int]:
+        """``(kH, kW)``."""
+        return int(self.support.shape[0]), int(self.support.shape[1])
+
+    # -- scales ----------------------------------------------------------------
+
+    def scales(
+        self,
+        images: ImageSet,
+        *,
+        hyps: HypothesisSet | None = None,
+        b_factor: float = 0.0,
+    ) -> NoiseScales:
+        """The micrograph's noise and signal scales of every ``(plane, row)``.
+
+        Parameters
+        ----------
+        images : ImageSet
+            The micrograph; its curves must be on this table's frequency axis.
+        hyps : HypothesisSet, optional
+            The stage's hypotheses; ``qbar_perp`` averages ``q_perp`` over their
+            template rows and planes (all of them when ``None``).
+        b_factor : float, optional
+            Envelope ``exp(-B s^2 / 4)`` (``s = f / pixel_size`` in 1/A) on the signal
+            weight. Defaults to 0.
+
+        Returns
+        -------
+        NoiseScales
+            ``(1, D, N)`` scales (one micrograph).
+        """
+        if not torch.equal(images.frequencies, self.frequencies):
+            raise ValueError(
+                "the image set's curves are on another frequency axis than the table "
+                "(prepare the micrograph with this table or one of the same box/pad)"
+            )
+
+        freq = self.frequencies.to(torch.float64)
+        envelope = torch.exp(-b_factor * (freq / images.pixel_size) ** 2 / 4.0)
+        noise = images.noise  # (D, F)
+        weight = images.signal * envelope
+        t = {name: getattr(self, name).to(torch.float64).T for name in TABLE_NAMES}
+
+        q_kept = noise @ t["reconstruction_autocorr"]  # (D, N)
+        q_residual = noise @ t["residual_autocorr"]
+        q_cross = noise @ t["reconstruction_residual_corr"]
+        lam = torch.where(q_kept > 0, q_cross / q_kept.clamp_min(1e-300), 0.0)
+        q_perp = (q_residual - lam**2 * q_kept).clamp_min(0.0)
+        g_kept = weight @ t["signal_reconstruction_corr"]
+        g_residual = weight @ t["signal_residual_corr"]
+        total = g_kept + g_residual
+        rho = torch.where(total > 0, g_residual / total.clamp_min(1e-300), 0.0)
+        rho = rho.clamp(0.0, 1.0 - 1e-6)
+
+        if hyps is None:
+            rows = torch.arange(self.n_templates)
+            planes = list(range(images.n_defocus))
+        else:
+            rows = hyps.template_rows()
+            planes = list(hyps.defocus_planes())
+        qbar_perp = q_perp[planes][:, rows].mean().reshape(1)
+
+        return NoiseScales(
+            q_kept[None],
+            q_residual[None],
+            q_cross[None],
+            lam[None],
+            q_perp[None],
+            rho[None],
+            qbar_perp,
+            self.rectangles,
+            float(b_factor),
+        )
+
+    # -- I/O -------------------------------------------------------------------
+
+    def save(self, path: str | Path) -> None:
         """Write to HDF5."""
         with h5py.File(path, "w") as f:
             f["frequencies"] = self.frequencies.numpy()
             for name in TABLE_NAMES:
                 f[name] = getattr(self, name).numpy()
+            f["support"] = self.support.numpy()
+            f["template_filter"] = self.template_filter.numpy()
             f.attrs["rectangles"] = json.dumps(self.rectangles)
             f.attrs["pad"] = self.pad
 
     @classmethod
-    def load(cls, path: str) -> PerSpatialFrequencyErrorTable:
+    def load(cls, path: str | Path) -> PerSpatialFrequencyErrorTable:
         """Read a file written by :meth:`save`."""
         with h5py.File(path, "r") as f:
             return cls(
                 frequencies=torch.from_numpy(f["frequencies"][()]),
                 **{name: torch.from_numpy(f[name][()]) for name in TABLE_NAMES},
-                rectangles=tuple(tuple(r) for r in json.loads(f.attrs["rectangles"])),
+                support=torch.from_numpy(np.asarray(f["support"][()], dtype=bool)),
+                template_filter=torch.from_numpy(f["template_filter"][()]),
+                rectangles=as_rectangles(json.loads(f.attrs["rectangles"])),
                 pad=int(f.attrs["pad"]),
             )
 
@@ -166,12 +320,39 @@ class RadialBins:
 # --------------------------------------------------------------------------- #
 
 
+def template_support(
+    transform: CoordinateTransform, config: KernelConfig
+) -> torch.Tensor:
+    """``(kH, kW)`` bool CPU support: where a warped polar image of ones exceeds 1/2."""
+    warped = transform.to_cartesian(
+        torch.ones(transform.polar_shape),
+        preserve_energy=False,
+        wrap_angular_axis=config.wrap_angular_axis,
+        order=config.order,
+        mode=config.mode,
+        cval=config.cval,
+    )
+    support: torch.Tensor = torch.as_tensor(np.asarray(warped)) > 0.5
+    return support
+
+
+def as_rectangles(rectangles: Sequence[Sequence[int]]) -> tuple[Rectangle, ...]:
+    """``(k_start, m_start, k_extent, m_extent)`` int tuples of a rectangle sequence."""
+    rects: list[Rectangle] = []
+    for r in rectangles:
+        if len(r) != 4:
+            raise ValueError(f"a rectangle has four entries, got {r!r}")
+        rects.append((int(r[0]), int(r[1]), int(r[2]), int(r[3])))
+    return tuple(rects)
+
+
 def reconstruct_polar(
     u: torch.Tensor, weighted_vh: torch.Tensor, n_angle: int
 ) -> torch.Tensor:
     """``(B, K, E)`` x ``(K, E, R)`` -> ``(B, n_angle, R)`` float32 polar images."""
     blocks = torch.einsum("bke,ker->bkr", u, weighted_vh)
-    return torch.fft.irfft(blocks, n=n_angle, dim=1, norm="ortho").to(torch.float32)
+    polar: torch.Tensor = torch.fft.irfft(blocks, n=n_angle, dim=1, norm="ortho")
+    return polar.to(torch.float32)
 
 
 def warp_to_cartesian(
@@ -191,7 +372,7 @@ def warp_to_cartesian(
 
 def exact_and_signal(
     projections: torch.Tensor,
-    exact_filters: torch.Tensor,
+    exact_filter: torch.Tensor,
     signal_filter: torch.Tensor,
     support: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -199,7 +380,7 @@ def exact_and_signal(
     size = projections.shape[-2:]
     spectrum = torch.fft.rfft2(projections)
 
-    exact = torch.fft.irfft2(spectrum * exact_filters, s=size)
+    exact = torch.fft.irfft2(spectrum * exact_filter, s=size)
     var, mean = torch.var_mean(exact, dim=(-2, -1), keepdim=True)
     exact = (exact - mean) / torch.sqrt(var + 1e-8) * support
 
@@ -234,10 +415,11 @@ def error_profiles(
 
 @torch.no_grad()
 def compute_error_tables(
-    volume: torch.Tensor,
+    volume: torch.Tensor | np.ndarray,
     template: Template,
-    rectangles: tuple[Rectangle, ...],
-    signal_filter: torch.Tensor | None = None,
+    rectangles: Sequence[Rectangle],
+    whitening: WhiteningFilter,
+    *,
     pad: int = 2,
     batch: int = 128,
     dtype: torch.dtype = torch.float32,
@@ -246,15 +428,15 @@ def compute_error_tables(
 
     Parameters
     ----------
-    volume : torch.Tensor
+    volume : torch.Tensor or numpy.ndarray
         ``(d, d, d)`` reference volume; ``(d, d)`` is the template box.
     template : Template
-        The SVD decomposition, its coordinate transform and warp settings.
-    rectangles : tuple of Rectangle
+        The SVD decomposition (built under ``whitening.template_filter``; checked),
+        its coordinate transform and warp settings.
+    rectangles : sequence of Rectangle
         Kept ``(k_start, m_start, k_extent, m_extent)`` feature regions.
-    signal_filter : torch.Tensor, optional
-        ``(d, d // 2 + 1)`` rfft-grid filter giving the signal ``p``. Defaults to the
-        template's first Fourier filter.
+    whitening : WhiteningFilter
+        The dataset's filter: ``W_avg * band`` for ``m`` and ``W_avg`` for ``p``.
     pad : int
         Zero-padding factor of the spectra. Default 2.
     batch : int
@@ -263,49 +445,54 @@ def compute_error_tables(
         Dtype of the padded spectra and the binning. Default float32.
     """
     result = template.result.to_dense()
+    if result.fourier_filters is None:
+        raise ValueError(
+            "the decomposition carries no Fourier filter; build it under "
+            "whitening.template_filter(box)"
+        )
+    whitening.check_template_filter(result.fourier_filters)
+
     device = template.device
     transform = template.reconstructor.coordinate_transform
     config = template.kernel_config
     h, w = template.template_shape
-    n_orient = result.num_orientations
-    n_rows = result.num_fourier_filters * n_orient
+    n_rows = result.num_fourier_filters * result.num_orientations  # one filter
+
+    vol = torch.as_tensor(np.asarray(volume), dtype=torch.float32)
+    if vol.dim() != 3 or tuple(vol.shape) != (h, h, w):
+        raise ValueError(
+            f"volume must be (d, d, d) with (d, d) the template box {(h, w)}, got "
+            f"{tuple(vol.shape)}"
+        )
+
+    rects = as_rectangles(rectangles)
+    k_stop = max(k0 + ke for k0, _, ke, _ in rects)
+    e_stop = max(m0 + me for _, m0, _, me in rects)
+    if k_stop > result.k_max or e_stop > result.eig_max:
+        raise ValueError(
+            f"rectangles reach ({k_stop}, {e_stop}) beyond the stored "
+            f"({result.k_max}, {result.eig_max})"
+        )
 
     # S * Vh over the kept cells, cropped to the rectangles' bounding box
-    k_stop = max(k0 + ke for k0, _, ke, _ in rectangles)
-    e_stop = max(m0 + me for _, m0, _, me in rectangles)
     mask = torch.zeros((k_stop, e_stop))
-    for k0, m0, ke, me in rectangles:
+    for k0, m0, ke, me in rects:
         mask[k0 : k0 + ke, m0 : m0 + me] = 1.0
-    s = torch.as_tensor(result.S[:k_stop, :e_stop]) * mask
-    vh = torch.as_tensor(result.Vh[:k_stop, :e_stop])
+    s = torch.as_tensor(np.asarray(result.S)[:k_stop, :e_stop]) * mask
+    vh = torch.as_tensor(np.asarray(result.Vh)[:k_stop, :e_stop])
     weighted_vh = (s[..., None] * vh).to(device, torch.complex64)
-    u = torch.from_numpy(result.U.reshape(n_rows, *result.U.shape[2:]))
+    u = torch.as_tensor(np.asarray(result.U)).reshape(n_rows, *result.U.shape[2:])
     u = u[:, :k_stop, :e_stop]
 
-    # the template's polar support: where a warped all-ones polar image exceeds 1/2
-    support = transform.to_cartesian(
-        torch.ones(transform.polar_shape),
-        preserve_energy=False,
-        wrap_angular_axis=config.wrap_angular_axis,
-        order=config.order,
-        mode=config.mode,
-        cval=config.cval,
-    )
-    support = torch.as_tensor(support, device=device) > 0.5
+    support = template_support(transform, config)
 
-    # volume projections and their filters
-    dft, mean_scaled, pad_width = precompute_volume_dft(
-        torch.as_tensor(volume, dtype=torch.float32, device=device)
-    )
+    # volume projections, the exact template's filter and the signal's
+    dft, mean_scaled, pad_width = precompute_volume_dft(vol.to(device))
     phi = torch.as_tensor(result.phi_values, dtype=torch.float32, device=device)
     theta = torch.as_tensor(result.theta_values, dtype=torch.float32, device=device)
-    if result.fourier_filters is None:
-        exact_filters = torch.ones((1, h, w // 2 + 1), device=device)
-    else:
-        exact_filters = torch.as_tensor(result.fourier_filters, device=device)
-    if signal_filter is None:
-        signal_filter = exact_filters[0]
-    signal_filter = signal_filter.to(device)
+    template_filter = whitening.template_filter((h, w))
+    exact_filter = template_filter.to(device)
+    signal_filter = whitening.average_filter((h, w), device)
 
     padded = (pad * h, pad * w)
     frequencies = frequency_axis(calculate_num_freq_bins(padded))
@@ -314,7 +501,6 @@ def compute_error_tables(
     tables = torch.empty((len(TABLE_NAMES), n_rows, bins.n_bins))
     for r0 in range(0, n_rows, batch):
         rows = torch.arange(r0, min(r0 + batch, n_rows), device=device)
-        f_idx, o_idx = rows // n_orient, rows % n_orient
 
         polar = reconstruct_polar(
             u[r0 : r0 + batch].to(device, torch.complex64),
@@ -323,20 +509,23 @@ def compute_error_tables(
         )
         reconstruction = warp_to_cartesian(polar, transform, config)
 
-        psi = torch.zeros_like(phi[o_idx])
+        psi = torch.zeros_like(phi[rows])
         projections = generate_projection_batch(
-            dft, mean_scaled, pad_width, phi[o_idx], theta[o_idx], psi
+            dft, mean_scaled, pad_width, phi[rows], theta[rows], psi
         )
-        filters = exact_filters[f_idx % exact_filters.shape[0]]
-        exact, signal = exact_and_signal(projections, filters, signal_filter, support)
+        exact, signal = exact_and_signal(
+            projections, exact_filter, signal_filter, support.to(device)
+        )
 
         tables[:, r0 : r0 + batch] = error_profiles(
             reconstruction, exact, signal, bins
         ).cpu()
 
     return PerSpatialFrequencyErrorTable(
-        frequencies,
-        *tables,
-        rectangles=tuple(tuple(r) for r in rectangles),
-        pad=pad,
+        frequencies=frequencies,
+        **dict(zip(TABLE_NAMES, tables.to(torch.float32), strict=True)),
+        support=support,
+        template_filter=template_filter.cpu(),
+        rectangles=rects,
+        pad=int(pad),
     )

@@ -5,7 +5,8 @@
 - ``noise (D, F)``: the ring mean of ``|x^ * CTF_d|^2 / (H W)`` per CTF plane.
 - ``signal (D, F)``: the ring mean of ``CTF_d^2 * C_i^2``.
 - ``level (H, W)``: the relative local noise level, the mean over the template's
-  support disk at every pixel of the image flattened inside the band (mean 1).
+  support disk at every pixel of the image flattened by its own noise curve inside
+  the band (mean 1).
 """
 
 from __future__ import annotations
@@ -21,9 +22,13 @@ from panther_em.inference.search.types import ImageSpectra
 from panther_em.spectra import curve_to_grid
 
 if TYPE_CHECKING:
+    from panther_em.inference.search.noise_model.spatial_frequency_error import (
+        PerSpatialFrequencyErrorTable,
+    )
     from panther_em.inference.search.noise_model.whitening import WhiteningFilter
 
-# Fraction of in-band mean to floor (prevents CTF zeros from being amplified).
+# Fraction of the in-band mean noise power the level map's flattening is floored at
+# (keeps near-empty rings from being amplified).
 FLATTEN_FLOOR = 0.05
 
 # Band grid values above which a frequency counts as in band.
@@ -49,7 +54,8 @@ def disk_mean(values: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
     r0, c0 = (k_h - 1) // 2, (k_w - 1) // 2
     window = (slice(r0, r0 + h), slice(c0, c0 + w))
 
-    return numerator[window] / denominator[window].clamp_min(1e-12)
+    mean: torch.Tensor = numerator[window] / denominator[window].clamp_min(1e-12)
+    return mean
 
 
 @dataclass(frozen=True, eq=False)
@@ -146,9 +152,8 @@ class ImageSet:
         name: str,
         whitening: WhiteningFilter,
         ctf: torch.Tensor,
+        table: PerSpatialFrequencyErrorTable,
         *,
-        frequencies: torch.Tensor,
-        support: torch.Tensor,
         pixel_size: float,
     ) -> ImageSet:
         """Whiten one micrograph and estimate its noise-model curves and level map.
@@ -164,10 +169,9 @@ class ImageSet:
             ``W_avg`` across dataset, the micrograph's ``C_i`` and the band.
         ctf : torch.Tensor
             ``(D, H, W // 2 + 1)`` real CTF planes in rfft layout.
-        frequencies : torch.Tensor
-            ``(F,)`` the error tables' frequency axis.
-        support : torch.Tensor
-            ``(kH, kW)`` bool template support disk.
+        table : PerSpatialFrequencyErrorTable
+            An error table of the template along its spatial  frequency axis. Carries
+            the curves, its support disk the level map.
         pixel_size : float
             Angstrom per pixel.
 
@@ -182,9 +186,6 @@ class ImageSet:
                 f"{tuple(micrograph.shape)}"
             )
 
-        if support.dim() != 2 or support.dtype is not torch.bool:
-            raise ValueError("support must be a 2-D bool tensor")
-
         if ctf.is_complex():
             raise ValueError("ctf planes must be real")
 
@@ -196,12 +197,13 @@ class ImageSet:
                 f"got {tuple(ctf.shape)}"
             )
 
+        whitening.check_template_filter(table.template_filter)
         whitening.check_image(name, micrograph)
 
         device = micrograph.device
         shape = (h, w)
         ctf = ctf.to(device=device, dtype=torch.float32)
-        freq = torch.as_tensor(frequencies).reshape(-1).to(torch.float32).cpu()
+        freq = table.frequencies
 
         # Prepare image with W_avg * C_i^2, then set mean zero, variance one.
         filtered = torch.fft.irfft2(
@@ -217,7 +219,7 @@ class ImageSet:
         counts = bins(
             torch.ones((1, h, w // 2 + 1), dtype=torch.float64, device=device)
         )
-        
+
         if bool((counts <= 0).any()):
             raise ValueError(
                 f"the frequency axis has bins no frequency of a {shape} grid falls in"
@@ -237,7 +239,8 @@ class ImageSet:
             noise[d] = ring_mean(power * ctf2) / float(h * w)
             signal[d] = ring_mean(ctf2 * correction)
 
-        level = _level_map(spectrum, noise, freq, support, whitening, shape)
+        image_noise = ring_mean(power) / float(h * w)  # the unfiltered image's curve
+        level = _level_map(spectrum, image_noise, freq, table.support, whitening, shape)
 
         return cls(str(name), image, ctf, freq, noise, signal, level, float(pixel_size))
 
@@ -285,10 +288,16 @@ def _level_map(
     whitening: WhiteningFilter,
     shape: tuple[int, int],
 ) -> torch.Tensor:
-    """``(H, W)`` relative local noise level of the search image (mean 1, CPU)."""
+    """``(H, W)`` relative local noise level of the search image (mean 1, CPU).
+
+    Notes
+    -----
+    The image (``spectrum``, its rfft) is flattened inside the band by
+    ``band / sqrt(max(S, floor * mean_band S))`` with ``S`` its own noise curve
+    ``noise (F,)``, squared, and averaged over the support disk at every pixel.
+    """
     device = spectrum.device
-    curve = noise.mean(dim=0).to(torch.float32)
-    s_grid = curve_to_grid(curve, frequencies, shape, device=device)
+    s_grid = curve_to_grid(noise.to(torch.float32), frequencies, shape, device=device)
     band = whitening.band_grid(shape, device)
     s_band = s_grid[band > IN_BAND].mean()
     flatten = band / torch.sqrt(s_grid.clamp_min(FLATTEN_FLOOR * s_band))

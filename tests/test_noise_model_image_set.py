@@ -1,4 +1,4 @@
-"""noise_model.ImageSet: parity with estimate_spectra and the per-micrograph checks."""
+"""noise_model.ImageSet: the curves, the level map and the per-micrograph checks."""
 
 from __future__ import annotations
 
@@ -6,16 +6,21 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
+from torch_fourier_filter.bandpass import low_pass_filter
 from torch_fourier_filter.utils import bin_1dim_with_lerp
 from torch_fourier_filter.whitening import calculate_num_freq_bins
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
 from panther_em.inference.search import ImageSet as SearchImageSet
 from panther_em.inference.search import SpectraConfig, estimate_spectra
-from panther_em.inference.search.noise_model.image_set import ImageSet
+from panther_em.inference.search.noise_model.image_set import FLATTEN_FLOOR, ImageSet
+from panther_em.inference.search.noise_model.spatial_frequency_error import (
+    PerSpatialFrequencyErrorTable,
+)
 from panther_em.inference.search.noise_model.whitening import WhiteningFilter
 from panther_em.spectra import WhiteningFilter as LegacyWhiteningFilter
-from panther_em.spectra import frequency_axis
+from panther_em.spectra import curve_to_grid, frequency_axis
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -52,6 +57,18 @@ def support_disk(box=BOX, radius=7):
     return (yy - c) ** 2 + (xx - c) ** 2 <= radius**2
 
 
+def error_table(whitening):
+    """A table carrying only what the image set reads: axis, support, filter."""
+    zeros = torch.zeros(1, FREQ.numel())
+    return PerSpatialFrequencyErrorTable(
+        FREQ,
+        *(zeros,) * 5,
+        support=support_disk(),
+        template_filter=whitening.template_filter((BOX, BOX)),
+        rectangles=((0, 0, 1, 1),),
+    )
+
+
 @pytest.fixture(scope="module")
 def whitening():
     return WhiteningFilter.from_images(
@@ -66,8 +83,7 @@ def prepare(whitening, name="m2", device="cpu"):
         name,
         whitening,
         ctf_planes(SHAPE),
-        frequencies=FREQ,
-        support=support_disk(),
+        error_table(whitening),
         pixel_size=PIXEL_SIZE,
     )
 
@@ -82,6 +98,22 @@ def full_grid_ring_mean(values):
     axis, radius = FREQ.double(), radius.double()
     total = bin_1dim_with_lerp(radius, values.double() * weight, axis, False)
     return total / bin_1dim_with_lerp(radius, weight, axis, False)
+
+
+def windowed_disk_mean(values, support):
+    """Reference disk mean by explicit windows (zero outside the image)."""
+    h, w = values.shape
+    k_h, k_w = support.shape
+    r0, c0 = (k_h - 1) // 2, (k_w - 1) // 2
+    pad = (k_w - 1 - c0, c0, k_h - 1 - r0, r0)
+    kernel = support.flip(0, 1).flatten().to(values.dtype)
+
+    def windows(x):
+        return F.unfold(F.pad(x[None, None], pad), (k_h, k_w))[0]  # (kH kW, H W)
+
+    total = (kernel[:, None] * windows(values)).sum(0)
+    count = (kernel[:, None] * windows(torch.ones_like(values))).sum(0)
+    return (total / count).reshape(h, w)
 
 
 def test_curves_are_full_grid_ring_means(whitening):
@@ -99,13 +131,33 @@ def test_curves_are_full_grid_ring_means(whitening):
         )
 
 
+def test_level_flattens_by_the_image_curve(whitening):
+    """The level map against an independent flattening and windowed disk mean."""
+    images = prepare(whitening)
+    h, w = SHAPE
+    spectrum = torch.fft.rfft2(images.image)
+    curve = full_grid_ring_mean(spectrum.abs().square()) / (h * w)
+    s_grid = curve_to_grid(curve.float(), FREQ, SHAPE)
+    band = low_pass_filter(*BAND, SHAPE, rfft=True, fftshift=False)
+    floor = FLATTEN_FLOOR * s_grid[band > 1e-3].mean()
+    flat = torch.fft.irfft2(spectrum * band / s_grid.clamp_min(floor).sqrt(), s=SHAPE)
+    local = windowed_disk_mean(flat.square(), support_disk())
+    torch.testing.assert_close(images.level, local / local.mean(), rtol=1e-4, atol=1e-5)
+
+    assert float(images.level.mean()) == pytest.approx(1.0, rel=1e-5)
+    # the bright quadrant is noisier than the rest
+    inner = images.level[8:40, 8:40].mean() / images.level[56:88, 56:88].mean()
+    assert inner > 2.0
+
+
 def test_matches_the_legacy_pipeline(whitening):
-    """Same search image and level map as the caller + estimate_spectra path.
+    """Same search image as the caller path; noise curves to a few percent.
 
     The legacy curves are half-grid ring means (``power_spectral_density`` counts each
     rfft column once); the new ones weight the columns as the full grid does, like the
-    error tables. They differ by a few percent per ring (most at DC and the corner),
-    which moves the level map by under 1 %.
+    error tables: a few percent per ring, most at DC and the corner. The legacy level
+    map flattens by the plane-averaged CTF-filtered curve, the new one by the image's
+    own, so the maps are not compared.
     """
     images = prepare(whitening)
     legacy = LegacyWhiteningFilter.from_images(micrographs())
@@ -118,7 +170,7 @@ def test_matches_the_legacy_pipeline(whitening):
     spectra = estimate_spectra(
         SearchImageSet.single(x, filters=ctf_planes(SHAPE)),
         tables,
-        SpectraConfig(pixel_size=PIXEL_SIZE, band_cutoff=BAND[0], band_falloff=BAND[1]),
+        SpectraConfig(level="none"),
         correction=(legacy.freq, legacy.correction_1d("m2")),
     )
     torch.testing.assert_close(images.frequencies, spectra.freq)
@@ -126,41 +178,50 @@ def test_matches_the_legacy_pipeline(whitening):
     torch.testing.assert_close(
         images.noise[:, interior], spectra.noise[0][:, interior], rtol=0.06, atol=0.0
     )
-    torch.testing.assert_close(images.level, spectra.level[0], rtol=0.02, atol=0.0)
 
 
-def test_curves_and_level(whitening):
+def test_shapes_and_normalization(whitening):
     images = prepare(whitening)
     assert images.n_defocus == 3 and images.n_bins == FREQ.numel()
     assert images.image_shape == SHAPE
     assert abs(float(images.image.mean())) < 1e-5
     assert float(images.image.std()) == pytest.approx(1.0, rel=1e-5)
-    assert float(images.level.mean()) == pytest.approx(1.0, rel=1e-5)
-    # the bright quadrant is noisier than the rest
-    inner = images.level[8:40, 8:40].mean() / images.level[56:88, 56:88].mean()
-    assert inner > 2.0
 
 
-def test_wrong_micrograph_or_inputs_raise(whitening):
+def test_wrong_micrograph_table_or_inputs_raise(whitening):
     raw = dict(micrographs())["m1"]
-    kwargs = {"frequencies": FREQ, "support": support_disk(), "pixel_size": PIXEL_SIZE}
+    table = error_table(whitening)
     with pytest.raises(ValueError, match="another micrograph"):
-        ImageSet.from_micrograph(raw, "m2", whitening, ctf_planes(SHAPE), **kwargs)
-    with pytest.raises(ValueError, match="ctf planes"):
         ImageSet.from_micrograph(
-            raw, "m1", whitening, ctf_planes((SHAPE[0], SHAPE[1] - 2)), **kwargs
+            raw, "m2", whitening, ctf_planes(SHAPE), table, pixel_size=PIXEL_SIZE
         )
-    with pytest.raises(ValueError, match="real"):
-        ImageSet.from_micrograph(
-            raw, "m1", whitening, ctf_planes(SHAPE).to(torch.complex64), **kwargs
-        )
-    with pytest.raises(ValueError, match="bool"):
+    other = WhiteningFilter.from_images(micrographs()[:2], band_cutoff=BAND[0])
+    with pytest.raises(ValueError, match="another W_avg or band"):
         ImageSet.from_micrograph(
             raw,
             "m1",
             whitening,
             ctf_planes(SHAPE),
-            **{**kwargs, "support": 1.0 * support_disk()},
+            error_table(other),
+            pixel_size=PIXEL_SIZE,
+        )
+    with pytest.raises(ValueError, match="ctf planes"):
+        ImageSet.from_micrograph(
+            raw,
+            "m1",
+            whitening,
+            ctf_planes((SHAPE[0], SHAPE[1] - 2)),
+            table,
+            pixel_size=PIXEL_SIZE,
+        )
+    with pytest.raises(ValueError, match="real"):
+        ImageSet.from_micrograph(
+            raw,
+            "m1",
+            whitening,
+            ctf_planes(SHAPE).to(torch.complex64),
+            table,
+            pixel_size=PIXEL_SIZE,
         )
 
 
