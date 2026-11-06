@@ -29,7 +29,6 @@ from panther_em.inference.search.features import as_rectangle, rectangles_disjoi
 from panther_em.inference.search.types import (
     ImageSet,
     ImageSpectra,
-    KernelConfig,
     Rectangle,
 )
 from panther_em.spectra import WhiteningFilter, frequency_axis
@@ -40,7 +39,7 @@ if TYPE_CHECKING:
 
     from panther_em.coordinates.transform_base import CoordinateTransform
     from panther_em.inference.search.hypotheses import HypothesisSet
-    from panther_em.inference.search.template import Template
+    from panther_em.inference.template import KernelConfig, Template
 
 TABLE_NAMES = ("kept", "residual", "cross", "kept_signal", "residual_signal")
 SCALE_NAMES = ("q_kept", "q_residual", "q_cross", "lam", "q_perp", "rho")
@@ -190,7 +189,7 @@ class SvdTemplates:
             raise NotImplementedError("Complex-valued projections not yet supported")
         self.result = result
         self.device = template.device
-        self.transform = template.reconstructor.coordinate_transform
+        self.transform = template.warp.transform
         self.config = template.kernel_config
         self.rectangles = _rectangles(rectangles)
         self.n_orientations = int(result.num_orientations)
@@ -306,9 +305,9 @@ class ProjectedTemplates:
         else:
             self.w_avg = torch.as_tensor(whitening).to(self.device)
 
-        self.support = support_mask(
-            template.reconstructor.coordinate_transform, template.kernel_config
-        ).to(self.device)
+        self.support = support_mask(template.warp.transform, template.kernel_config).to(
+            self.device
+        )
 
     @property
     def signal_source(self) -> Literal["projection", "template"]:

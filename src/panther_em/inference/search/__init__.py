@@ -8,10 +8,11 @@ materialising the full correlogram.
 
 Objects, by lifetime
 --------------------
-* **Per template** (:mod:`.template`): :class:`Template` bundles a
-  :class:`~panther_em.decomposition.result.DecompositionResult` with a lazily built,
-  byte-budgeted :class:`KernelBank` (Cartesian feature kernels, their spectra) and a
-  device-resident :class:`WeightSource` (``U * S``).
+* **Per template** (:mod:`panther_em.inference.template`):
+  :class:`~panther_em.inference.template.Template` bundles a
+  :class:`~panther_em.decomposition.result.DecompositionResult` with its kernel warp
+  (:class:`~panther_em.inference.template.TemplateWarp`: Cartesian kernels on demand,
+  the transposed warp the direct engine uses) and device-resident ``U * S``.
 * **Per template and feature selection** (:mod:`.noise`): :class:`RadialTables`, the
   ring profiles of the kept, residual and signal templates of every orientation,
   which the coloured-noise :class:`ThresholdTest` reads.
@@ -59,14 +60,25 @@ The two search types
    orientation and plane, where the test rejects and the threshold accepts::
 
        cal = Calibration(alpha=5e-3, zeta=0.95, eps_rho=0.1, b_factor=40.0)
-       Searcher(template, [
-           Stage.create([(0, 0, 32, 16)], precision="fp16", orientations=1,
-                        planes=(D // 2,),
-                        decision=Decision(7.8, ThresholdTest(tables_32x16, cal),
-                                          accept=False)),
-           Stage.create([(0, 0, 128, 64)],
-                        decision=Decision(7.8, ThresholdTest(tables_128x64, cal))),
-       ], n_defocus=D)
+       Searcher(
+           template,
+           [
+               Stage.create(
+                   [(0, 0, 32, 16)],
+                   precision="fp16",
+                   orientations=1,
+                   planes=(D // 2,),
+                   decision=Decision(
+                       7.8, ThresholdTest(tables_32x16, cal), accept=False
+                   ),
+               ),
+               Stage.create(
+                   [(0, 0, 128, 64)],
+                   decision=Decision(7.8, ThresholdTest(tables_128x64, cal)),
+               ),
+           ],
+           n_defocus=D,
+       )
 
    Each stage featurizes only the planes it uses, so the first stage pays the
    featurization of one plane. A HEALPix level needs a template whose Euler
@@ -144,12 +156,10 @@ from panther_em.inference.search.noise import (
 from panther_em.inference.search.results import PixelLedger, SearchResult, StageResult
 from panther_em.inference.search.search import ExecutionConfig, Searcher, SearchSession
 from panther_em.inference.search.stage import Stage
-from panther_em.inference.search.template import KernelBank, Template, WeightSource
 from panther_em.inference.search.types import (
     BatchShape,
     ImageSet,
     ImageSpectra,
-    KernelConfig,
     PixelSelection,
     Precision,
     Rectangle,
@@ -172,8 +182,6 @@ __all__ = [
     "HypothesisSpace",
     "ImageSet",
     "ImageSpectra",
-    "KernelBank",
-    "KernelConfig",
     "MemoryPlan",
     "NoiseScales",
     "PixelLabel",
@@ -190,9 +198,7 @@ __all__ = [
     "Stage",
     "StagePlan",
     "StageResult",
-    "Template",
     "ThresholdTest",
-    "WeightSource",
     "choose_mode",
     "estimate_spectra",
     "healpix_ipix",

@@ -113,14 +113,14 @@ def read_group(store, group, plane: int = 0) -> torch.Tensor:
     return torch.cat(parts, dim=0)
 
 
-def count_kernel_builds(bank):
-    """Wrap ``bank._build_group`` so ``counter[0]`` counts kernels built from now on."""
+def count_kernel_builds(warp):
+    """Wrap ``warp._build_group`` so ``counter[0]`` counts kernels built from now on."""
     counter = [0]
-    original = bank._build_group
+    original = warp._build_group
 
     def counting(k, ms):
         counter[0] += len(ms)
         return original(k, ms)
 
-    bank._build_group = counting
+    warp._build_group = counting
     return counter

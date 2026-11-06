@@ -12,7 +12,7 @@ from panther_em.inference.search.decision import (
 )
 from panther_em.inference.search.noise import RadialTables
 from panther_em.inference.search.stage import Stage, stage_from_json, stage_to_json
-from panther_em.inference.search.template import Template
+from panther_em.inference.template import Template
 from panther_em.inference.search.types import Precision
 
 pytestmark = pytest.mark.filterwarnings(

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from functools import cached_property
@@ -32,7 +33,6 @@ from panther_em.inference.search.statistics import (
     fused_stats_supported,
     make_block_stats,
 )
-from panther_em.inference.search.template import _ByteLRU
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Hashable, Iterable, Sequence
@@ -49,11 +49,43 @@ if TYPE_CHECKING:
     from panther_em.inference.search.hypotheses import HypBatch, HypothesisSpace
     from panther_em.inference.search.stage import Stage
     from panther_em.inference.search.statistics import BlockStats
-    from panther_em.inference.search.template import WeightSource
     from panther_em.inference.search.types import BatchShape, Precision
+    from panther_em.inference.template import WeightSource
 
 LoopKind = Literal["eager", "graph"]
 MIB = 1024**2
+
+
+class _ByteLRU:
+    """Insertion-ordered tensor cache with a byte budget (``None`` = unbounded)."""
+
+    def __init__(self, budget: int | None) -> None:
+        self.budget = budget
+        self._items: OrderedDict[Hashable, torch.Tensor] = OrderedDict()
+        self.nbytes = 0
+
+    def get(self, key: Hashable) -> torch.Tensor | None:
+        t = self._items.get(key)
+        if t is not None:
+            self._items.move_to_end(key)
+        return t
+
+    def put(self, key: Hashable, value: torch.Tensor) -> None:
+        """Insert ``value``, evicting the least recently used entries over budget."""
+        old = self._items.pop(key, None)
+        if old is not None:
+            self.nbytes -= old.numel() * old.element_size()
+        self._items[key] = value
+        self.nbytes += value.numel() * value.element_size()
+        if self.budget is None:
+            return
+        while self.nbytes > self.budget and len(self._items) > 1:
+            _, evicted = self._items.popitem(last=False)  # never the newest entry
+            self.nbytes -= evicted.numel() * evicted.element_size()
+
+    def clear(self) -> None:
+        self._items.clear()
+        self.nbytes = 0
 
 
 # --------------------------------------------------------------------------- #

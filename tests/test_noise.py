@@ -25,7 +25,7 @@ from panther_em.inference.search.noise import (
     zeta_quantile,
     zscore_threshold,
 )
-from panther_em.inference.search.template import Template
+from panther_em.inference.template import Template
 from panther_em.inference.search.types import ImageSet, ImageSpectra
 from panther_em.spectra import WhiteningFilter, curve_to_grid, frequency_axis
 
@@ -66,7 +66,7 @@ def test_ring_sums_are_parseval_exact():
 
 
 def test_support_mask_is_the_polar_disk(template):
-    transform = template.reconstructor.coordinate_transform
+    transform = template.warp.transform
     mask = support_mask(transform, template.kernel_config)
     assert mask.shape == (20, 20) and mask.dtype is torch.bool
     assert mask[10, 10] and not mask[0, 0]
@@ -105,7 +105,9 @@ def test_tables_parseval_full_rank_and_reconstructor_convention(template):
     assert t_full.cross.abs().max() < 1e-6 * t_full.kept.sum(1).max()
     kept_full, _ = SvdTemplates(template, FULL)(_rows(6))
     for o in range(6):
-        ref = template.reconstructor.reconstruct_projection(o, 0, return_torch=True)
+        ref = template.warp.reconstructor.reconstruct_projection(
+            o, 0, return_torch=True
+        )
         ref = torch.as_tensor(np.asarray(ref)).real.to(torch.float32)  # NumPy on CPU
         torch.testing.assert_close(kept_full[o], ref, rtol=1e-4, atol=1e-5)
 

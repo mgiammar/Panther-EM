@@ -19,10 +19,9 @@ from panther_em.inference.search.noise_model.spatial_frequency_error import (
     PerSpatialFrequencyErrorTable,
     RadialBins,
     compute_error_tables,
-    template_support,
 )
 from panther_em.inference.search.noise_model.whitening import WhiteningFilter
-from panther_em.inference.search.template import Template
+from panther_em.inference.template import KernelConfig, Template
 from panther_em.spectra import WhiteningFilter as LegacyWhiteningFilter
 
 pytestmark = pytest.mark.filterwarnings(
@@ -98,13 +97,9 @@ def test_matches_radial_tables(whitening, decomposition, rects):
         scale = ref.abs().max()
         torch.testing.assert_close(new, ref, rtol=1e-4, atol=1e-5 * float(scale))
     assert torch.equal(table.support, legacy.support)
-    assert torch.equal(
-        table.support,
-        template_support(
-            template.reconstructor.coordinate_transform, template.kernel_config
-        ),
-    )
+    assert torch.equal(table.support, template.warp.support)
     assert table.rectangles == tuple(rects) and table.n_templates == 6
+    assert table.kernel_config == template.kernel_config
     torch.testing.assert_close(
         table.template_filter, whitening.template_filter((BOX, BOX))
     )
@@ -112,13 +107,33 @@ def test_matches_radial_tables(whitening, decomposition, rects):
 
 def test_template_support_is_the_legacy_mask(decomposition):
     _, template = decomposition
-    transform, config = (
-        template.reconstructor.coordinate_transform,
-        template.kernel_config,
-    )
-    assert torch.equal(
-        template_support(transform, config), support_mask(transform, config)
-    )
+    legacy = support_mask(template.warp.transform, template.kernel_config)
+    assert torch.equal(template.warp.support, legacy)
+
+
+def test_check_template(whitening, decomposition, synthetic_result):
+    volume, template = decomposition
+    table = compute_error_tables(volume, template, [(0, 0, 3, 4)], whitening)
+    table.check_template(template)
+    result = template.result
+    with pytest.raises(ValueError, match="kernel warp"):
+        table.check_template(
+            Template(result, device="cpu", kernel=KernelConfig(order=3))
+        )
+    with pytest.raises(ValueError, match="box"):
+        table.check_template(Template(synthetic_result(box=20), device="cpu"))
+    with pytest.raises(ValueError, match="template rows"):
+        table.check_template(
+            Template(synthetic_result(box=BOX, n_orientations=4), device="cpu")
+        )
+    with pytest.raises(ValueError, match="beyond"):
+        table.check_template(Template(synthetic_result(box=BOX, k_max=2), device="cpu"))
+    with pytest.raises(ValueError, match="no Fourier filter"):
+        table.check_template(Template(synthetic_result(box=BOX), device="cpu"))
+    band = low_pass_filter(*BAND, (BOX, BOX), rfft=True, fftshift=False)[None]
+    _, band_only = decompose(band)
+    with pytest.raises(ValueError, match="another Fourier filter"):
+        table.check_template(band_only)
 
 
 def test_guards(whitening, decomposition):
@@ -204,12 +219,14 @@ def test_round_trip_and_validation(whitening, decomposition, tmp_path):
         torch.testing.assert_close(getattr(back, name), getattr(table, name))
     assert torch.equal(back.support, table.support)
     assert back.rectangles == table.rectangles and back.pad == table.pad
+    assert back.kernel_config == table.kernel_config
 
     fields = {
         name: getattr(table, name)
         for name in ("frequencies", *TABLE_NAMES, "support", "template_filter")
     }
     fields["rectangles"] = table.rectangles
+    fields["kernel_config"] = table.kernel_config
     for bad in (
         {"frequencies": table.frequencies.double()},
         {"residual_autocorr": table.residual_autocorr[:-1]},
@@ -217,6 +234,7 @@ def test_round_trip_and_validation(whitening, decomposition, tmp_path):
         {"template_filter": table.template_filter[:, :-1]},
         {"rectangles": ()},
         {"rectangles": ((0, 0, 0, 4),)},
+        {"kernel_config": None},
         {"pad": 0},
     ):
         with pytest.raises(ValueError):

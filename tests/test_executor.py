@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from panther_em.inference.search.template import WeightSource
+from panther_em.inference.template import WeightSource
 from panther_em.inference.search.features import ComplexGemmEngine
 from panther_em.inference.search.executor import (
     Executor,

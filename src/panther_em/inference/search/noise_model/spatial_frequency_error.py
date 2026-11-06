@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass
 from functools import cached_property
@@ -25,19 +26,23 @@ from panther_em.decomposition.pipeline_projections import (
     precompute_volume_dft,
 )
 from panther_em.inference.search.noise import NoiseScales
-from panther_em.inference.search.noise_model.whitening import canonical_device
+from panther_em.inference.search.noise_model.whitening import (
+    FILTER_ATOL,
+    FILTER_RTOL,
+    canonical_device,
+)
+from panther_em.inference.template import KernelConfig
 from panther_em.spectra import frequency_axis
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
-    from panther_em.coordinates.transform_base import CoordinateTransform
     from panther_em.inference.search.hypotheses import HypothesisSet
     from panther_em.inference.search.noise_model.image_set import ImageSet
     from panther_em.inference.search.noise_model.whitening import WhiteningFilter
-    from panther_em.inference.search.template import Template
-    from panther_em.inference.search.types import KernelConfig, Rectangle
+    from panther_em.inference.search.types import Rectangle
+    from panther_em.inference.template import Template
 
 TABLE_NAMES = (
     "reconstruction_autocorr",
@@ -73,6 +78,9 @@ class PerSpatialFrequencyErrorTable:
         ``(kH, kW // 2 + 1)`` float32 ``W_avg * band`` the tables were built under.
     rectangles : tuple of Rectangle
         The kept ``(k_start, m_start, k_extent, m_extent)`` feature regions.
+    kernel_config : KernelConfig
+        The warp the reconstructions and the support disk were built with; a search
+        must use a template with the same (:meth:`check_template`).
     pad : int
         Zero-padding factor of the spectra the tables were binned from. Default 2.
     """
@@ -86,6 +94,7 @@ class PerSpatialFrequencyErrorTable:
     support: torch.Tensor
     template_filter: torch.Tensor
     rectangles: tuple[Rectangle, ...]
+    kernel_config: KernelConfig
     pad: int = 2
 
     def __post_init__(self) -> None:
@@ -136,6 +145,9 @@ class PerSpatialFrequencyErrorTable:
             ):
                 raise ValueError(f"bad rectangle {r!r}; see compute_error_tables")
 
+        if not isinstance(self.kernel_config, KernelConfig):
+            raise ValueError("kernel_config must be a KernelConfig")
+
         if self.pad < 1:
             raise ValueError("pad must be >= 1")
 
@@ -155,6 +167,48 @@ class PerSpatialFrequencyErrorTable:
     def template_shape(self) -> tuple[int, int]:
         """``(kH, kW)``."""
         return int(self.support.shape[0]), int(self.support.shape[1])
+
+    # ------ template guard ----------------------------------------------------
+
+    def check_template(self, template: Template) -> None:
+        """Raise unless the tables describe ``template``'s kernels."""
+        if template.kernel_config != self.kernel_config:
+            raise ValueError(
+                f"the tables were built with the kernel warp {self.kernel_config}, the "
+                f"template warps its kernels with {template.kernel_config}"
+            )
+        if tuple(template.template_shape) != self.template_shape:
+            raise ValueError(
+                f"the tables were built on a {self.template_shape} box, the template's "
+                f"is {tuple(template.template_shape)}"
+            )
+        if template.n_templates != self.n_templates:
+            raise ValueError(
+                f"the tables hold {self.n_templates} template rows, the template "
+                f"{template.n_templates}"
+            )
+        for k0, m0, ke, me in self.rectangles:
+            if k0 + ke > template.k_max or m0 + me > template.eig_max:
+                raise ValueError(
+                    f"rectangle {(k0, m0, ke, me)} lies beyond the template's stored "
+                    f"(k_max={template.k_max}, eig_max={template.eig_max})"
+                )
+        filters = template.result.fourier_filters
+        if filters is None:
+            raise ValueError("the template's decomposition carries no Fourier filter")
+        grid = torch.as_tensor(np.asarray(filters))
+        if grid.dim() == 3 and grid.shape[0] == 1:
+            grid = grid[0]
+        if grid.is_complex():
+            grid = grid.real
+        expected = self.template_filter
+        if tuple(grid.shape) != tuple(expected.shape) or not torch.allclose(
+            grid.to(expected.dtype), expected, rtol=FILTER_RTOL, atol=FILTER_ATOL
+        ):
+            raise ValueError(
+                "the template's decomposition was built under another Fourier filter "
+                "than the tables' W_avg * band"
+            )
 
     # -- image binning ---------------------------------------------------------
 
@@ -268,6 +322,9 @@ class PerSpatialFrequencyErrorTable:
             f["support"] = self.support.numpy()
             f["template_filter"] = self.template_filter.numpy()
             f.attrs["rectangles"] = json.dumps(self.rectangles)
+            f.attrs["kernel_config"] = json.dumps(
+                dataclasses.asdict(self.kernel_config)
+            )
             f.attrs["pad"] = self.pad
 
     @classmethod
@@ -280,6 +337,7 @@ class PerSpatialFrequencyErrorTable:
                 support=torch.from_numpy(np.asarray(f["support"][()], dtype=bool)),
                 template_filter=torch.from_numpy(f["template_filter"][()]),
                 rectangles=as_rectangles(json.loads(f.attrs["rectangles"])),
+                kernel_config=KernelConfig(**json.loads(f.attrs["kernel_config"])),
                 pad=int(f.attrs["pad"]),
             )
 
@@ -369,22 +427,6 @@ class RadialBins:
 # --------------------------------------------------------------------------- #
 
 
-def template_support(
-    transform: CoordinateTransform, config: KernelConfig
-) -> torch.Tensor:
-    """``(kH, kW)`` bool CPU support: where a warped polar image of ones exceeds 1/2."""
-    warped = transform.to_cartesian(
-        torch.ones(transform.polar_shape),
-        preserve_energy=False,
-        wrap_angular_axis=config.wrap_angular_axis,
-        order=config.order,
-        mode=config.mode,
-        cval=config.cval,
-    )
-    support: torch.Tensor = torch.as_tensor(np.asarray(warped)) > 0.5
-    return support
-
-
 def as_rectangles(rectangles: Sequence[Sequence[int]]) -> tuple[Rectangle, ...]:
     """``(k_start, m_start, k_extent, m_extent)`` int tuples of a rectangle sequence."""
     rects: list[Rectangle] = []
@@ -402,21 +444,6 @@ def reconstruct_polar(
     blocks = torch.einsum("bke,ker->bkr", u, weighted_vh)
     polar: torch.Tensor = torch.fft.irfft(blocks, n=n_angle, dim=1, norm="ortho")
     return polar.to(torch.float32)
-
-
-def warp_to_cartesian(
-    polar: torch.Tensor, transform: CoordinateTransform, config: KernelConfig
-) -> torch.Tensor:
-    """``(B, n_angle, R)`` polar -> ``(B, kH, kW)`` float32 Cartesian images."""
-    cart = transform.to_cartesian(
-        polar,
-        preserve_energy=config.preserve_energy,
-        wrap_angular_axis=config.wrap_angular_axis,
-        order=config.order,
-        mode=config.mode,
-        cval=config.cval,
-    )
-    return torch.as_tensor(cart, device=polar.device).to(torch.float32)
 
 
 def exact_and_signal(
@@ -480,8 +507,9 @@ def compute_error_tables(
     volume : torch.Tensor or numpy.ndarray
         ``(d, d, d)`` reference volume; ``(d, d)`` is the template box.
     template : Template
-        The SVD decomposition (built under ``whitening.template_filter``; checked),
-        its coordinate transform and warp settings.
+        The SVD decomposition (built under ``whitening.template_filter``; checked)
+        and its kernel warp, which the reconstructions and the support use and the
+        table records.
     rectangles : sequence of Rectangle
         Kept ``(k_start, m_start, k_extent, m_extent)`` feature regions.
     whitening : WhiteningFilter
@@ -502,8 +530,7 @@ def compute_error_tables(
     whitening.check_template_filter(result.fourier_filters)
 
     device = template.device
-    transform = template.reconstructor.coordinate_transform
-    config = template.kernel_config
+    warp = template.warp
     h, w = template.template_shape
     n_rows = result.num_fourier_filters * result.num_orientations  # one filter
 
@@ -533,7 +560,7 @@ def compute_error_tables(
     u = torch.as_tensor(np.asarray(result.U)).reshape(n_rows, *result.U.shape[2:])
     u = u[:, :k_stop, :e_stop]
 
-    support = template_support(transform, config)
+    support = warp.support.clone()
 
     # volume projections, the exact template's filter and the signal's
     dft, mean_scaled, pad_width = precompute_volume_dft(vol.to(device))
@@ -556,7 +583,7 @@ def compute_error_tables(
             weighted_vh,
             result.num_angular_components,
         )
-        reconstruction = warp_to_cartesian(polar, transform, config)
+        reconstruction = warp.to_cartesian(polar)
 
         psi = torch.zeros_like(phi[rows])
         projections = generate_projection_batch(
@@ -576,5 +603,6 @@ def compute_error_tables(
         support=support,
         template_filter=template_filter.cpu(),
         rectangles=rects,
+        kernel_config=template.kernel_config,
         pad=int(pad),
     )

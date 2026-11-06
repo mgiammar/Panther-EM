@@ -32,8 +32,9 @@ lives in :mod:`.stage`).
     result.save("search.h5")
 
 A :class:`Searcher` is bound to one template and one list of stages and owns the
-execution resources that amortise across image sets (kernels and spectra on the
-template, prepared weights and captured hypothesis loops on the executor). A
+execution resources that amortise across image sets (one featurization per
+rectangle and engine, holding its kernels or adjoint bases; prepared weights and
+captured hypothesis loops on the executor). A
 :class:`SearchSession` runs the stages over one :class:`ImageSet`: stage 0 searches
 every unmasked pixel, each later stage re-scores the pixels the previous decision
 left AMBIGUOUS or ACCEPTED, and the session stops early when that set is empty. A
@@ -86,11 +87,11 @@ if TYPE_CHECKING:
     from panther_em.inference.search.featurization.direct_featurization import (
         ContractionName,
     )
-    from panther_em.inference.search.template import KernelBank, Template
     from panther_em.inference.search.types import BatchShape, Rectangle
+    from panther_em.inference.template import Template, TemplateWarp
 
     FeaturizationFactory = Callable[
-        [KernelBank, Rectangle, Mode], BaseImageFeaturization
+        [TemplateWarp, Rectangle, Mode], BaseImageFeaturization
     ]
 
 
@@ -207,7 +208,7 @@ class Searcher:
         Retain every stage's compact maps on the final :class:`SearchResult` (and in
         its HDF5 file). Defaults to False.
     featurization : callable, optional
-        ``(kernels, rect, mode) -> BaseImageFeaturization``; defaults to
+        ``(warp, rect, mode) -> BaseImageFeaturization``; defaults to
         :func:`~.featurization.make_featurization` configured by ``execution`` (tests
         inject a stub).
     """
@@ -312,7 +313,7 @@ class Searcher:
         key = (rect, mode)
         found = self._featurizations.get(key)
         if found is None:
-            found = self.make_featurization(self.template.kernels, rect, mode)
+            found = self.make_featurization(self.template.warp, rect, mode)
             self._featurizations[key] = found
         return found
 

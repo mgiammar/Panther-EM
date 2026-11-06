@@ -27,7 +27,7 @@ from panther_em.inference.search.noise import (
 from panther_em.inference.search.results import MAP_NAMES, SearchResult, StageResult
 from panther_em.inference.search.search import ExecutionConfig, Searcher
 from panther_em.inference.search.stage import Stage
-from panther_em.inference.search.template import Template
+from panther_em.inference.template import Template
 from panther_em.inference.search.types import BatchShape, ImageSet, ImageSpectra
 
 pytestmark = pytest.mark.filterwarnings(
@@ -48,8 +48,8 @@ class StubFeaturization(BaseImageFeaturization):
     pixel identity and differ between planes whose filtered images differ.
     """
 
-    def __init__(self, kernels, rect, owner):
-        super().__init__(kernels, rect)
+    def __init__(self, warp, rect, owner):
+        super().__init__(warp, rect)
         self.owner = owner
 
     def chunks(self, planes, rows, cols):
@@ -84,8 +84,8 @@ class StubFeaturizer:
         self.calls = 0  # chunks() calls: one per (rectangle, band, pass, image)
         self.planes_produced = 0
 
-    def __call__(self, kernels, rect, mode):
-        return StubFeaturization(kernels, rect, self)
+    def __call__(self, warp, rect, mode):
+        return StubFeaturization(warp, rect, self)
 
 
 @pytest.fixture
@@ -105,7 +105,7 @@ def _with_spectra(images, tables, level="none"):
 
 def _dense_reference(template, image, rects, n_psi, planes=None, filters=None):
     """Per-pixel statistics from the dense correlogram (kernels, FFT, einsum, irfft)."""
-    recon = template.reconstructor
+    recon = template.warp.reconstructor
     us = torch.as_tensor(recon.result.U) * torch.as_tensor(recon.result.S)[None, None]
     us = us.reshape(-1, *us.shape[2:]).to(torch.complex64)  # (N, K, E)
     k_stop = max(k0 + ke for k0, _, ke, _ in rects)
@@ -121,7 +121,7 @@ def _dense_reference(template, image, rects, n_psi, planes=None, filters=None):
                 ),
                 dim=-1,
             ).reshape(-1, 2)
-            kernels = template.kernels.spatial(cells)
+            kernels = template.warp.spatial(cells)
             feats = compute_feature_stack(img[None], kernels)[0]  # (cells, oh, ow)
             oh, ow = feats.shape[-2:]
             y = feats.reshape(ke, me, oh * ow).permute(2, 0, 1)  # (P, ke, me)

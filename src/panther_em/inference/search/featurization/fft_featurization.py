@@ -1,7 +1,13 @@
-"""Classes and associated methods for FFT-based featurization across large images."""
+"""Classes and associated methods for FFT-based featurization across large images.
+
+The rectangle's Cartesian kernels are built once, on first use, and held by the
+featurization (a searcher keeps one per rectangle across images); their spectra at a
+region's FFT shape are computed per chunk of cells on every call.
+"""
 
 from __future__ import annotations
 
+from functools import cached_property
 from typing import TYPE_CHECKING
 
 import torch
@@ -15,7 +21,7 @@ from panther_em.inference.search.featurization.base import (
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
-    from panther_em.inference.search.template import KernelBank
+    from panther_em.inference.template import TemplateWarp
 
 DEFAULT_CELL_CHUNK = 32
 """Kernel spectra computed (and held) per chunk."""
@@ -26,8 +32,8 @@ class FFTFeaturization(BaseImageFeaturization):
 
     Parameters
     ----------
-    kernels : KernelBank
-        The template's kernel bank.
+    warp : TemplateWarp
+        The template's kernel warp.
     rect : Rectangle
         ``(k_start, m_start, k_extent, m_extent)``.
     cell_chunk : int, optional
@@ -36,17 +42,22 @@ class FFTFeaturization(BaseImageFeaturization):
 
     def __init__(
         self,
-        kernels: KernelBank,
+        warp: TemplateWarp,
         rect: Sequence[int],
         *,
         cell_chunk: int = DEFAULT_CELL_CHUNK,
     ) -> None:
-        super().__init__(kernels, rect)
+        super().__init__(warp, rect)
 
         if int(cell_chunk) < 1:
             raise ValueError("cell_chunk must be >= 1")
 
         self.cell_chunk = int(cell_chunk)
+
+    @cached_property
+    def kernels(self) -> torch.Tensor:
+        """``(n_cells, kH, kW)`` complex64 kernels of the rectangle (built once)."""
+        return self.warp.spatial(self.cells)
 
     def region(
         self, rows: torch.Tensor, cols: torch.Tensor
@@ -95,13 +106,9 @@ class FFTFeaturization(BaseImageFeaturization):
         whole = n_positions == out_h * out_w and bool(
             torch.equal(local, torch.arange(n_positions, device=device))
         )
-        cache = self.kernels.spectral_fits(self.n_cells, fft_shape)
-
         for start in range(0, self.n_cells, self.cell_chunk):
             cells = slice(start, min(start + self.cell_chunk, self.n_cells))
-            spectra = self.kernels.spectral_views(
-                self.cells[cells], fft_shape, cache=cache
-            )
+            spectra = torch.fft.fft2(self.kernels[cells], s=fft_shape).conj()
             for d, image_fft in enumerate(image_ffts):
                 values = torch.empty(
                     (len(spectra), n_positions), dtype=torch.complex64, device=device

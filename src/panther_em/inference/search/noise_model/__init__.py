@@ -17,7 +17,6 @@ from panther_em.inference.search.noise_model.spatial_frequency_error import (
     PerSpatialFrequencyErrorTable,
     RadialBins,
     compute_error_tables,
-    template_support,
 )
 from panther_em.inference.search.noise_model.whitening import WhiteningFilter
 
@@ -27,5 +26,4 @@ __all__ = [
     "RadialBins",
     "WhiteningFilter",
     "compute_error_tables",
-    "template_support",
 ]

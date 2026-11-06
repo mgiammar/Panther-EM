@@ -23,6 +23,7 @@ GEMM, 5e-4) the speed of the ``2 r x kH kW`` planar GEMM and needs no planar blo
 from __future__ import annotations
 
 import contextlib
+import enum
 import math
 import warnings
 from dataclasses import dataclass, field
@@ -31,14 +32,13 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
-from panther_em.inference.search.types import KernelConfig, Precision
-
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
     from panther_em.coordinates.transform_base import CoordinateTransform
     from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-    from panther_em.inference.search.types import Rectangle
+    from panther_em.inference.search.types import Precision, Rectangle
+    from panther_em.inference.template.warp import KernelConfig
 
 NPAD = 12
 """ndimage's ``grid-constant`` pre-padding (samples of ``cval`` per edge) before the
@@ -47,6 +47,21 @@ spline prefilter, for interpolation orders above 1."""
 SELF_CHECK_TOL = 1e-5
 """Tolerance of the build-time check that the transform's radial continuation of an
 angularly monochromatic image is the outer product the adjoint assumes."""
+
+
+def precision_name(precision: Precision | str) -> str:
+    """``"fp32"``, ``"tf32"`` or ``"fp16"`` of a ``Precision`` member or its value.
+
+    Kept free of the search package (``Precision`` is a ``str`` enum there) so the
+    template package does not import it.
+    """
+    value = precision.value if isinstance(precision, enum.Enum) else precision
+    name = str(value).lower()
+    if name not in ("fp32", "tf32", "fp16"):
+        raise ValueError(
+            f"unknown precision {precision!r}; expected fp32, tf32 or fp16"
+        )
+    return name
 
 
 def bspline(order: int, x: torch.Tensor) -> torch.Tensor:
@@ -289,9 +304,8 @@ class WarpAdjoint:
         fp16 on CUDA runs the sparse matmul in half precision (half the traffic, ~3e-4
         relative on the features); anything else runs in fp32.
         """
-        precision = Precision.coerce(precision)
         n = int(boxes.shape[0])
-        half = precision is Precision.FP16 and self.device.type == "cuda"
+        half = precision_name(precision) == "fp16" and self.device.type == "cuda"
         if half:
             if self._half is None:
                 with _quiet_sparse():
@@ -343,11 +357,11 @@ class AdjointBases:
             fp16: the angular GEMM on fp16 tensor cores (fp32 accumulation); tf32 or
             fp16: the radial contraction in tf32. fp32: CUDA cores throughout.
         """
-        precision = Precision.coerce(precision)
+        name = precision_name(precision)
         r2 = int(self.radial_re.shape[-1])
         n = int(polar.shape[1]) // r2
         cuda = polar.is_cuda
-        if precision is Precision.FP16 and cuda:
+        if name == "fp16" and cuda:
             if self._angular_half is None:
                 self._angular_half = self.angular.to(torch.float16)
             try:
@@ -357,10 +371,10 @@ class AdjointBases:
             except TypeError:  # torch without out_dtype
                 z = (self._angular_half @ polar.to(torch.float16)).to(torch.float32)
         else:
-            with _tf32(cuda and precision is Precision.TF32):
+            with _tf32(cuda and name == "tf32"):
                 z = self.angular @ polar.to(torch.float32)
         z = z.view(2, self.n_k, r2, n)
-        with _tf32(cuda and precision is not Precision.FP32):
+        with _tf32(cuda and name != "fp32"):
             re = torch.bmm(self.radial_re, z[0]) - torch.bmm(self.radial_im, z[1])
             im = torch.bmm(self.radial_re, z[1]) + torch.bmm(self.radial_im, z[0])
         return torch.complex(re, -im).reshape(self.n_k * self.n_m, n)

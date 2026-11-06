@@ -19,6 +19,7 @@ from panther_em.inference.search.noise_model.spatial_frequency_error import (
     PerSpatialFrequencyErrorTable,
 )
 from panther_em.inference.search.noise_model.whitening import WhiteningFilter
+from panther_em.inference.template import KernelConfig
 from panther_em.spectra import WhiteningFilter as LegacyWhiteningFilter
 from panther_em.spectra import curve_to_grid, frequency_axis
 
@@ -66,6 +67,7 @@ def error_table(whitening):
         support=support_disk(),
         template_filter=whitening.template_filter((BOX, BOX)),
         rectangles=((0, 0, 1, 1),),
+        kernel_config=KernelConfig(),
     )
 
 

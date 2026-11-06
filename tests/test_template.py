@@ -1,19 +1,18 @@
-"""KernelBank / WeightSource / Template (template.py)."""
+"""TemplateWarp / WeightSource / Template (panther_em.inference.template)."""
 
 from __future__ import annotations
 
 import pytest
 import torch
-from conftest import count_kernel_builds
+from conftest import count_kernel_builds, requires_cuda
 
-from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-from panther_em.inference.search.template import (
-    KernelBank,
+from panther_em.inference.search.features import FeatureLayout
+from panther_em.inference.template import (
+    KernelConfig,
     Template,
+    TemplateWarp,
     WeightSource,
 )
-from panther_em.inference.search.features import FeatureLayout
-from panther_em.inference.search.types import KernelConfig
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",
@@ -47,98 +46,79 @@ def reference_layout_weights(result, layout):
 
 
 @pytest.fixture
-def recon(synthetic_result):
-    return ProjectionReconstructor(synthetic_result(), device="cpu")
+def warp(synthetic_result):
+    return TemplateWarp(synthetic_result(), device="cpu")
 
 
 def _cells(*pairs):
     return torch.tensor(pairs, dtype=torch.long)
 
 
-def test_kernel_bank_matches_per_cell_construction(recon):
+def test_spatial_matches_per_cell_construction_and_keeps_nothing(warp):
     cells = _cells((0, 0), (2, 3), (1, 1), (3, 4), (2, 0))
-    bank = KernelBank(recon, KernelConfig())
-    built = count_kernel_builds(bank)
-    got = bank.spatial(cells)
-    expected = build_block_kernels(recon, cells)
+    built = count_kernel_builds(warp)
+    got = warp.spatial(cells)
+    expected = build_block_kernels(warp.reconstructor, cells)
     assert got.shape == (5, 20, 20) and got.dtype == torch.complex64
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
-    # order preserved and duplicates handled; nothing rebuilt on a repeat request
     assert built[0] == 5
-    again = bank.spatial(_cells((3, 4), (0, 0), (0, 0)))
+    # request order and duplicates; built again on every call (no cache)
+    again = warp.spatial(_cells((3, 4), (0, 0), (0, 0)))
     torch.testing.assert_close(again[0], expected[3])
     torch.testing.assert_close(again[1], expected[0])
     torch.testing.assert_close(again[2], expected[0])
-    assert built[0] == 5
+    assert built[0] == 7  # (3, 4) and (0, 0) once each
+    assert warp.spatial([]).shape == (0, 20, 20)
 
 
-def test_kernel_bank_respects_kernel_config(recon):
+def test_spatial_respects_the_kernel_config(synthetic_result):
+    result = synthetic_result()
     cells = _cells((1, 2))
-    default = KernelBank(recon).spatial(cells)
-    linear = KernelBank(recon, KernelConfig(order=1, preserve_energy=False)).spatial(
-        cells
+    default = TemplateWarp(result, device="cpu").spatial(cells)
+    linear_warp = TemplateWarp(
+        result, KernelConfig(order=1, preserve_energy=False), device="cpu"
     )
+    linear = linear_warp.spatial(cells)
     assert not torch.allclose(default, linear)
-    expected = build_block_kernels(recon, cells, order=1, preserve_energy=False)
+    expected = build_block_kernels(
+        linear_warp.reconstructor, cells, order=1, preserve_energy=False
+    )
     torch.testing.assert_close(linear, expected, rtol=1e-5, atol=1e-6)
 
 
-def test_kernel_bank_budget_eviction_and_host_tier(recon):
-    one = 20 * 20 * 8  # bytes per complex64 kernel
-    cells = _cells((0, 0), (0, 1), (0, 2), (0, 3))
-    ref = build_block_kernels(recon, cells)
-
-    bank = KernelBank(recon, device_budget=2 * one, host_budget=10 * one)
-    built = count_kernel_builds(bank)
-    torch.testing.assert_close(bank.spatial(cells), ref)
-    dev, host = bank.bytes()
-    assert dev <= 2 * one and host == 2 * one and built[0] == 4
-    torch.testing.assert_close(bank.spatial(cells), ref)  # served from the two tiers
-    assert built[0] == 4
-    # the host tier is inclusive: promoted kernels keep their host copy, so after the
-    # round trip every kernel is on the host and device evictions copy nothing
-    assert bank.bytes()[1] == 4 * one
-    torch.testing.assert_close(bank.spatial(cells), ref)
-    assert built[0] == 4 and bank.bytes() == (2 * one, 4 * one)
-
-    no_host = KernelBank(recon, device_budget=2 * one)
-    rebuilt = count_kernel_builds(no_host)
-    no_host.spatial(cells)
-    assert no_host.bytes() == (2 * one, 0)
-    no_host.spatial(cells)
-    assert rebuilt[0] > 4  # evicted kernels had to be rebuilt
-
-
-def test_kernel_bank_spectral_and_planar(recon):
-    bank = KernelBank(recon)
-    cells = _cells((1, 0), (2, 2))
-    spatial = bank.spatial(cells)
-    spec = bank.spectral(cells, (32, 30))
-    torch.testing.assert_close(spec, torch.fft.fft2(spatial, s=(32, 30)).conj())
-    out = torch.empty_like(spec)
-    assert bank.spectral(cells, (32, 30), out=out) is out
-    torch.testing.assert_close(out, spec)
-    with pytest.raises(ValueError):
-        bank.spectral(
-            cells, (32, 30), out=torch.empty(1, 32, 30, dtype=torch.complex64)
-        )
-
-    planar = bank.planar(cells)  # (2, n, kH*kW)
-    assert planar.shape == (2, 2, 400)
-    image = torch.randn(20, 20)
-    feats = planar @ image.reshape(-1)  # (2, n)
-    expected = (image[None] * spatial.conj()).sum(dim=(-2, -1))
-    torch.testing.assert_close(
-        torch.complex(feats[0], feats[1]), expected, rtol=1e-4, atol=1e-4
+def test_generic_warp_and_support(warp):
+    # the generic warp of a kernel's polar image is the kernel (real part)
+    recon = warp.reconstructor
+    polar = (
+        recon.angular_phase_component(1, 0.0)[:, None]
+        * torch.as_tensor(recon.result.Vh[1, 2]).to(torch.complex64)[None, :]
     )
+    expected = warp.spatial(_cells((1, 2)))[0].real
+    torch.testing.assert_close(
+        warp.to_cartesian(polar.real[None])[0], expected, rtol=1e-5, atol=1e-6
+    )
+    support = warp.support
+    assert support.shape == (20, 20) and support.dtype == torch.bool
+    assert support[10, 10] and not support[0, 0]
+    assert warp.support is support  # built once
 
 
-def test_weight_source_matches_reference_layout_weights(recon):
+def test_adjoint_is_built_once_and_released(warp):
+    adjoint = warp.adjoint
+    assert adjoint is not None and warp.adjoint is adjoint
+    bases = warp.adjoint_bases((0, 0, 2, 3))
+    assert (bases.n_k, bases.n_m) == (2, 3)
+    warp.release()
+    assert warp.adjoint is not adjoint
+
+
+def test_weight_source_matches_reference_layout_weights(synthetic_result):
+    result = synthetic_result()
     rects = [(0, 0, 2, 3), (2, 0, 2, 2), (0, 3, 2, 2)]
     layout = FeatureLayout.create(rects)
-    src = WeightSource(recon.result, "cpu")
+    src = WeightSource(result, "cpu")
     got = src.layout_weights(layout)
-    legacy = reference_layout_weights(recon.result, layout)
+    legacy = reference_layout_weights(result, layout)
     torch.testing.assert_close(got, legacy)
     assert src.n_templates == 6 and src.nbytes == 6 * 4 * 5 * 8
 
@@ -148,20 +128,21 @@ def test_weight_source_matches_reference_layout_weights(recon):
     assert blk.shape == (2, 2, 2)
 
 
-def test_weight_source_bounding_box_and_sparse(recon):
-    boxed = WeightSource(recon.result, "cpu", cells_union=[(1, 1, 2, 2), (2, 0, 1, 1)])
+def test_weight_source_bounding_box_and_sparse(synthetic_result):
+    result = synthetic_result()
+    boxed = WeightSource(result, "cpu", cells_union=[(1, 1, 2, 2), (2, 0, 1, 1)])
     assert (boxed.k_start, boxed.m_start, boxed.k_stop, boxed.m_stop) == (1, 0, 3, 3)
-    full = WeightSource(recon.result, "cpu")
+    full = WeightSource(result, "cpu")
     torch.testing.assert_close(boxed.block((1, 1, 2, 2)), full.block((1, 1, 2, 2)))
     with pytest.raises(ValueError):
         boxed.block((0, 0, 1, 1))
     with pytest.raises(ValueError):
-        WeightSource(recon.result, "cpu", cells_union=(0, 0, 10, 10))
+        WeightSource(result, "cpu", cells_union=(0, 0, 10, 10))
 
-    sparse = recon.result.to_sparse(7)
+    sparse = result.to_sparse(7)
     sparse_src = WeightSource(sparse, "cpu")
     dense = full.us.clone()
-    top = recon.result.get_top_n(7, include_negative=False)
+    top = result.get_top_n(7, include_negative=False)
     keep = torch.zeros(4, 5, dtype=torch.bool)
     for k, m in top:
         keep[int(k), int(m)] = True
@@ -171,97 +152,43 @@ def test_weight_source_bounding_box_and_sparse(recon):
 
 def test_template_bundle_and_hdf5_round_trip(synthetic_result, tmp_path):
     result = synthetic_result()
-    template = Template(result, device="cpu", weights_cells=(0, 0, 4, 5))
-    assert template.template_shape == (20, 20)
+    config = KernelConfig(order=3)
+    template = Template(result, device="cpu", kernel=config, weights_cells=(0, 0, 4, 5))
+    assert template.template_shape == (20, 20) and template.kernel_config is config
+    assert (template.k_max, template.eig_max, template.n_templates) == (4, 5, 6)
     assert template.space.n_templates == 6 and template.space.phi_deg is not None
     assert template._weights is None
     assert template.weights.us.shape == (6, 4, 5)
     torch.testing.assert_close(
-        template.kernels.spatial(_cells((0, 0))),
-        build_block_kernels(template.reconstructor, _cells((0, 0))),
+        template.warp.spatial(_cells((0, 0))),
+        build_block_kernels(template.warp.reconstructor, _cells((0, 0)), order=3),
     )
 
     path = tmp_path / "decomp.h5"
     result.save(path)
-    loaded = Template.from_hdf5(path, device="cpu")
+    loaded = Template.from_hdf5(path, device="cpu", kernel=config)
+    assert loaded.kernel_config == config
     torch.testing.assert_close(loaded.weights.us, template.weights.us)
     template.release()
-    assert template._weights is None and template.kernels.bytes() == (0, 0)
+    assert template._weights is None
 
 
-@pytest.fixture
-def recon_cuda(synthetic_result):
-    from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-
-    return ProjectionReconstructor(synthetic_result(), device="cuda")
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_kernel_bank_separable_build_matches_generic_on_a_side_stream(recon_cuda):
+@requires_cuda
+def test_separable_build_matches_generic_on_a_side_stream(synthetic_result):
     """The CuPy fast path must agree with the generic warp, also when torch runs on a
     non-default stream (its DLPack views and CuPy work are stream-ordered)."""
-    from panther_em.inference.search.template import KernelBank
-
-    fast = KernelBank(recon_cuda, device="cuda")
-    slow = KernelBank(recon_cuda, device="cuda")
-    slow._sep = None  # force the generic path
+    result = synthetic_result()
+    fast = TemplateWarp(result, device="cuda")
+    slow = TemplateWarp(result, device="cuda")
+    slow.__dict__["_separable"] = None  # force the generic path
     cells = _cells((0, 0), (1, 3), (3, 4), (2, 1))
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         a = fast.spatial(cells)
-        _ = torch.randn(
-            64 << 20, device="cuda"
-        )  # churn the allocator on the same stream
+        _ = torch.randn(64 << 20, device="cuda")  # churn the allocator on the stream
     torch.cuda.synchronize()
     b = slow.spatial(cells)
     torch.cuda.synchronize()
     rel = ((a - b).flatten(1).norm(dim=1) / b.flatten(1).norm(dim=1)).max().item()
     # both paths mirror the same seam padding; the residual is spline arithmetic
-    assert fast._sep is not None and rel < 1e-4, rel
-
-
-def test_spectral_views_can_bypass_the_cache(recon):
-    one = 32 * 30 * 8  # one complex64 spectrum at (32, 30)
-    bank = KernelBank(recon, spectral_budget=3 * one)
-    cells = _cells((1, 0), (2, 2), (0, 1), (1, 1))
-    assert bank.spectral_fits(3, (32, 30)) and not bank.spectral_fits(4, (32, 30))
-    views = bank.spectral_views(cells, (32, 30), cache=False)
-    expected = torch.fft.fft2(bank.spatial(cells), s=(32, 30)).conj()
-    torch.testing.assert_close(torch.stack(views), expected)
-    assert bank._spectral_cache.nbytes == 0  # nothing was cached
-    cached = bank.spectral_views(cells[:2], (32, 30))
-    torch.testing.assert_close(torch.stack(cached), expected[:2])
-    assert bank._spectral_cache.nbytes == 2 * one
-    # the uncached call still reads what is cached
-    again = bank.spectral_views(cells[:2], (32, 30), cache=False)
-    assert again[0] is cached[0] and again[1] is cached[1]
-
-
-def test_kernel_bank_planar_block_tier(recon):
-    one = 2 * 400 * 2  # one cell's planar rows in fp16 at the 20x20 box
-    bank = KernelBank(recon, planar_budget=4 * one)
-    rect = (1, 0, 2, 2)  # 4 cells: fits exactly
-    assert bank.planar_fits(rect, torch.float16) and not bank.has_planar_block(rect, torch.float16)
-    assert bank.planar_bytes_of(rect, torch.float16) == 4 * one
-    block = bank.planar_block(rect, torch.float16)
-    assert block.shape == (2, 4, 400) and block.dtype == torch.float16 and block.is_contiguous()
-    # row-major (k, m) cells, same rows as planar()
-    cells = _cells((1, 0), (1, 1), (2, 0), (2, 1))
-    torch.testing.assert_close(block, bank.planar(cells, torch.float16))
-    # built once: the same tensor comes back, nothing is reallocated
-    assert bank.planar_block(rect, torch.float16) is block
-    assert bank.has_planar_block(rect, torch.float16) and bank.planar_bytes == 4 * one
-    # another dtype is another block; the budget evicts the least recently used one
-    assert bank.planar_fits(rect, torch.float32) is False  # 8 * one > budget
-    small = (0, 0, 1, 2)  # 2 cells in fp16: fits, evicts the 4-cell block
-    other = bank.planar_block(small, torch.float16)
-    assert bank.has_planar_block(small, torch.float16)
-    assert not bank.has_planar_block(rect, torch.float16) and bank.planar_bytes == 2 * one
-    assert bank.planar_block(small, torch.float16) is other
-    bank.clear()
-    assert bank.planar_bytes == 0 and not bank.has_planar_block(small, torch.float16)
-    # tier disabled: built and returned, never cached
-    off = KernelBank(recon, planar_budget=0)
-    assert not off.planar_fits(rect, torch.float16)
-    b1 = off.planar_block(rect, torch.float16)
-    assert b1 is not off.planar_block(rect, torch.float16) and off.planar_bytes == 0
+    assert fast._separable is not None and rel < 1e-4, rel

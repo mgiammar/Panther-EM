@@ -17,7 +17,7 @@ from panther_em.inference.search.executor import StageMaps
 from panther_em.inference.search.hypotheses import HypothesisSet, HypothesisSpace
 from panther_em.inference.search.noise import NoiseScales, RadialTables
 from panther_em.inference.search.results import PixelLedger
-from panther_em.inference.search.template import Template
+from panther_em.inference.template import Template
 from panther_em.inference.search.types import (
     ImageSet,
     ImageSpectra,

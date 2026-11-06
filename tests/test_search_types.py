@@ -8,7 +8,6 @@ import torch
 from panther_em.inference.search.types import (
     BatchShape,
     ImageSet,
-    KernelConfig,
     PixelSelection,
     Precision,
     SearchGeometry,
@@ -31,6 +30,7 @@ def test_kernel_config_kwargs_match_construct_cartesian_feature_signature():
     import inspect
 
     from panther_em.inference.projection_reconstruction import ProjectionReconstructor
+    from panther_em.inference.template import KernelConfig
 
     params = inspect.signature(
         ProjectionReconstructor.construct_cartesian_feature

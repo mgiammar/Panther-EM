@@ -1,4 +1,4 @@
-"""The adjoint-warp featurization against the kernel bank's Cartesian kernels."""
+"""The adjoint warp against the template warp's Cartesian kernels."""
 
 from __future__ import annotations
 
@@ -9,10 +9,8 @@ from conftest import make_synthetic_result, requires_cuda
 
 from panther_em.coordinates.spiral_polar import SpiralPolarTransform
 from panther_em.decomposition.result import DecompositionResult
-from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-from panther_em.inference.search.adjoint import bspline, build_bases
-from panther_em.inference.search.template import KernelBank
-from panther_em.inference.search.types import KernelConfig
+from panther_em.inference.template import KernelConfig, TemplateWarp
+from panther_em.inference.template.adjoint import bspline, build_bases
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",
@@ -51,16 +49,16 @@ def _spiral_result(box=24, n_angular=32, n_radial=10, **kw):
     )
 
 
-def _reference_features(bank, cells, boxes):
-    """``<box, conj K>`` for every cell from the bank's spatial kernels, in fp64."""
-    kernels = bank.spatial(cells).reshape(len(cells), -1).to(torch.complex128)
+def _reference_features(warp, cells, boxes):
+    """``<box, conj K>`` for every cell from the warp's spatial kernels, in fp64."""
+    kernels = warp.spatial(cells).reshape(len(cells), -1).to(torch.complex128)
     return torch.conj(kernels) @ boxes.to(torch.complex128).T
 
 
-def _adjoint_features(bank, rect, boxes, precision="fp32"):
-    adjoint = bank.adjoint()
+def _adjoint_features(warp, rect, boxes, precision="fp32"):
+    adjoint = warp.adjoint
     assert adjoint is not None
-    bases = bank.adjoint_bases(rect)
+    bases = warp.adjoint_bases(rect)
     return bases.features(adjoint.apply(boxes, precision), precision)
 
 
@@ -77,10 +75,9 @@ def test_bspline_partition_of_unity_and_scipy_weights():
 
 @pytest.mark.parametrize("order", [5, 3])
 @pytest.mark.parametrize("spiral", [False, True])
-def test_adjoint_matches_the_banks_kernels(order, spiral):
+def test_adjoint_matches_the_warps_kernels(order, spiral):
     result = _spiral_result() if spiral else make_synthetic_result(box=24, n_angular=32)
-    recon = ProjectionReconstructor(result, device="cpu")
-    bank = KernelBank(recon, KernelConfig(order=order))
+    bank = TemplateWarp(result, KernelConfig(order=order), device="cpu")
     rect = (0, 0, 4, 3)
     cells = _cells(rect)
     gen = torch.Generator().manual_seed(1)
@@ -93,13 +90,12 @@ def test_adjoint_matches_the_banks_kernels(order, spiral):
 
 
 def test_adjoint_forward_model_reproduces_a_kernel():
-    """``S (filt(a) (x) filt(c))`` masked equals ``bank.spatial`` for a spiral cell."""
-    recon = ProjectionReconstructor(_spiral_result(), device="cpu")
-    bank = KernelBank(recon)
-    adjoint = bank.adjoint()
+    """``S (filt(a) (x) filt(c))`` masked equals ``warp.spatial`` for a spiral cell."""
+    bank = TemplateWarp(_spiral_result(), device="cpu")
+    adjoint = bank.adjoint
     assert adjoint is not None
     rect = (2, 1, 1, 1)
-    bases = build_bases(adjoint, recon, rect)
+    bases = build_bases(adjoint, bank.reconstructor, rect)
     k_count = bases.n_k
     a = torch.complex(bases.angular[:k_count], bases.angular[k_count:]).to(
         torch.complex128
@@ -113,14 +109,17 @@ def test_adjoint_forward_model_reproduces_a_kernel():
 
 
 def test_unsupported_configs_fall_back_to_none():
-    recon = ProjectionReconstructor(make_synthetic_result(), device="cpu")
-    assert KernelBank(recon, KernelConfig(mode="edge")).adjoint() is None
-    assert KernelBank(recon, KernelConfig(cval=1.0)).adjoint() is None
-    assert KernelBank(recon, KernelConfig(order=0)).adjoint() is None
-    bank = KernelBank(recon)
+    result = make_synthetic_result()
+
+    def warp(**config):
+        return TemplateWarp(result, KernelConfig(**config), device="cpu")
+
+    assert warp(mode="edge").adjoint is None
+    assert warp(cval=1.0).adjoint is None
+    assert warp(order=0).adjoint is None
     with pytest.raises(ValueError, match="unsupported"):
-        KernelBank(recon, KernelConfig(order=0)).adjoint_bases((0, 0, 1, 1))
-    assert bank.adjoint() is not None
+        warp(order=0).adjoint_bases((0, 0, 1, 1))
+    assert warp().adjoint is not None
 
 
 def test_spiral_radial_continuation_matches_pad_radial_axis():
@@ -149,9 +148,7 @@ def test_spiral_radial_continuation_matches_pad_radial_axis():
 
 @requires_cuda
 def test_cuda_adjoint_matches_cpu_kernels_in_every_precision():
-    result = _spiral_result()
-    recon = ProjectionReconstructor(result, device="cuda")
-    bank = KernelBank(recon, device="cuda")
+    bank = TemplateWarp(_spiral_result(), device="cuda")
     rect = (1, 0, 3, 4)
     cells = _cells(rect)
     gen = torch.Generator().manual_seed(2)

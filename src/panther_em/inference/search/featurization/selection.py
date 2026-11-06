@@ -21,8 +21,8 @@ if TYPE_CHECKING:
     from panther_em.inference.search.featurization.direct_featurization import (
         ContractionName,
     )
-    from panther_em.inference.search.template import KernelBank
     from panther_em.inference.search.types import Precision, SearchGeometry
+    from panther_em.inference.template import TemplateWarp
 
 Mode = Literal["fft", "direct"]
 
@@ -51,7 +51,7 @@ def choose_mode(geometry: SearchGeometry, n_selected: int) -> Mode:
 
 
 def make_featurization(
-    kernels: KernelBank,
+    warp: TemplateWarp,
     rect: Sequence[int],
     mode: Mode,
     *,
@@ -62,11 +62,11 @@ def make_featurization(
 ) -> BaseImageFeaturization:
     """The ``mode`` featurization of ``rect``."""
     if mode == "fft":
-        return FFTFeaturization(kernels, rect, cell_chunk=cell_chunk)
+        return FFTFeaturization(warp, rect, cell_chunk=cell_chunk)
 
     if mode == "direct":
         return DirectFeaturization(
-            kernels, rect, batch=batch, precision=precision, contraction=contraction
+            warp, rect, batch=batch, precision=precision, contraction=contraction
         )
 
     raise ValueError(f"unknown featurization mode {mode!r}")

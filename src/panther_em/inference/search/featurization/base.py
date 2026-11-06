@@ -18,8 +18,8 @@ import torch
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
-    from panther_em.inference.search.template import KernelBank
     from panther_em.inference.search.types import Rectangle
+    from panther_em.inference.template import TemplateWarp
 
 
 def rectangle_cells(rect: Rectangle) -> torch.Tensor:
@@ -85,13 +85,13 @@ class BaseImageFeaturization(ABC):
 
     Parameters
     ----------
-    kernels : KernelBank
-        The template's kernel bank; features are computed on its device.
+    warp : TemplateWarp
+        The template's kernel warp; features are computed on its device.
     rect : Rectangle
         ``(k_start, m_start, k_extent, m_extent)`` within the stored decomposition.
     """
 
-    def __init__(self, kernels: KernelBank, rect: Sequence[int]) -> None:
+    def __init__(self, warp: TemplateWarp, rect: Sequence[int]) -> None:
         if len(rect) != 4:
             raise ValueError(
                 f"a rectangle is (k_start, m_start, k_extent, m_extent), got {rect!r}"
@@ -104,7 +104,7 @@ class BaseImageFeaturization(ABC):
                 f"rectangle {tuple(rect)} needs starts >= 0 and extents >= 1"
             )
 
-        result = kernels.reconstructor.result
+        result = warp.result
 
         if k0 + k_ext > int(result.k_max) or m0 + m_ext > int(result.eig_max):
             raise ValueError(
@@ -112,20 +112,20 @@ class BaseImageFeaturization(ABC):
                 f"eig_max={result.eig_max}) feature space"
             )
 
-        self.kernels = kernels
+        self.warp = warp
         self.rect: Rectangle = (k0, m0, k_ext, m_ext)
 
     # -- geometry ---------------------------------------------------------------
 
     @property
     def device(self) -> torch.device:
-        """Where features are computed (the kernel bank's device)."""
-        return self.kernels.device
+        """Where features are computed (the warp's device)."""
+        return self.warp.device
 
     @property
     def box_shape(self) -> tuple[int, int]:
         """Kernel box ``(kH, kW)``."""
-        k_h, k_w = self.kernels.template_shape
+        k_h, k_w = self.warp.box_shape
         return int(k_h), int(k_w)
 
     @property

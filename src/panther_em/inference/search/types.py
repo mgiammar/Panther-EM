@@ -51,32 +51,6 @@ class Precision(str, enum.Enum):
 
 
 @dataclass(frozen=True)
-class KernelConfig:
-    """Polar-to-Cartesian warp settings used when building feature kernels.
-
-    Replaces the ``**polar_to_cart_kwargs`` that used to be threaded from the search
-    entry points down to
-    :meth:`~panther_em.inference.projection_reconstruction.ProjectionReconstructor.construct_cartesian_feature`.
-    """
-
-    order: int = 5
-    mode: str = "constant"
-    cval: float = 0.0
-    preserve_energy: bool = True
-    wrap_angular_axis: bool = True
-
-    def as_kwargs(self) -> dict[str, int | str | float | bool]:
-        """Keyword arguments for ``construct_cartesian_feature``."""
-        return {
-            "order": self.order,
-            "mode": self.mode,
-            "cval": self.cval,
-            "preserve_energy": self.preserve_energy,
-            "wrap_angular_axis": self.wrap_angular_axis,
-        }
-
-
-@dataclass(frozen=True)
 class BatchShape:
     """Inner-loop batch sizes: pixels per GEMM and hypotheses per GEMM."""
 
