@@ -20,13 +20,14 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from panther_em.inference.search.features import as_rectangle, make_engine
+from panther_em.inference.search.correlation.contraction import make_engine
+from panther_em.inference.search.correlation.layout import as_rectangle
 from panther_em.inference.search.types import Precision
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
 
-    from panther_em.inference.search.features import ContractionEngine
+    from panther_em.inference.search.correlation.contraction import ContractionEngine
     from panther_em.inference.search.featurization.base import FeatureChunk
     from panther_em.inference.search.types import Rectangle
 

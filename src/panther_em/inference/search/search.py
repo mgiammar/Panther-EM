@@ -56,15 +56,9 @@ from typing import TYPE_CHECKING, Literal
 import torch
 from tqdm import tqdm
 
+from panther_em.inference.search.correlation.executor import Executor
+from panther_em.inference.search.correlation.maps import StageMaps, merge_stage_maps
 from panther_em.inference.search.decision import PixelLabel
-from panther_em.inference.search.executor import (
-    Executor,
-    StageMaps,
-    feature_bytes_per_pixel,
-    merge_stage_maps,
-    plan_memory,
-    plan_stage,
-)
 from panther_em.inference.search.featurization import (
     FeatureStore,
     choose_mode,
@@ -72,6 +66,11 @@ from panther_em.inference.search.featurization import (
 )
 from panther_em.inference.search.hypotheses import HypothesisSpace, healpix_ipix
 from panther_em.inference.search.noise_model import ImageSet
+from panther_em.inference.search.planning import (
+    feature_bytes_per_pixel,
+    plan_memory,
+    plan_stage,
+)
 from panther_em.inference.search.results import PixelLedger, SearchResult, StageResult
 from panther_em.inference.search.stage import Stage
 from panther_em.inference.search.types import (
@@ -84,7 +83,6 @@ from panther_em.inference.search.types import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
 
-    from panther_em.inference.search.executor import MemoryPlan
     from panther_em.inference.search.featurization import (
         BaseImageFeaturization,
         Mode,
@@ -92,6 +90,7 @@ if TYPE_CHECKING:
     from panther_em.inference.search.featurization.direct_featurization import (
         ContractionName,
     )
+    from panther_em.inference.search.planning import MemoryPlan
     from panther_em.inference.search.types import BatchShape, Rectangle
     from panther_em.inference.template import Template, TemplateWarp
 

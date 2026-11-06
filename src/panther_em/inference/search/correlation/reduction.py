@@ -1,4 +1,4 @@
-"""Per-pixel search statistics tracked online over a batch of hypotheses.
+"""The reduction: iRFFT over the in-plane angle, moments and the running maximum.
 
 :class:`PixelStats` accumulates the first two moments plus the running best correlation
 (and the hypothesis / in-plane angle that produced it) for a batch of image pixels, so a
@@ -13,8 +13,10 @@ from typing import TYPE_CHECKING, Literal, overload
 
 import torch
 
-from panther_em.inference.search import fused_kernel_loader
-from panther_em.inference.search.packed import decode_argmax_packed
+from panther_em.inference.search.correlation.kernels import fused_kernel_loader
+from panther_em.inference.search.correlation.kernels.packed import (
+    decode_argmax_packed,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -773,7 +775,9 @@ class BlockStats:
         # One tracker for the whole block; the sub-batches are views of its buffers,
         # so finalization runs once per block instead of once per sub-batch (that
         # was ~20 small launches x n_sub per block, the dominant loop overhead).
-        self.block = PixelStats(int(n_sub) * int(gemm_pixels), device=device, fused=fused)
+        self.block = PixelStats(
+            int(n_sub) * int(gemm_pixels), device=device, fused=fused
+        )
         self.stats = [
             PixelStats.view_of(self.block, sub * gemm_pixels, (sub + 1) * gemm_pixels)
             for sub in range(n_sub)
@@ -795,7 +799,10 @@ class BlockStats:
     def consume(self, spectrum_pnf: torch.Tensor, batch: HypBatch, sub: int) -> None:
         """Accumulate one batch's spectrum ``(P_g, N_b, F)`` into sub-batch ``sub``."""
         self.stats[sub].update_graphed(
-            spectrum_pnf, batch.virtual_offset, num_psi=self.n_psi, reverse_psi_axis=True
+            spectrum_pnf,
+            batch.virtual_offset,
+            num_psi=self.n_psi,
+            reverse_psi_axis=True,
         )
 
     def note_replayed(self, n_evaluated: int) -> None:

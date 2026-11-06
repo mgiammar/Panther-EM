@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from panther_em.inference.search.decision import PixelLabel
-from panther_em.inference.search.executor import StageMaps
+from panther_em.inference.search.correlation.maps import StageMaps
 from panther_em.inference.search.hypotheses import HypothesisSpace
 from panther_em.inference.search.stage import Stage, stage_from_json, stage_to_json
 from panther_em.inference.search.types import PixelSelection, SearchGeometry

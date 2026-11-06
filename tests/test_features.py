@@ -6,7 +6,7 @@ import pytest
 import torch
 from conftest import read_engine_block, reference_spectrum
 
-from panther_em.inference.search.features import (
+from panther_em.inference.search.correlation import (
     ComplexGemmEngine,
     FeatureLayout,
     Fp16GemmEngine,
@@ -14,7 +14,6 @@ from panther_em.inference.search.features import (
     make_engine,
     rectangles_disjoint,
 )
-
 
 # --------------------------------------------------------------------------- #
 # layout

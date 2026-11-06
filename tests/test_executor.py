@@ -5,20 +5,24 @@ from __future__ import annotations
 import pytest
 import torch
 
-from panther_em.inference.template import WeightSource
-from panther_em.inference.search.features import ComplexGemmEngine
-from panther_em.inference.search.executor import (
+from panther_em.inference.search.correlation import (
+    ComplexGemmEngine,
     Executor,
+    FeatureLayout,
+)
+from panther_em.inference.search.featurization import FeatureChunk, FeatureStore
+from panther_em.inference.search.hypotheses import (
+    HypBatch,
+    HypothesisSpace,
+)
+from panther_em.inference.search.planning import (
     hyp_batch_multiple,
     plan_memory,
     plan_stage,
 )
-from panther_em.inference.search.hypotheses import HypBatch
-from panther_em.inference.search.features import FeatureLayout
-from panther_em.inference.search.hypotheses import HypothesisSet, HypothesisSpace
 from panther_em.inference.search.stage import Stage
-from panther_em.inference.search.featurization import FeatureChunk, FeatureStore
 from panther_em.inference.search.types import BatchShape
+from panther_em.inference.template import WeightSource
 
 CUDA = torch.cuda.is_available()
 pytestmark = pytest.mark.filterwarnings("ignore:ComplexHalf support is experimental")
@@ -298,7 +302,7 @@ def test_cuda_fused_eager_and_graph_match_reference(synthetic_result, precision)
 
 
 def test_merge_stage_maps_matches_the_joint_statistics():
-    from panther_em.inference.search.executor import StageMaps, merge_stage_maps
+    from panther_em.inference.search.correlation import StageMaps, merge_stage_maps
 
     gen = torch.Generator().manual_seed(3)
     n_planes, n_sel, n_psi, n_px = 3, 5, 4, 7

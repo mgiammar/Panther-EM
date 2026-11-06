@@ -9,8 +9,8 @@ import torch
 from noise_case import BOX, noise_case
 from skimage.morphology import isotropic_dilation
 
+from panther_em.inference.search.correlation import StageMaps
 from panther_em.inference.search.decision import Decision, PixelLabel
-from panther_em.inference.search.executor import StageMaps
 from panther_em.inference.search.hypotheses import HypothesisSet, HypothesisSpace
 from panther_em.inference.search.noise_model import Calibration, ThresholdTest
 from panther_em.inference.search.results import PixelLedger

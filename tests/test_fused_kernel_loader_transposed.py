@@ -20,8 +20,8 @@ import warnings
 import pytest
 import torch
 
-from panther_em.inference.search import fused_kernel_loader
-from panther_em.inference.search.statistics import _reduce_stats
+from panther_em.inference.search.correlation.kernels import fused_kernel_loader
+from panther_em.inference.search.correlation.reduction import _reduce_stats
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA device"

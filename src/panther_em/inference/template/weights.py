@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from panther_em.decomposition.result import DecompositionResult
-    from panther_em.inference.search.features import FeatureLayout
+    from panther_em.inference.search.correlation.layout import FeatureLayout
 
 Rectangle = tuple[int, int, int, int]
 

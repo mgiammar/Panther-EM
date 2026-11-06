@@ -122,9 +122,8 @@ Example
     result.save("search.h5")
 """
 
+from panther_em.inference.search.correlation import Executor, FeatureLayout
 from panther_em.inference.search.decision import Decision, PixelLabel
-from panther_em.inference.search.executor import Executor, MemoryPlan, StagePlan
-from panther_em.inference.search.features import FeatureLayout
 from panther_em.inference.search.featurization import (
     BaseImageFeaturization,
     DirectFeaturization,
@@ -153,6 +152,7 @@ from panther_em.inference.search.noise_model import (
     zeta_quantile,
     zscore_threshold,
 )
+from panther_em.inference.search.planning import MemoryPlan, StagePlan
 from panther_em.inference.search.results import PixelLedger, SearchResult, StageResult
 from panther_em.inference.search.search import ExecutionConfig, Searcher, SearchSession
 from panther_em.inference.search.stage import Stage

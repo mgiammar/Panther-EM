@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from panther_em.inference.search.decision import Decision
-from panther_em.inference.search.features import (
+from panther_em.inference.search.correlation.layout import (
     FeatureLayout,
     as_rectangle,
     rectangles_disjoint,

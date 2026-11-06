@@ -20,12 +20,12 @@ import warnings
 import pytest
 import torch
 
-from panther_em.inference.search import fused_kernel_loader
-from panther_em.inference.search.packed import (
+from panther_em.inference.search.correlation.kernels import fused_kernel_loader
+from panther_em.inference.search.correlation.kernels.packed import (
     decode_argmax_packed,
     encode_argmax_packed,
 )
-from panther_em.inference.search.statistics import (
+from panther_em.inference.search.correlation.reduction import (
     PixelStats,
     _cuda_graph_capture_supported,
     _reduce_stats,

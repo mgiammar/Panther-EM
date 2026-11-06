@@ -10,7 +10,6 @@ import pytest
 import torch
 from noise_case import BOX, noise_case
 
-from panther_em.inference.correlation import compute_feature_stack
 from panther_em.inference.search import search as search_module
 from panther_em.inference.search.decision import Decision, PixelLabel
 from panther_em.inference.search.featurization import (
@@ -95,6 +94,15 @@ def template(synthetic_result):
 
 def _image(h=30, w=30, seed=0):
     return torch.randn(h, w, generator=torch.Generator().manual_seed(seed))
+
+
+def compute_feature_stack(image, kernels):
+    """Valid cross-correlation ``(B, L, H - kH + 1, W - kW + 1)`` of ``image (B, H, W)``
+    with ``kernels (L, kH, kW)`` by a full-size FFT (the test's independent reference)."""
+    _, h, w = image.shape
+    _, kh, kw = kernels.shape
+    spectrum = torch.fft.fft2(image)[:, None] * torch.fft.fft2(kernels, s=(h, w)).conj()
+    return torch.fft.ifft2(spectrum)[..., : h - kh + 1, : w - kw + 1]
 
 
 def _dense_reference(template, image, rects, n_psi, planes=None, filters=None):

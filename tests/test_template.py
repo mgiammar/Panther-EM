@@ -6,7 +6,7 @@ import pytest
 import torch
 from conftest import count_kernel_builds, requires_cuda
 
-from panther_em.inference.search.features import FeatureLayout
+from panther_em.inference.search.correlation import FeatureLayout
 from panther_em.inference.template import (
     KernelConfig,
     Template,
