@@ -95,3 +95,18 @@ def merge_stage_maps(parts: Sequence[StageMaps], n_selected: int) -> StageMaps:
         best_psi=torch.where(searched, best_psi.gather(0, gather)[0], none),
         n_evaluated=sum(p.n_evaluated for p in parts),
     )
+
+
+def concat_stage_maps(parts: Sequence[StageMaps]) -> StageMaps:
+    """Maps of disjoint pixel bands, concatenated in band order."""
+    if len(parts) == 1:
+        return parts[0]
+    return StageMaps(
+        mip=torch.cat([p.mip for p in parts]),
+        mean=torch.cat([p.mean for p in parts]),
+        variance=torch.cat([p.variance for p in parts]),
+        zscore=torch.cat([p.zscore for p in parts]),
+        best_virtual=torch.cat([p.best_virtual for p in parts]),
+        best_psi=torch.cat([p.best_psi for p in parts]),
+        n_evaluated=parts[0].n_evaluated,
+    )

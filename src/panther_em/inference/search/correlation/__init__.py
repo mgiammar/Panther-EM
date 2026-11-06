@@ -10,9 +10,9 @@ The search's inner loop, per block of pixels and batch of hypotheses:
    the torch reference);
 3. **loop** (:mod:`.loop`): the two above for every sub-batch and hypothesis batch of
    a block, captured once as a CUDA graph where the kernels allow;
-4. **executor** (:mod:`.executor`): the resources that outlive a stage (prepared
-   weights, captured loops, streams) and the run over a store's blocks into
-   :class:`~.maps.StageMaps`.
+4. **correlator** (:mod:`.correlator`): the resources that outlive a pass (prepared
+   weights, captured loops, the stream) and the run over a store's blocks into
+   :class:`~.maps.StageMaps`, given a pass's :class:`~.loop.LoopPlan`.
 
 The package knows store blocks and weights, not images, pixel positions or decisions.
 """
@@ -24,7 +24,7 @@ from panther_em.inference.search.correlation.contraction import (
     Spectrum,
     make_engine,
 )
-from panther_em.inference.search.correlation.executor import Executor
+from panther_em.inference.search.correlation.correlator import Correlator
 from panther_em.inference.search.correlation.layout import (
     FeatureLayout,
     KRun,
@@ -32,21 +32,27 @@ from panther_em.inference.search.correlation.layout import (
     as_rectangle,
     rectangles_disjoint,
 )
-from panther_em.inference.search.correlation.loop import HypLoop
-from panther_em.inference.search.correlation.maps import StageMaps, merge_stage_maps
+from panther_em.inference.search.correlation.loop import HypLoop, LoopPlan
+from panther_em.inference.search.correlation.maps import (
+    StageMaps,
+    concat_stage_maps,
+    merge_stage_maps,
+)
 
 __all__ = [
     "ComplexGemmEngine",
     "ContractionEngine",
-    "Executor",
+    "Correlator",
     "FeatureLayout",
     "Fp16GemmEngine",
     "HypLoop",
     "KRun",
     "LayoutPart",
+    "LoopPlan",
     "Spectrum",
     "StageMaps",
     "as_rectangle",
+    "concat_stage_maps",
     "make_engine",
     "merge_stage_maps",
     "rectangles_disjoint",

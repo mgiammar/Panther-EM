@@ -10,7 +10,8 @@ import pytest
 import torch
 from noise_case import BOX, noise_case
 
-from panther_em.inference.search import search as search_module
+from panther_em.inference.search import runner as runner_module
+from panther_em.inference.search.config import ExecutionConfig, Tuning
 from panther_em.inference.search.decision import Decision, PixelLabel
 from panther_em.inference.search.featurization import (
     BaseImageFeaturization,
@@ -24,7 +25,7 @@ from panther_em.inference.search.results import (
     SearchResult,
     StageResult,
 )
-from panther_em.inference.search.search import ExecutionConfig, Searcher
+from panther_em.inference.search.search import Searcher
 from panther_em.inference.search.stage import Stage
 from panther_em.inference.search.types import BatchShape, SearchImages
 from panther_em.inference.template import Template
@@ -34,9 +35,11 @@ pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array__ implementation doesn't accept.*:DeprecationWarning",
 )
 
-EXEC = ExecutionConfig(batch=BatchShape(8, 5), cell_chunk=4, use_cuda_graph=False)
+EXEC = ExecutionConfig(
+    tuning=Tuning(batch=BatchShape(8, 5), cell_chunk=4, use_cuda_graph=False)
+)
 # every plane resident at once, one kernel sweep over all of them
-EXEC_JOINT = replace(EXEC, plane_major=False)
+EXEC_JOINT = replace(EXEC, tuning=replace(EXEC.tuning, plane_major=False))
 
 
 class StubFeaturization(BaseImageFeaturization):
@@ -461,7 +464,7 @@ def test_center_mode_orientation_subset_and_run_many(template):
     }
     assert dec["phi"] is not None and torch.isfinite(dec["phi"]).all()
     torch.testing.assert_close(results[0].mip, results[1].mip)
-    assert len(searcher.executor.loops) == 1  # the loop was reused across image sets
+    assert len(searcher.correlator.loops) == 1  # the loop was reused across image sets
 
 
 def test_search_result_round_trip_and_masked_pixels(template, tmp_path):
@@ -533,17 +536,17 @@ def test_cuda_bands_match_one_band_and_never_coexist(synthetic_result, monkeypat
         Stage.create([(0, 0, 3, 4)], n_psi=16, decision=Decision(0.0, accept=False)),
         Stage.create([(0, 0, 4, 5)], n_psi=16),
     ]
-    exe = replace(EXEC, batch=BatchShape(64, 5))
+    exe = replace(EXEC, tuning=replace(EXEC.tuning, batch=BatchShape(64, 5)))
     alive_at_allocation: list[int] = []
     stores: list[weakref.ref] = []
 
-    class Tracked(search_module.FeatureStore):
+    class Tracked(runner_module.FeatureStore):
         def __init__(self, *args, **kwargs):
             alive_at_allocation.append(sum(r() is not None for r in stores))
             super().__init__(*args, **kwargs)
             stores.append(weakref.ref(self))
 
-    monkeypatch.setattr(search_module, "FeatureStore", Tracked)
+    monkeypatch.setattr(runner_module, "FeatureStore", Tracked)
 
     def run(fraction):
         searcher = Searcher(
@@ -581,7 +584,7 @@ def test_cuda_mixed_precision_two_stage_matches_cpu(synthetic_result):
     cpu = Searcher(
         Template(result, device="cpu"),
         stages("fp32"),
-        execution=ExecutionConfig(batch=BatchShape(8, 4), cell_chunk=4),
+        execution=ExecutionConfig(tuning=Tuning(batch=BatchShape(8, 4), cell_chunk=4)),
     ).run(SearchImages.single(image))
     gpu_searcher = Searcher(
         Template(result, device="cuda"),
@@ -589,12 +592,13 @@ def test_cuda_mixed_precision_two_stage_matches_cpu(synthetic_result):
         # fp32 direct contraction: the fp16 default is 5e-4 off on the features, and
         # stage 1 (fp32) is compared with the CPU at 1e-4 below
         execution=ExecutionConfig(
-            batch=BatchShape(8, 4), cell_chunk=4, use_cuda_graph=True, direct_precision="fp32"
+            direct_precision="fp32",
+            tuning=Tuning(batch=BatchShape(8, 4), cell_chunk=4, use_cuda_graph=True),
         ),
         keep_stage_results=True,
     )
     gpu = gpu_searcher.run(SearchImages.single(image)).to("cpu")
-    assert any(loop.graph is not None for loop in gpu_searcher.executor.loops.values())
+    assert any(loop.graph is not None for loop in gpu_searcher.correlator.loops.values())
     # stage 0 ran in fp16 on the GPU: the re-scored set may differ at near-ties, so
     # compare the final maps only where both searched the pixel in the same stage
     same = (gpu.last_stage == cpu.last_stage) & (cpu.last_stage >= 0)
@@ -664,7 +668,7 @@ def test_session_store_is_released_after_the_session(template):
     gc.collect()
     assert store_ref() is None  # only the session owned the store
     assert block_ref() is None  # and nothing (the cached loop's plan) kept its blocks
-    assert searcher.executor.loops  # the loop cache survives for the next image set
+    assert searcher.correlator.loops  # the loop cache survives for the next image set
 
 
 def test_plane_major_passes_match_the_joint_search(template):
@@ -691,7 +695,7 @@ def test_plane_major_passes_match_the_joint_search(template):
     torch.testing.assert_close(major.stage_results[0].best_index, joint.stage_results[0].best_index)
     assert major.stage_results[0].maps.n_evaluated == joint.stage_results[0].maps.n_evaluated
     # the two passes shared one loop and the prepared weights of the hypotheses
-    assert len(major_session.searcher.executor.loops) == 1
+    assert len(major_session.searcher.correlator.loops) == 1
     # a later stage over the same planes starts from an empty store (featurizes again)
     stages = [stage, Stage.create([rect], n_psi=16, planes=(0, 2), decision=Decision(0.5))]
     stub = StubFeaturizer()

@@ -3,28 +3,152 @@
 :class:`HypLoop` reduces one pixel block of features against every hypothesis: one
 contraction into a static spectrum buffer and one statistics update per (sub-batch,
 hypothesis batch, k-run); on CUDA with the fused kernels the whole block loop is
-captured once as a CUDA graph and replayed per block.
+captured once as a CUDA graph and replayed per block. :class:`LoopPlan` is what the
+loop reads: a pass's shapes (its memory plan) resolved against the store whose blocks
+it will see.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 from panther_em.inference.search.correlation.contraction import Spectrum
+from panther_em.inference.search.correlation.reduction import SpectrumSpec
 
 if TYPE_CHECKING:
+    from panther_em.inference.search.correlation.contraction import ContractionEngine
+    from panther_em.inference.search.correlation.layout import FeatureLayout
     from panther_em.inference.search.correlation.reduction import BlockStats
-    from panther_em.inference.search.planning import StagePlan
+    from panther_em.inference.search.featurization.store import (
+        ColumnGroup,
+        FeatureStore,
+    )
+    from panther_em.inference.search.hypotheses import HypothesisSet
+    from panther_em.inference.search.planning import MemoryPlan
+    from panther_em.inference.search.stage import Stage
+
+
+@dataclass(frozen=True, eq=False)
+class LoopPlan:
+    """Everything the block loop needs for one pass, resolved against its store.
+
+    Build with :meth:`create`.
+
+    Attributes
+    ----------
+    stage : Stage
+        The stage the pass belongs to.
+    layout : FeatureLayout
+        The stage's rectangles.
+    groups : tuple[ColumnGroup, ...]
+        Every store group the pass reads (addressed by ``group.id``).
+    plane_lookup : tuple[tuple[tuple[int, int], ...], ...]
+        ``[rect_index][d_local] -> (group id, local plane index)``.
+    memory : MemoryPlan
+        The pass's shapes.
+    signature : tuple
+        Cache identity of the hypothesis loop (layout, precision, shapes, hypotheses).
+    """
+
+    stage: Stage
+    layout: FeatureLayout
+    groups: tuple[ColumnGroup, ...]
+    plane_lookup: tuple[tuple[tuple[int, int], ...], ...]
+    memory: MemoryPlan
+    signature: tuple
+
+    @classmethod
+    def create(cls, stage: Stage, store: FeatureStore, memory: MemoryPlan) -> LoopPlan:
+        """Resolve a pass's memory plan against a store whose groups already exist."""
+        layout = stage.layout()
+        planes = memory.hyps.defocus_planes()
+        groups: list[ColumnGroup] = []
+        lookup: list[tuple[tuple[int, int], ...]] = []
+        for rect in layout.rectangles:
+            try:
+                covering = store.groups_covering(rect, stage.precision, planes)
+            except KeyError as exc:
+                raise ValueError(str(exc)) from exc
+            lookup.append(tuple((g.id, local) for g, local in covering))
+            for g, _ in covering:
+                if g not in groups:
+                    groups.append(g)
+        if memory.block_pixels != store.block_pixels:
+            raise ValueError(
+                f"memory plan block_pixels {memory.block_pixels} != store "
+                f"block_pixels {store.block_pixels}"
+            )
+        signature = (
+            layout.rectangles,
+            stage.precision,
+            # a group's block shape is set by its plane count, not by which planes
+            tuple((g.id, g.rect, g.precision, g.n_defocus) for g in groups),
+            tuple(lookup),
+            memory.gemm_pixels,
+            memory.block_pixels,
+            memory.hyp_batch,
+            stage.n_psi,
+            # which planes a pass searches is irrelevant to the loop: it reads the
+            # groups/lookup above, and the batches depend on the plane *count* only
+            memory.hyps.template_signature,
+            memory.hyps.n_defocus_selected,
+            memory.fused,
+            memory.loop,
+            str(memory.device),
+        )
+        return cls(
+            stage=stage,
+            layout=layout,
+            groups=tuple(groups),
+            plane_lookup=tuple(lookup),
+            memory=memory,
+            signature=signature,
+        )
+
+    @property
+    def engine(self) -> ContractionEngine:
+        """The stage's GEMM engine."""
+        return self.memory.engine
+
+    @property
+    def hyps(self) -> HypothesisSet:
+        """The pass's batched hypotheses."""
+        return self.memory.hyps
+
+    @property
+    def fused(self) -> bool:
+        """Whether the statistics run on the fused CUDA kernels."""
+        return self.memory.fused
+
+    @property
+    def n_freq(self) -> int:
+        """``k_stop``."""
+        return self.stage.k_stop
+
+    @cached_property
+    def spectrum(self) -> SpectrumSpec:
+        """Shape of the pass's spectra (the statistics' construction parameters)."""
+        return SpectrumSpec(
+            dtype=self.engine.spectrum_dtype,
+            n_freq=self.n_freq,
+            n_psi=self.stage.n_psi,
+            gemm_pixels=self.memory.gemm_pixels,
+            n_sub=self.memory.n_sub,
+            hyp_batch=self.memory.hyp_batch,
+            n_virtual=self.hyps.n_virtual,
+            device=self.memory.device,
+        )
 
 
 Prepared = Mapping[tuple[int, int], torch.Tensor]  # (k-run index, batch index) -> B
 
 
-def _make_spectra(plan: StagePlan, device: torch.device) -> dict[int, Spectrum]:
+def _make_spectra(plan: LoopPlan, device: torch.device) -> dict[int, Spectrum]:
     """One static spectrum buffer per distinct hypothesis-batch size (full + tail)."""
     spectra: dict[int, Spectrum] = {}
     for batch in plan.hyps.batches:
@@ -42,7 +166,7 @@ def _make_spectra(plan: StagePlan, device: torch.device) -> dict[int, Spectrum]:
 
 
 def _loop_body(
-    plan: StagePlan,
+    plan: LoopPlan,
     prepared: Prepared,
     operands: Mapping[int, torch.Tensor],
     stats: BlockStats,
@@ -90,7 +214,7 @@ class HypLoop:
 
     Attributes
     ----------
-    plan : StagePlan
+    plan : LoopPlan
     stats : BlockStats
         The block accumulator the loop fills.
     graph : torch.cuda.CUDAGraph or None
@@ -99,7 +223,7 @@ class HypLoop:
 
     def __init__(
         self,
-        plan: StagePlan,
+        plan: LoopPlan,
         prepared: Prepared,
         stats: BlockStats,
         spectra: Mapping[int, Spectrum],
@@ -120,7 +244,7 @@ class HypLoop:
     @torch.no_grad()
     def build(
         cls,
-        plan: StagePlan,
+        plan: LoopPlan,
         prepared: Prepared,
         stats: BlockStats,
         example: Mapping[int, torch.Tensor],

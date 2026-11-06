@@ -1,14 +1,16 @@
-"""Executor end to end vs a dense reference (CPU torch path; CUDA fused/graph)."""
+"""Correlator end to end vs a dense reference (CPU torch path; CUDA fused/graph)."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
+from panther_em.inference.search.config import Tuning
 from panther_em.inference.search.correlation import (
     ComplexGemmEngine,
-    Executor,
+    Correlator,
     FeatureLayout,
+    LoopPlan,
 )
 from panther_em.inference.search.featurization import FeatureChunk, FeatureStore
 from panther_em.inference.search.hypotheses import (
@@ -16,9 +18,9 @@ from panther_em.inference.search.hypotheses import (
     HypothesisSpace,
 )
 from panther_em.inference.search.planning import (
+    DeviceInfo,
     hyp_batch_multiple,
     plan_memory,
-    plan_stage,
 )
 from panther_em.inference.search.stage import Stage
 from panther_em.inference.search.types import BatchShape
@@ -100,18 +102,20 @@ def _run_stage(
     use_fused_kernel=True,
 ):
     memory = plan_memory(
-        ctx,
+        DeviceInfo.probe(ctx.device),
         spec,
         n_pixels=store.n_pixels,
         space=space,
         template_ids=template_ids,
         defocus_ids=defocus_ids,
-        batch=batch,
-        block_pixels=store.block_pixels,
-        use_cuda_graph=use_cuda_graph,
-        use_fused_kernel=use_fused_kernel,
+        tuning=Tuning(
+            batch=batch,
+            block_pixels=store.block_pixels,
+            use_cuda_graph=use_cuda_graph,
+            use_fused_kernel=use_fused_kernel,
+        ),
     )
-    plan = plan_stage(ctx, 0, spec, store, memory)
+    plan = LoopPlan.create(spec, store, memory)
     maps = ctx.run(store, plan)
     return plan, maps
 
@@ -132,7 +136,7 @@ def test_cpu_eager_matches_reference_any_block_size(synthetic_result, block_pixe
     space = HypothesisSpace.from_result(result)
     spec = Stage.create([(0, 0, 4, 3), (0, 3, 2, 2)], precision="fp32", n_psi=16)
     store, features = _fill_store(result, spec, 1, block_pixels, "cpu")
-    ctx = Executor("cpu", WeightSource(result, "cpu"))
+    ctx = Correlator("cpu", WeightSource(result, "cpu"))
     plan, maps = _run_stage(ctx, result, spec, store, space, batch=BatchShape(4, 4))
     assert plan.memory.block_pixels == block_pixels and plan.memory.loop == "eager"
     assert plan.fused is False
@@ -146,7 +150,7 @@ def test_defocus_axis_reduces_over_planes(synthetic_result):
     space = HypothesisSpace.from_result(result, n_defocus=3)
     spec = Stage.create([(0, 0, 4, 5)], n_psi=16)
     store, features = _fill_store(result, spec, 3, 8, "cpu")
-    ctx = Executor("cpu", WeightSource(result, "cpu"))
+    ctx = Correlator("cpu", WeightSource(result, "cpu"))
     plan, maps = _run_stage(ctx, result, spec, store, space, batch=BatchShape(4, 6))
     ref = _reference(result, spec, features, plan.hyps, 16)
     _assert_matches(maps, ref, plan.hyps)
@@ -175,7 +179,7 @@ def test_strided_subset_matches_restricted_reference_and_decodes_globally(
     space = HypothesisSpace.from_result(result, n_defocus=2)
     spec = Stage.create([(0, 0, 3, 4)], n_psi=16)
     store, features = _fill_store(result, spec, 2, 25, "cpu")
-    ctx = Executor("cpu", WeightSource(result, "cpu"))
+    ctx = Correlator("cpu", WeightSource(result, "cpu"))
     plan, maps = _run_stage(
         ctx,
         result,
@@ -198,10 +202,14 @@ def test_strided_subset_matches_restricted_reference_and_decodes_globally(
 def test_plan_memory_defaults_and_overrides(synthetic_result):
     result = synthetic_result(n_orientations=40)
     space = HypothesisSpace.from_result(result, n_defocus=3)
-    ctx = Executor("cpu", WeightSource(result, "cpu"))
+    cpu = DeviceInfo(torch.device("cpu"))
     spec = Stage.create([(0, 0, 4, 5)], n_psi=256)
     plan = plan_memory(
-        ctx, spec, n_pixels=1000, space=space, l2_target=64 * 1024**2, block_bytes_max=1024
+        cpu,
+        spec,
+        n_pixels=1000,
+        space=space,
+        tuning=Tuning(l2_target=64 * 1024**2, block_bytes_max=1024),
     )
     # the L2 budget allows more than the 120 hypotheses, so the batch is clamped to them
     assert plan.hyp_batch == 120 and plan.block_pixels % plan.gemm_pixels == 0
@@ -209,13 +217,12 @@ def test_plan_memory_defaults_and_overrides(synthetic_result):
     assert plan.hyps.hyp_batch == plan.hyp_batch
     assert plan.hyps.n_virtual == 3 * 40
     explicit = plan_memory(
-        ctx,
+        cpu,
         spec,
         n_pixels=10,
         space=space,
         defocus_ids=torch.tensor([1]),
-        batch=BatchShape(4, 3),
-        block_pixels=9,
+        tuning=Tuning(batch=BatchShape(4, 3), block_pixels=9),
     )
     assert (explicit.gemm_pixels, explicit.hyp_batch, explicit.block_pixels) == (4, 3, 8)
     assert explicit.hyps.defocus_planes() == (1,)
@@ -230,7 +237,7 @@ def test_executor_prepared_weights_hit_and_evict(synthetic_result):
     run = layout.k_runs[0]  # k in [0, 3): both first rectangles
     batch = HypBatch(0, 1, 5, 1)
 
-    ctx = Executor("cpu", src)
+    ctx = Correlator("cpu", src)
     got = ctx.prepared(layout, run, batch, engine)
     manual = engine.prepare_weights(
         torch.cat([src.block((0, 0, 3, 2))[1:5], src.block((0, 2, 3, 3))[1:5]], dim=-1)
@@ -252,7 +259,7 @@ def test_executor_prepared_weights_hit_and_evict(synthetic_result):
         ),
     )
 
-    tiny = Executor("cpu", src, prepared_budget=got.numel() * got.element_size())
+    tiny = Correlator("cpu", src, prepared_budget=got.numel() * got.element_size())
     a = tiny.prepared(layout, run, batch, engine)
     b = tiny.prepared(layout, layout.k_runs[1], batch, engine)  # over budget: newest kept
     assert tiny.prepared(layout, layout.k_runs[1], batch, engine) is b
@@ -269,7 +276,7 @@ def test_cuda_fused_eager_and_graph_match_reference(synthetic_result, precision)
     space = HypothesisSpace.from_result(result, n_defocus=2)
     spec = Stage.create([(0, 0, 4, 3), (0, 3, 2, 2)], precision=precision, n_psi=128)
     store, features = _fill_store(result, spec, 2, 8, device)
-    ctx = Executor(device, WeightSource(result, device))
+    ctx = Correlator(device, WeightSource(result, device))
     tol = (
         {"rtol": 1e-4, "atol": 1e-4}
         if precision == "fp32"

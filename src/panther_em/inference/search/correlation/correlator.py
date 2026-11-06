@@ -1,8 +1,8 @@
-"""The correlation executor: long-lived resources and the run over a store's blocks.
+"""The correlator: what outlives a pass, and the run over a store's blocks.
 
-:class:`Executor` owns what outlives a stage and an image set: the device
-capabilities, the streams, the prepared-weight cache and the cache of captured loops;
-:meth:`Executor.run` reduces every block of a store into :class:`StageMaps`.
+:class:`Correlator` owns the prepared-weight cache, the cache of built (captured)
+loops, the compute stream and the graph pool; :meth:`Correlator.run` correlates
+every block of a store against a pass's hypotheses into :class:`StageMaps`.
 """
 
 from __future__ import annotations
@@ -13,23 +13,18 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from panther_em.inference.search.correlation.kernels import fused_kernel_loader
 from panther_em.inference.search.correlation.loop import HypLoop
 from panther_em.inference.search.correlation.maps import StageMaps
-from panther_em.inference.search.correlation.reduction import (
-    _cuda_graph_capture_supported,
-    make_block_stats,
-)
+from panther_em.inference.search.correlation.reduction import make_block_stats
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Hashable, Mapping
 
     from panther_em.inference.search.correlation.contraction import ContractionEngine
     from panther_em.inference.search.correlation.layout import FeatureLayout, KRun
-    from panther_em.inference.search.correlation.loop import Prepared
+    from panther_em.inference.search.correlation.loop import LoopPlan, Prepared
     from panther_em.inference.search.featurization.store import FeatureStore
     from panther_em.inference.search.hypotheses import HypBatch
-    from panther_em.inference.search.planning import StagePlan
     from panther_em.inference.template import WeightSource
 
 
@@ -65,12 +60,13 @@ class _ByteLRU:
         self.nbytes = 0
 
 
-class Executor:
-    """Long-lived execution resources shared by every stage and image set.
+class Correlator:
+    """Long-lived correlation resources shared by every pass and image set.
 
     Parameters
     ----------
     device : torch.device or str
+        The compute device.
     weights : WeightSource
         Backs the prepared-weight cache.
     prepared_budget : int, optional
@@ -78,15 +74,10 @@ class Executor:
 
     Attributes
     ----------
-    is_cuda, cuda_graphs, fused_kernel : bool
-        Probed once: CUDA device; CUDA graph capture works; the fused iRFFT+stats
-        extension compiled (probing it triggers the JIT build).
-    l2_bytes, free_bytes : int or None
-        L2 cache size and free device memory at construction, when known.
     compute : torch.cuda.Stream or None
-        The stream the block loop runs on.
+        The stream the block loop runs on (CUDA only).
     loops : dict
-        Captured or eager hypothesis loops keyed by ``StagePlan.signature``.
+        Captured or eager hypothesis loops keyed by ``LoopPlan.signature``.
     """
 
     def __init__(
@@ -98,41 +89,13 @@ class Executor:
     ) -> None:
         self.device = torch.device(device)
         self.weights = weights
-        self.is_cuda = self.device.type == "cuda"
-        self.cuda_graphs = False
-        self.fused_kernel = False
-        self.l2_bytes: int | None = None
-        self.free_bytes: int | None = None
-        if self.is_cuda:
-            index = (
-                self.device.index
-                if self.device.index is not None
-                else torch.cuda.current_device()
-            )
-            self.device = torch.device("cuda", index)
-            props = torch.cuda.get_device_properties(index)
-            free, _total = torch.cuda.mem_get_info(index)
-            self.cuda_graphs = _cuda_graph_capture_supported(index)
-            self.fused_kernel = fused_kernel_loader._try_compile() is not None
-            self.l2_bytes = int(getattr(props, "L2_cache_size", 0)) or None
-            self.free_bytes = int(free)
         self._prepared = _ByteLRU(prepared_budget)
         self.loops: dict[tuple, HypLoop] = {}
-        self.graph_pool: Any = torch.cuda.graph_pool_handle() if self.is_cuda else None
+        is_cuda = self.device.type == "cuda"
+        self.graph_pool: Any = torch.cuda.graph_pool_handle() if is_cuda else None
         self.compute: torch.cuda.Stream | None = None
-        if self.is_cuda:
+        if is_cuda:
             self.compute = torch.cuda.Stream(device=self.device)  # type: ignore[no-untyped-call]
-
-    def refresh_free_bytes(self) -> int | None:
-        """Re-measure ``free_bytes``: driver-free plus the allocator's idle reserve."""
-        if self.is_cuda:
-            index = self.device.index
-            free, _total = torch.cuda.mem_get_info(index)
-            idle = torch.cuda.memory_reserved(index) - torch.cuda.memory_allocated(
-                index
-            )
-            self.free_bytes = int(free) + int(idle)
-        return self.free_bytes
 
     # -- prepared weights --------------------------------------------------------
 
@@ -203,7 +166,7 @@ class Executor:
     # -- loops and execution -----------------------------------------------------
 
     def loop_for(
-        self, plan: StagePlan, prepared: Prepared, example: Mapping[int, torch.Tensor]
+        self, plan: LoopPlan, prepared: Prepared, example: Mapping[int, torch.Tensor]
     ) -> HypLoop:
         """The cached hypothesis loop for ``plan``; built (captured) once per signature."""
         loop = self.loops.get(plan.signature)
@@ -217,7 +180,7 @@ class Executor:
     def run(
         self,
         store: FeatureStore,
-        plan: StagePlan,
+        plan: LoopPlan,
         *,
         progress: Callable[[int], None] | None = None,
     ) -> StageMaps:

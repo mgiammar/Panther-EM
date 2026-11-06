@@ -24,9 +24,10 @@ Objects, by lifetime
   :class:`Stage` s (feature rectangles, precision, ``n_psi``, orientation sampling,
   CTF planes) each ending in a :class:`Decision` (threshold, optional threshold test,
   whether it accepts, absorb radius). :class:`Searcher` binds a template to its
-  stages and owns the execution resources that amortise across image sets
-  (:class:`~.executor.Executor`: prepared weights, captured hypothesis loops,
-  streams).
+  stages and owns the resources that amortise across image sets (the
+  featurizations; :class:`~.correlation.Correlator`: prepared weights, captured
+  hypothesis loops, the stream). :class:`ExecutionConfig` (:mod:`.config`) sets how
+  the stages run: a few everyday choices and a :class:`Tuning` of overrides.
 * **Per micrograph** (:class:`SearchSession`): the
   :class:`~.noise_model.ImageSet` (whitened search image, CTF planes, noise and
   signal curves, level map), the dense
@@ -36,17 +37,19 @@ Objects, by lifetime
 
 How a stage runs
 ----------------
-1. **Plan** (:mod:`.executor`): batch shape, block size and the stage's
-   :class:`HypothesisSet` from the device capabilities and the execution knobs; a
-   stage whose store would not fit the device is cut into bands of rows.
-2. **Featurize** (:mod:`.featurization`): for each band and plane pass, a fresh
-   :class:`~.featurization.FeatureStore` is filled with the features of every
-   rectangle, by overlap-save FFT correlation (dense selections) or a box gather +
-   contraction (sparse selections, particle boxes; see
+1. **Plan** (:mod:`.planning`): one :class:`StagePlan` before any work -- the
+   stage's :class:`HypothesisSet`, the featurization engine, the bands (a stage
+   whose store would not fit the device is cut into bands of rows) and, per band,
+   the plane passes with their batch shapes and block sizes.
+2. **Featurize** (:mod:`.runner`, :mod:`.featurization`): for each band and plane
+   pass, a fresh :class:`~.featurization.FeatureStore` is filled with the features
+   of every rectangle, by overlap-save FFT correlation (dense selections) or a box
+   gather + contraction (sparse selections, particle boxes; see
    :func:`~.featurization.choose_mode` and its constants).
-3. **Execute** (:mod:`.executor`, :mod:`.statistics`): per block, per GEMM sub-batch,
-   per defocus plane and per hypothesis batch, one contraction and one statistics
-   update (in-kernel accumulation on CUDA), optionally replayed as one CUDA graph.
+3. **Correlate** (:mod:`.correlation`): per block, per GEMM sub-batch and per
+   hypothesis batch, one contraction (CGEMM) and one reduction (iRFFT over the
+   in-plane angle, moments, running maximum; in-kernel on CUDA), optionally replayed
+   as one CUDA graph; the passes of a band are merged, the bands concatenated.
 4. **Decide** (:mod:`.decision`): the maps are written to the ledger and the stage's
    decision labels its pixels: the threshold test (or the plain threshold)
    ``REJECTS``, the plain threshold ``ACCEPTS`` when the stage accepts, the rest stay
@@ -122,7 +125,8 @@ Example
     result.save("search.h5")
 """
 
-from panther_em.inference.search.correlation import Executor, FeatureLayout
+from panther_em.inference.search.config import ExecutionConfig, Tuning
+from panther_em.inference.search.correlation import Correlator, FeatureLayout
 from panther_em.inference.search.decision import Decision, PixelLabel
 from panther_em.inference.search.featurization import (
     BaseImageFeaturization,
@@ -152,9 +156,15 @@ from panther_em.inference.search.noise_model import (
     zeta_quantile,
     zscore_threshold,
 )
-from panther_em.inference.search.planning import MemoryPlan, StagePlan
+from panther_em.inference.search.planning import (
+    DeviceInfo,
+    MemoryPlan,
+    StagePlan,
+    plan_stage,
+)
 from panther_em.inference.search.results import PixelLedger, SearchResult, StageResult
-from panther_em.inference.search.search import ExecutionConfig, Searcher, SearchSession
+from panther_em.inference.search.runner import StageRunner
+from panther_em.inference.search.search import Searcher, SearchSession
 from panther_em.inference.search.stage import Stage
 from panther_em.inference.search.types import (
     BatchShape,
@@ -169,10 +179,11 @@ __all__ = [
     "BaseImageFeaturization",
     "BatchShape",
     "Calibration",
+    "Correlator",
     "Decision",
+    "DeviceInfo",
     "DirectFeaturization",
     "ExecutionConfig",
-    "Executor",
     "FFTFeaturization",
     "FeatureLayout",
     "FeatureStore",
@@ -196,7 +207,9 @@ __all__ = [
     "Stage",
     "StagePlan",
     "StageResult",
+    "StageRunner",
     "ThresholdTest",
+    "Tuning",
     "WhiteningFilter",
     "choose_mode",
     "compute_error_tables",
@@ -204,6 +217,7 @@ __all__ = [
     "healpix_level_ids",
     "healpix_orientations",
     "make_featurization",
+    "plan_stage",
     "psi_degrees",
     "zeta_quantile",
     "zscore_threshold",
