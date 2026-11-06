@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
 # (k_start, m_start, k_extent, m_extent) block of ``(angular frequency, eigenvector)``
@@ -325,6 +326,24 @@ class ImageSet:
             return self.filters[b, d]
         return self.filters[d]
 
+    def filtered_planes(
+        self, b: int, planes: Sequence[int], device: torch.device | str
+    ) -> torch.Tensor:
+        """``(len(planes), H, W)`` float32 image ``b`` under each plane's filter."""
+        image = self.images[b].to(device=device, dtype=torch.float32)
+        out = torch.empty(
+            (len(planes), *image.shape), dtype=torch.float32, device=device
+        )
+        for i, d in enumerate(planes):
+            filt = self.filter_plane(int(d), b)
+            if filt is None:
+                out[i] = image
+            else:
+                out[i] = torch.fft.irfft2(
+                    torch.fft.rfft2(image) * filt.to(device), s=tuple(image.shape)
+                )
+        return out
+
     @classmethod
     def single(
         cls,
@@ -469,6 +488,23 @@ class SearchGeometry:
             return torch.arange(self.n_pixels, dtype=torch.long)
         dense = self.validate_mask(mask).reshape(-1)
         return torch.nonzero(dense, as_tuple=False).squeeze(-1).to(torch.long)
+
+    def positions(
+        self, flat: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(image, row, col)`` top-left box origins of flat pixel indices.
+
+        Center mode: pixel ``b`` is the box centred on image ``b``.
+        """
+        flat = flat.to(torch.long)
+        if self.mode == "center":
+            (h, w), (k_h, k_w) = self.image_shape, self.template_shape
+            rows = torch.full_like(flat, (h - k_h) // 2)
+            cols = torch.full_like(flat, (w - k_w) // 2)
+            return flat, rows, cols
+        out_h, out_w = self.grid
+        within = flat % (out_h * out_w)
+        return flat // (out_h * out_w), within // out_w, within % out_w
 
     def unflatten(self, flat: torch.Tensor) -> torch.Tensor:
         """Reshape a ``(n_pixels, ...)`` tensor to ``(B, *grid, ...)``."""

@@ -9,6 +9,10 @@ import pytest
 import torch
 
 from panther_em.inference.correlation import compute_feature_stack
+from panther_em.inference.search.featurization import (
+    BaseImageFeaturization,
+    FeatureChunk,
+)
 from panther_em.inference.search.decision import (
     Calibration,
     Decision,
@@ -36,40 +40,52 @@ EXEC = ExecutionConfig(batch=BatchShape(8, 5), cell_chunk=4, use_cuda_graph=Fals
 EXEC_JOINT = replace(EXEC, plane_major=False)
 
 
+class StubFeaturization(BaseImageFeaturization):
+    """Deterministic random features per cell and pixel, plus the plane's value there.
+
+    A stand-in for the FFT and direct engines: pixel ``(row, col)`` of a plane gets
+    ``noise[cell, row * out_w + col] + planes[d, row, col]``, so features follow the
+    pixel identity and differ between planes whose filtered images differ.
+    """
+
+    def __init__(self, kernels, rect, owner):
+        super().__init__(kernels, rect)
+        self.owner = owner
+
+    def chunks(self, planes, rows, cols):
+        self.validate(planes, rows, cols)
+        self.owner.calls += 1
+        self.owner.planes_produced += int(planes.shape[0])
+        out_w = int(planes.shape[-1]) - self.box_shape[1] + 1
+        flat = (rows * out_w + cols).cpu()
+        noise = []
+        for k, m in self.cells.tolist():
+            gen = torch.Generator().manual_seed(self.owner.seed * 100003 + k * 1009 + m)
+            full = torch.complex(
+                torch.randn(10_000, generator=gen), torch.randn(10_000, generator=gen)
+            )
+            noise.append(full[flat])
+        noise = torch.stack(noise)  # (cells, P)
+        for d in range(int(planes.shape[0])):
+            values = noise + planes[d].cpu()[rows.cpu(), cols.cpu()][None]
+            yield FeatureChunk(
+                d,
+                slice(0, self.n_cells),
+                slice(0, int(rows.numel())),
+                values.to(torch.complex64).to(self.device),
+            )
+
+
 class StubFeaturizer:
-    """Deterministic random features per cell; a stand-in for ``featurize``."""
+    """A featurization factory for ``Searcher(featurization=...)`` that counts calls."""
 
     def __init__(self, seed: int = 1) -> None:
         self.seed = seed
-        self.calls = 0
+        self.calls = 0  # chunks() calls: one per (rectangle, band, pass, image)
         self.planes_produced = 0
 
-    def __call__(
-        self,
-        bank,
-        images,
-        group,
-        writer,
-        schedule,
-        *,
-        chunk=64,
-        order="pixel_major",
-        stream=None,
-    ):
-        self.calls += 1
-        self.planes_produced += len(group.planes)
-        n = int(schedule.column_index.numel())
-        k0, m0, ke, me = group.rect
-        for c, (k, m) in enumerate((k0 + i // me, m0 + i % me) for i in range(ke * me)):
-            gen = torch.Generator().manual_seed(self.seed * 100003 + k * 1009 + m)
-            full = torch.complex(
-                torch.randn(images.n_defocus, 10_000, generator=gen),
-                torch.randn(images.n_defocus, 10_000, generator=gen),
-            )
-            # pixel-identity features, per global plane; the group holds a subset
-            data = full[list(group.planes)][:, schedule.column_index]
-            writer.write(slice(c, c + 1), (0, n), data[:, None, :])
-        writer.close()
+    def __call__(self, kernels, rect, mode):
+        return StubFeaturization(kernels, rect, self)
 
 
 @pytest.fixture
@@ -276,7 +292,7 @@ def test_two_stage_healpix_level_and_planes(synthetic_result):
         ),
         Stage.create([(0, 0, 4, 5)], n_psi=16, decision=test1),
     ]
-    searcher = Searcher(template, stages, execution=EXEC_JOINT, featurize=stub, n_defocus=3)
+    searcher = Searcher(template, stages, execution=EXEC_JOINT, featurization=stub, n_defocus=3)
     assert searcher.ipix is not None and searcher.ipix.tolist() == list(range(48))
     t_ids, d_ids = stages[0].hypothesis_ids(searcher.space, searcher.ipix)
     assert t_ids.numel() == 12 * 2 and d_ids.tolist() == [1]  # one child per parent pixel
@@ -313,11 +329,11 @@ def test_session_stops_when_no_pixel_is_left(template):
         Stage.create([(0, 0, 2, 2)], n_psi=16, decision=Decision(1e9)),  # rejects all
         Stage.create([(0, 0, 4, 3)], n_psi=16, decision=Decision(0.0)),
     ]
-    searcher = Searcher(template, stages, execution=EXEC, featurize=stub, keep_stage_results=True)
+    searcher = Searcher(template, stages, execution=EXEC, featurization=stub, keep_stage_results=True)
     session = searcher.session(ImageSet.from_stack(torch.zeros(2, 30, 30)))
     results = list(session)
     assert [r.stage_index for r in results] == [0] and results[0].n_pixels == 242
-    assert results[0].n_ambiguous_after == 0 and stub.calls == 1
+    assert results[0].n_ambiguous_after == 0 and stub.calls == 2  # one per image
     res = session.snapshot()
     assert len(res.stage_results) == 1 and isinstance(res.stage_results[0], StageResult)
     assert torch.all(res.label == int(PixelLabel.REJECTED)) and torch.all(res.last_stage == 0)
@@ -327,7 +343,7 @@ def test_session_stops_when_no_pixel_is_left(template):
         Stage.create([(0, 0, 2, 2)], n_psi=16, decision=Decision(-1e9)),
         Stage.create([(0, 0, 4, 3)], n_psi=16),
     ]
-    searcher = Searcher(template, stages, execution=EXEC, featurize=StubFeaturizer())
+    searcher = Searcher(template, stages, execution=EXEC, featurization=StubFeaturizer())
     res = searcher.run(ImageSet.from_stack(torch.zeros(2, 30, 30)))
     assert torch.all(res.last_stage == 1) and torch.all(res.label == int(PixelLabel.AMBIGUOUS))
 
@@ -365,7 +381,7 @@ def test_searcher_validates_the_threshold_test(template, synthetic_result):
     with pytest.raises(ValueError, match="box"):
         Searcher(template, [stage(RadialTables.build(small, [rect]))])
     searcher = Searcher(
-        template, [stage(tables)], execution=EXEC, featurize=StubFeaturizer()
+        template, [stage(tables)], execution=EXEC, featurization=StubFeaturizer()
     )
     with pytest.raises(ValueError, match=r"stage 0: .*spectra"):
         searcher.session(ImageSet.single(_image()))
@@ -379,7 +395,7 @@ def test_full_rank_test_decides_everything(template):
         template,
         [Stage.create([(0, 0, 4, 5)], n_psi=16, decision=decision)],
         execution=EXEC,
-        featurize=StubFeaturizer(),
+        featurization=StubFeaturizer(),
     )
     res = searcher.run(_with_spectra(ImageSet.single(_image()), tables))
     assert not (res.label == int(PixelLabel.AMBIGUOUS)).any()  # no residual: decided
@@ -394,7 +410,7 @@ def test_center_mode_orientation_subset_and_run_many(template):
         template,
         stages,
         execution=EXEC_JOINT,
-        featurize=stub,
+        featurization=stub,
         n_defocus=2,
         defocus_values=torch.tensor([-500.0, 500.0]),
     )
@@ -419,7 +435,7 @@ def test_search_result_round_trip_and_masked_pixels(template, tmp_path):
     mask = torch.zeros(11, 11, dtype=torch.bool)
     mask[2:9, 2:9] = True
     probe = Searcher(
-        template, [Stage.create([(0, 0, 2, 2)], n_psi=16)], execution=EXEC, featurize=stub
+        template, [Stage.create([(0, 0, 2, 2)], n_psi=16)], execution=EXEC, featurization=stub
     ).run(ImageSet.single(torch.zeros(30, 30), mask=mask))
     z = probe.zscore[0][mask]
     ordered = z.sort().values
@@ -429,7 +445,7 @@ def test_search_result_round_trip_and_masked_pixels(template, tmp_path):
         Stage.create([(0, 0, 4, 5)], n_psi=32),
     ]
     searcher = Searcher(
-        template, stages, execution=EXEC, featurize=StubFeaturizer(), keep_stage_results=True
+        template, stages, execution=EXEC, featurization=StubFeaturizer(), keep_stage_results=True
     )
     res = searcher.run(ImageSet.single(torch.zeros(30, 30), mask=mask))
     assert (res.label[0][~mask] == int(PixelLabel.MASKED)).all()
@@ -487,7 +503,11 @@ def test_cuda_mixed_precision_two_stage_matches_cpu(synthetic_result):
     gpu_searcher = Searcher(
         Template(result, device="cuda"),
         stages("fp16"),
-        execution=ExecutionConfig(batch=BatchShape(8, 4), cell_chunk=4, use_cuda_graph=True),
+        # fp32 direct contraction: the fp16 default is 5e-4 off on the features, and
+        # stage 1 (fp32) is compared with the CPU at 1e-4 below
+        execution=ExecutionConfig(
+            batch=BatchShape(8, 4), cell_chunk=4, use_cuda_graph=True, direct_precision="fp32"
+        ),
         keep_stage_results=True,
     )
     gpu = gpu_searcher.run(ImageSet.single(image)).to("cpu")
@@ -512,13 +532,14 @@ def test_stage_planes_are_featurized_only_where_needed(template):
         Stage.create([rect], n_psi=16),
     ]
     searcher = Searcher(
-        template, stages, execution=EXEC_JOINT, featurize=stub, n_defocus=3, keep_stage_results=True
+        template, stages, execution=EXEC_JOINT, featurization=stub, n_defocus=3, keep_stage_results=True
     )
     images = ImageSet.from_stack(torch.zeros(1, 30, 30), filters=torch.ones(3, 30, 16))
     session = searcher.session(images)
     results = list(session)
-    assert stub.calls == 2 and stub.planes_produced == 3  # plane 1, then planes 0 and 2 only
-    assert [g.planes for g in session.store.groups] == [(1,), (0, 2)]
+    # plane 1, then all three: a stage never reuses an earlier stage's features
+    assert stub.calls == 2 and stub.planes_produced == 4
+    assert [g.planes for g in session.store.groups] == [(0, 1, 2)]
     accepted = int((results[0].labels_after == int(PixelLabel.ACCEPTED)).sum())
     assert results[0].n_pixels == 121 and results[1].n_pixels == accepted > 0
 
@@ -526,7 +547,7 @@ def test_stage_planes_are_featurized_only_where_needed(template):
     mask = torch.zeros(1, 11, 11, dtype=torch.bool)
     mask.reshape(-1)[results[1].pixel_index] = True
     fresh = Searcher(
-        template, [Stage.create([rect], n_psi=16)], execution=EXEC, featurize=StubFeaturizer(),
+        template, [Stage.create([rect], n_psi=16)], execution=EXEC, featurization=StubFeaturizer(),
         n_defocus=3,
     ).run(ImageSet.from_stack(torch.zeros(1, 30, 30), filters=torch.ones(3, 30, 16), mask=mask))
     order = torch.argsort(results[1].pixel_index)
@@ -544,12 +565,12 @@ def test_session_store_is_released_after_the_session(template):
     import weakref
 
     searcher = Searcher(
-        template, [Stage.create([(0, 0, 4, 5)], n_psi=16)], execution=EXEC, featurize=StubFeaturizer()
+        template, [Stage.create([(0, 0, 4, 5)], n_psi=16)], execution=EXEC, featurization=StubFeaturizer()
     )
     session = searcher.session(ImageSet.single(torch.zeros(30, 30)))
     session.run_all()
     store_ref = weakref.ref(session.store)
-    block_ref = weakref.ref(session.store.groups[0].blocks[0])  # the bytes themselves
+    block_ref = weakref.ref(session.store.groups[0].data)  # the bytes themselves
     del session
     gc.collect()
     assert store_ref() is None  # only the session owned the store
@@ -564,7 +585,7 @@ def test_plane_major_passes_match_the_joint_search(template):
     stage = Stage.create([rect], n_psi=16, planes=(0, 2), decision=Decision(0.5))
 
     def run(exe, stub):
-        searcher = Searcher(template, [stage], execution=exe, featurize=stub, n_defocus=3, keep_stage_results=True)
+        searcher = Searcher(template, [stage], execution=exe, featurization=stub, n_defocus=3, keep_stage_results=True)
         session = searcher.session(image)
         result = session.run_all()
         return session, result
@@ -574,7 +595,8 @@ def test_plane_major_passes_match_the_joint_search(template):
     major_session, major = run(EXEC, major_stub)
     assert joint_stub.calls == 1 and joint_stub.planes_produced == 2
     assert major_stub.calls == 2 and major_stub.planes_produced == 2  # one pass per plane
-    assert major_session.store.groups == []  # each pass dropped its plane's group
+    # each pass featurized its own plane; the session keeps the last pass's store
+    assert [g.planes for g in major_session.store.groups] == [(2,)]
     for name in MAP_NAMES:
         torch.testing.assert_close(getattr(major, name), getattr(joint, name), rtol=1e-5, atol=1e-5, equal_nan=True)
     torch.testing.assert_close(major.stage_results[0].best_index, joint.stage_results[0].best_index)
@@ -584,7 +606,7 @@ def test_plane_major_passes_match_the_joint_search(template):
     # a later stage over the same planes starts from an empty store (featurizes again)
     stages = [stage, Stage.create([rect], n_psi=16, planes=(0, 2), decision=Decision(0.5))]
     stub = StubFeaturizer()
-    searcher = Searcher(template, stages, execution=EXEC, featurize=stub, n_defocus=3, keep_stage_results=True)
+    searcher = Searcher(template, stages, execution=EXEC, featurization=stub, n_defocus=3, keep_stage_results=True)
     two = searcher.run(image)
     assert stub.calls == 4
     torch.testing.assert_close(two.stage_results[1].maps.mip, joint.stage_results[0].maps.mip)

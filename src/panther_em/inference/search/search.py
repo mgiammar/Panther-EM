@@ -59,11 +59,12 @@ from panther_em.inference.search.executor import (
     merge_stage_maps,
     plan_memory,
     plan_stage,
-    resident_groups,
 )
-from panther_em.inference.search.features import FeatureStore
-from panther_em.inference.search.featurize import featurize as _featurize
-from panther_em.inference.search.featurize import schedule_tiles
+from panther_em.inference.search.featurization import (
+    FeatureStore,
+    choose_mode,
+    make_featurization,
+)
 from panther_em.inference.search.hypotheses import HypothesisSpace, healpix_ipix
 from panther_em.inference.search.results import PixelLedger, SearchResult, StageResult
 from panther_em.inference.search.stage import Stage
@@ -75,18 +76,22 @@ from panther_em.inference.search.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
     from panther_em.inference.search.executor import MemoryPlan
-    from panther_em.inference.search.features import Residency
-    from panther_em.inference.search.featurize import (
-        DirectEngine,
-        Featurize,
-        LoopOrder,
-        TileSpec,
+    from panther_em.inference.search.featurization import (
+        BaseImageFeaturization,
+        Mode,
     )
-    from panther_em.inference.search.template import Template
+    from panther_em.inference.search.featurization.direct_featurization import (
+        ContractionName,
+    )
+    from panther_em.inference.search.template import KernelBank, Template
     from panther_em.inference.search.types import BatchShape, Rectangle
+
+    FeaturizationFactory = Callable[
+        [KernelBank, Rectangle, Mode], BaseImageFeaturization
+    ]
 
 
 @dataclass(frozen=True)
@@ -102,69 +107,40 @@ class ExecutionConfig:
         Explicit store block size (a multiple of the GEMM pixel batch).
     use_cuda_graph, use_fused_kernel : bool
         Allow the graphed hypothesis loop / the fused statistics kernel.
-    tile : int
-        Featurizer output tile side (grid mode) for a pinned-host store, whose
-        blocks must complete tile by tile to be staged out. Larger tiles waste less
-        of each overlap-save FFT but their kernel spectra are bigger (8 MiB per cell
-        at 1024, 134 MiB at 4096), and once they no longer fit the template's
-        ``spectral_budget`` every plane re-FFTs every kernel, which costs as much as
-        the correlation itself. 1024 keeps a rank-1024 stage's spectra in 8 GiB.
-    device_tile : int, (int, int), "fit" or None
-        Tile of a device-resident store, which has no staging constraint.
-        Featurizing a pixel subset costs one correlation per (cell, tile touched),
-        so the per-pixel cost is set by how much of each tile the selection uses.
-        ``"fit"`` (default) uses one tile the size of the selection's bounding box:
-        a band of 180 rows of a 4k micrograph is then one 700 x 4096 FFT per cell
-        instead of two 2560^2 ones of which 9 % is kept. A side or ``(h, w)`` pair
-        tiles from the grid origin (measured on the 60S template at rank 8192: 0.49
-        ns per pixel-cell at 1024, 0.22 at 2048, 0.47 at 4096 with 134 MB spectra);
-        ``None`` covers each image with one tile.
-    cell_chunk : int
-        Kernels per featurization chunk.
-    image_batch : int
-        Positions per GEMM of the direct featurization engine.
     featurize_mode : {"auto", "fft", "direct"}
-        Featurization engine: tiled FFT correlation or box gather + planar GEMM.
-        ``"auto"`` applies :func:`~panther_em.inference.search.featurize.choose_mode`
-        (its constants ``DIRECT_MAX_DENSITY`` / ``DIRECT_MAX_BOX_EXCESS`` decide).
-    direct_engine : {"adjoint", "planar"}
+        Featurization engine: overlap-save FFT correlation of the selection's bounding
+        box, or box gather + contraction per position. ``"auto"`` applies
+        :func:`~panther_em.inference.search.featurization.choose_mode` to each
+        stage's selection.
+    cell_chunk : int
+        Kernel spectra per chunk of the FFT engine.
+    image_batch : int
+        Positions per chunk of the direct engine.
+    direct_contraction : {"adjoint", "planar"}
         How the direct engine turns boxes into features: ``"adjoint"`` scatters each
-        box onto the polar grid through the transposed warp and contracts it with the
-        prefiltered polar vectors (no Cartesian kernels, 2-3.5x the planar GEMM's
-        speed; falls back to ``"planar"`` where the transform/config is not
-        mirrored), ``"planar"`` the ``[Re K; -Im K]`` kernel GEMM.
+        box onto the polar grid through the transposed warp (no Cartesian kernels,
+        2-3.5x the planar GEMM's speed; falls back to ``"planar"`` where the
+        transform is not mirrored), ``"planar"`` the ``[Re K; -Im K]`` kernel GEMM.
     direct_precision : {"fp16", "tf32", "fp32"}
         Operand precision of the direct engine, independent of the stage's (store)
-        precision. Planar GEMM: fp16 operands accumulated and written in fp32 run on
-        the tensor cores at 3x the fp32 CUDA-core rate with 2.4e-5 relative feature
-        error. Adjoint engine: fp16 runs the scatter and the angular GEMM in half
-        precision (5e-4 relative, 1.7x the fp32 path), fp32 is exact to 1e-6; see
-        ``featurize.DIRECT_GEMM_PRECISION``.
-    loop_order : {"pixel_major", "cell_major"}
-        Featurizer loop order of a pinned-host store (``pixel_major`` completes
-        blocks tile by tile, which staging needs). A device-resident store is always
-        featurized ``cell_major``: each kernel spectrum is FFT'd once and reused
-        across the image's tiles instead of once per tile.
+        precision: fp16 is 5e-4 relative on the adjoint's features, fp32 exact to
+        1e-6.
     ledger_device : device, optional
         Where the dense per-pixel state lives; defaults to the compute device.
     prepared_budget : int, optional
         Byte budget of the prepared-weight cache.
     show_progress : bool
         Print per-stage progress bars.
-    store_residency : {"auto", "device", "pinned_host"}
-        Where a stage's feature store lives. ``"auto"`` keeps it on the device: a
-        stage whose store would exceed ``device_store_fraction`` of the free memory
-        runs in *bands*, row-contiguous chunks of its pixels whose store fits, each
-        featurized (one band-shaped FFT per cell) and reduced in turn, and the maps
-        are concatenated before the decision. ``"pinned_host"`` instead pins one
-        whole-selection store on the host and streams its blocks.
     l2_target : int, optional
         Bytes of spectrum per contraction to keep L2-resident (the hypothesis batch
         follows from it); defaults to a quarter of the device's L2.
     block_bytes_max : int
         Byte budget of one feature-store block (256 MiB).
     device_store_fraction : float
-        See ``store_residency``.
+        A stage whose store would exceed this fraction of the free device memory runs
+        in *bands*: row-contiguous chunks of its pixels whose store fits, each
+        featurized (one band-shaped FFT per cell) and reduced in turn; the maps are
+        concatenated before the decision.
     plane_major : bool
         Search a multi-plane stage one defocus plane at a time: each pass treats the
         plane as its own image, featurizing and holding only that plane's features
@@ -181,18 +157,14 @@ class ExecutionConfig:
     block_pixels: int | None = None
     use_cuda_graph: bool = True
     use_fused_kernel: bool = True
-    tile: int = 1024
-    device_tile: TileSpec | None = "fit"
-    cell_chunk: int = 64
-    image_batch: int = 1024
     featurize_mode: Literal["auto", "fft", "direct"] = "auto"
-    direct_engine: DirectEngine = "adjoint"
+    cell_chunk: int = 32
+    image_batch: int = 1024
+    direct_contraction: ContractionName = "adjoint"
     direct_precision: Literal["fp16", "tf32", "fp32"] = "fp16"
-    loop_order: LoopOrder = "pixel_major"
     ledger_device: torch.device | str | None = None
     prepared_budget: int | None = None
     show_progress: bool = False
-    store_residency: Residency | Literal["auto"] = "auto"
     l2_target: int | None = None
     block_bytes_max: int = 256 << 20
     device_store_fraction: float = 0.5
@@ -234,9 +206,10 @@ class Searcher:
     keep_stage_results : bool, optional
         Retain every stage's compact maps on the final :class:`SearchResult` (and in
         its HDF5 file). Defaults to False.
-    featurize : callable, optional
-        Override :func:`~.featurize.featurize` (tests inject a stub with the same
-        signature).
+    featurization : callable, optional
+        ``(kernels, rect, mode) -> BaseImageFeaturization``; defaults to
+        :func:`~.featurization.make_featurization` configured by ``execution`` (tests
+        inject a stub).
     """
 
     def __init__(
@@ -248,7 +221,7 @@ class Searcher:
         n_defocus: int = 1,
         defocus_values: torch.Tensor | None = None,
         keep_stage_results: bool = False,
-        featurize: Featurize | None = None,
+        featurization: FeaturizationFactory | None = None,
     ) -> None:
         self.template = template
         self.stages = tuple(stages)
@@ -259,11 +232,17 @@ class Searcher:
         self.space = HypothesisSpace.from_result(
             template.result, n_defocus=n_defocus, defocus_values=defocus_values
         )
-        self.featurize: Featurize = featurize or functools.partial(
-            _featurize,
-            gemm_precision=self.execution.direct_precision,
-            direct_engine=self.execution.direct_engine,
+        self.make_featurization: FeaturizationFactory = (
+            featurization
+            or functools.partial(
+                make_featurization,
+                cell_chunk=self.execution.cell_chunk,
+                batch=self.execution.image_batch,
+                precision=self.execution.direct_precision,
+                contraction=self.execution.direct_contraction,
+            )
         )
+        self._featurizations: dict[tuple[Rectangle, Mode], BaseImageFeaturization] = {}
         # NESTED HEALPix ids of the template's orientations, when a stage samples
         # orientations by HEALPix level (None otherwise, or when not HEALPix)
         self.ipix = None
@@ -328,6 +307,15 @@ class Searcher:
         """Compute device."""
         return self.template.device
 
+    def featurization(self, rect: Rectangle, mode: Mode) -> BaseImageFeaturization:
+        """The ``mode`` featurization of ``rect`` (built once, reused across images)."""
+        key = (rect, mode)
+        found = self._featurizations.get(key)
+        if found is None:
+            found = self.make_featurization(self.template.kernels, rect, mode)
+            self._featurizations[key] = found
+        return found
+
     def session(self, images: ImageSet) -> SearchSession:
         """A session over one image set (iterate it for per-stage results)."""
         return SearchSession(self, images)
@@ -386,8 +374,7 @@ class SearchSession:
             self.geometry, exe.ledger_device or searcher.device, initial=initial
         )
         self.pixels: PixelSelection = initial
-        self.store: FeatureStore | None = None
-        self._store_tile: TileSpec = 0  # tile the store's column order was built with
+        self.store: FeatureStore | None = None  # the last pass's features
         self.stage_index = 0
         self.stage_results: list[StageResult] = []
         self.elapsed_s = 0.0
@@ -406,109 +393,41 @@ class SearchSession:
 
     # -- stage machinery ---------------------------------------------------------
 
-    def _prepare_store(
+    def _featurize(
         self,
-        block_pixels: int,
-        precision: Precision,
-        rectangles: Sequence[Rectangle],
+        stage: Stage,
+        pixels: PixelSelection,
         planes: Sequence[int],
-        residency: Residency = "device",
-        pixels: PixelSelection | None = None,
+        block_pixels: int,
+        mode: Mode,
     ) -> FeatureStore:
-        """Re-block / compact the store to ``pixels`` (default: the current ones).
-
-        Featurizes whatever the store does not hold yet.
-        """
-        exe = self.searcher.execution
-        executor = self.searcher.executor
-        pixels = self.pixels if pixels is None else pixels
-        store = self.store
-        rects = tuple(tuple(int(v) for v in r) for r in rectangles)
-        reusable = store is not None and any(
-            g.rect in rects and g.precision is precision for g in store.groups
+        """A store of ``pixels`` (compact columns in selection order) for ``planes``."""
+        searcher = self.searcher
+        self.store = None  # the previous pass's features are not read again
+        store = FeatureStore(
+            stage.rectangles,
+            stage.precision,
+            planes,
+            len(pixels),
+            block_pixels,
+            searcher.device,
         )
-        if store is not None and not reusable:
-            # Nothing of the previous stage's store is read again (a different
-            # rectangle or precision): drop it rather than compact it.
-            store = None
-        tile: TileSpec
-        if reusable:
-            tile = self._store_tile  # the subset keeps the store's column order
-        elif residency == "pinned_host":
-            tile = exe.tile
-        elif exe.device_tile is not None:
-            tile = exe.device_tile
-        else:
-            tile = max(int(g) for g in self.geometry.grid)  # one tile per image
-        schedule = schedule_tiles(
-            self.geometry,
-            pixels,
-            tile=tile,
-            image_batch=exe.image_batch,
-            mode=None if exe.featurize_mode == "auto" else exe.featurize_mode,
-            # a direct schedule keeps a reused store's column order (FFT tiles
-            # already match through ``tile``)
-            order=store.column_index if reusable and store is not None else None,
-        )
-        if store is None:
-            store = FeatureStore(
-                self.geometry,
-                pixels,
-                schedule.column_index,
-                block_pixels=block_pixels,
-                n_defocus=self.images.n_defocus,
-                device=self.searcher.device,
-                residency=residency,
-            )
-            store.copy_stream = executor.copy
-        else:
-            keep = torch.isin(
-                store.column_index, pixels.index.to(store.column_index.device)
-            )
-            if (
-                not bool(keep.all())
-                or store.block_pixels != block_pixels
-                or store.residency != residency
-            ):
-                store = store.subset(
-                    keep, block_pixels=block_pixels, residency=residency
-                )
-                store.copy_stream = executor.copy
-            if not torch.equal(
-                schedule.column_index,
-                store.column_index.to(schedule.column_index.device),
-            ):
-                raise RuntimeError(
-                    "featurization column order diverged from the store's"
-                )
-        self._store_tile = tile
-        self._mark("store:ready")
-        missing = [
-            (rect, mp)
-            for rect in rectangles
-            if (mp := store.missing_planes(rect, precision, planes))
-        ]
-        if missing and executor.featurize is not None:
-            # Blocks were zero-allocated on the current stream: featurize after it.
-            executor.featurize.wait_stream(torch.cuda.current_stream(executor.device))
-        for rect, missing_planes in missing:
-            group = store.add_group(rect, precision, missing_planes)
-            self._mark("store:group_allocated")
-            self.searcher.featurize(
-                self.searcher.template.kernels,
-                self.images,
-                group,
-                store.writer(group),
-                schedule,
-                chunk=exe.cell_chunk,
-                order=(
-                    exe.loop_order if store.residency == "pinned_host" else "cell_major"
-                ),
-                stream=executor.featurize,
-            )
-        if missing and executor.featurize is not None:
-            # Everything downstream (compute stream, compaction) sees complete blocks.
-            torch.cuda.current_stream(executor.device).wait_stream(executor.featurize)
+        self._mark("store:allocated")
+        image, rows, cols = self.geometry.positions(pixels.index.to("cpu"))
+        # the selection is sorted, so each image's positions are one run of columns
+        ids, counts = torch.unique_consecutive(image, return_counts=True)
+        start = 0
+        for b, count in zip(ids.tolist(), counts.tolist(), strict=True):
+            columns = slice(start, start + count)
+            filtered = self.images.filtered_planes(b, planes, searcher.device)
+            for rect in stage.rectangles:
+                featurization = searcher.featurization(rect, mode)
+                for chunk in featurization.chunks(
+                    filtered, rows[columns], cols[columns]
+                ):
+                    store.write(rect, chunk, column_offset=start)
+            start += count
+        store.check_complete()
         self.store = store
         return store
 
@@ -517,24 +436,18 @@ class SearchSession:
     ) -> list[PixelSelection]:
         """Row-contiguous chunks of the stage's pixels whose store fits the device.
 
-        One band (the whole selection) unless the store is ``"auto"`` resident on a
-        CUDA device and a pass's store would exceed ``device_store_fraction`` of the
-        free memory; then the sorted selection is cut into equal chunks of a multiple
-        of ``gemm_pixels`` pixels that fit, each a band of rows the FFT engine covers
-        with one fitted tile.
+        One band (the whole selection) unless a pass's store on a CUDA device would
+        exceed ``device_store_fraction`` of the free memory; then the sorted selection
+        is cut into equal chunks of a multiple of ``gemm_pixels`` pixels that fit, each
+        a band of rows the FFT engine covers with one region.
         """
         exe = self.searcher.execution
         executor = self.searcher.executor
         pixels = self.pixels
-        if (
-            exe.store_residency != "auto"
-            or not executor.is_cuda
-            or len(pixels) == 0
-            or not executor.free_bytes
-        ):
+        if not executor.is_cuda or len(pixels) == 0 or not executor.free_bytes:
             return [pixels]
         per_pixel = feature_bytes_per_pixel(
-            resident_groups(stage, pass_planes, self.store)
+            (rect, stage.precision, len(pass_planes)) for rect in stage.rectangles
         )
         limit = int(executor.free_bytes * exe.device_store_fraction)
         if per_pixel * len(pixels) <= limit:
@@ -577,33 +490,23 @@ class SearchSession:
                 block_pixels=exe.block_pixels,
                 use_cuda_graph=exe.use_cuda_graph,
                 use_fused_kernel=exe.use_fused_kernel,
-                store=self.store,
-                residency=exe.store_residency,
                 l2_target=exe.l2_target,
                 block_bytes_max=exe.block_bytes_max,
-                device_store_fraction=exe.device_store_fraction,
             )
 
         memory = memory_for(defocus_ids)
         hyps = memory.hyps
         planes = hyps.defocus_planes()
         # One pass per plane (the plane's features alone are resident), or one pass
-        # over every plane; a reused store already holding every plane runs in one.
-        passes: list[tuple[int, ...]]
-        if (
-            exe.plane_major
-            and len(planes) > 1
-            and (
-                self.store is None
-                or any(
-                    self.store.missing_planes(r, stage.precision, planes)
-                    for r in stage.rectangles
-                )
-            )
-        ):
-            passes = [(p,) for p in planes]
-        else:
-            passes = [planes]
+        # over every plane.
+        passes: list[tuple[int, ...]] = (
+            [(p,) for p in planes] if exe.plane_major and len(planes) > 1 else [planes]
+        )
+        mode: Mode = (
+            choose_mode(self.geometry, len(self.pixels))
+            if exe.featurize_mode == "auto"
+            else exe.featurize_mode
+        )
         bands = self._bands(stage, passes[0], memory.gemm_pixels)
         progress = None
         if exe.show_progress:
@@ -620,7 +523,6 @@ class SearchSession:
         band_columns: list[torch.Tensor] = []
         for band in bands:
             parts: list[StageMaps] = []
-            column_index: torch.Tensor | None = None
             for pass_planes in passes:
                 t_pass = time.perf_counter()
                 pass_memory = (
@@ -630,20 +532,9 @@ class SearchSession:
                         torch.tensor(pass_planes, dtype=torch.long), len(band)
                     )
                 )
-                before = (id(self.store), len(self.store.groups) if self.store else 0)
-                store = self._prepare_store(
-                    pass_memory.block_pixels,
-                    stage.precision,
-                    stage.rectangles,
-                    pass_planes,
-                    pass_memory.residency,
-                    pixels=band,
+                store = self._featurize(
+                    stage, band, pass_planes, pass_memory.block_pixels, mode
                 )
-                n_kept = before[1] if id(store) == before[0] else 0
-                if column_index is None:
-                    column_index = store.column_index
-                elif not torch.equal(column_index, store.column_index):
-                    raise RuntimeError("column order changed between plane passes")
                 if searcher.executor.is_cuda:
                     torch.cuda.synchronize(searcher.device)
                 t_featurized = time.perf_counter()
@@ -657,16 +548,8 @@ class SearchSession:
                 self._mark(f"stage{index}:executed")
                 featurize_s += t_featurized - t_pass
                 execute_s += t_executed - t_featurized
-                if len(passes) > 1:
-                    # the groups this pass added are not read again: free them for
-                    # the next pass (groups an earlier stage left stay for reuse)
-                    while len(store.groups) > n_kept:
-                        store.drop_group(store.groups[-1])
-            assert column_index is not None
             band_maps.append(merge_stage_maps(parts, hyps.n_selected))
-            band_columns.append(column_index)
-            if len(bands) > 1:
-                self.store = None  # a band's store serves no later stage
+            band_columns.append(band.index.to("cpu"))
         maps = band_maps[0] if len(band_maps) == 1 else _concat_stage_maps(band_maps)
         column_index = (
             band_columns[0] if len(band_columns) == 1 else torch.cat(band_columns)

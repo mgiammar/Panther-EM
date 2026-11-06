@@ -30,12 +30,14 @@ Objects, by lifetime
 
 How a stage runs
 ----------------
-1. **Plan** (:mod:`.executor`): batch shape, block size, residency and the stage's
-   :class:`HypothesisSet` from the device capabilities and the execution knobs.
-2. **Featurize** (:mod:`.featurize`, :mod:`.features`): the store is compacted to the
-   stage's pixels and every missing (rectangle, precision, plane) group is produced,
-   by tiled FFT correlation (dense grids) or a patch gather + planar GEMM (sparse
-   selections, particle boxes; see ``featurize.choose_mode`` and its constants).
+1. **Plan** (:mod:`.executor`): batch shape, block size and the stage's
+   :class:`HypothesisSet` from the device capabilities and the execution knobs; a
+   stage whose store would not fit the device is cut into bands of rows.
+2. **Featurize** (:mod:`.featurization`): for each band and plane pass, a fresh
+   :class:`~.featurization.FeatureStore` is filled with the features of every
+   rectangle, by overlap-save FFT correlation (dense selections) or a box gather +
+   contraction (sparse selections, particle boxes; see
+   :func:`~.featurization.choose_mode` and its constants).
 3. **Execute** (:mod:`.executor`, :mod:`.statistics`): per block, per GEMM sub-batch,
    per defocus plane and per hypothesis batch, one contraction and one statistics
    update (in-kernel accumulation on CUDA), optionally replayed as one CUDA graph.
@@ -66,8 +68,8 @@ The two search types
                         decision=Decision(7.8, ThresholdTest(tables_128x64, cal))),
        ], n_defocus=D)
 
-   Each store group holds only the planes its stage uses, so the first stage pays
-   the featurization of one plane. A HEALPix level needs a template whose Euler
+   Each stage featurizes only the planes it uses, so the first stage pays the
+   featurization of one plane. A HEALPix level needs a template whose Euler
    angles are HEALPix pixel centers (``healpix_orientations(nside)`` generates them);
    explicit orientation ids work for any template.
 
@@ -112,11 +114,14 @@ from panther_em.inference.search.decision import (
     ThresholdTest,
 )
 from panther_em.inference.search.executor import Executor, MemoryPlan, StagePlan
-from panther_em.inference.search.features import FeatureLayout, FeatureStore
-from panther_em.inference.search.featurize import (
-    TileSchedule,
-    featurize,
-    schedule_tiles,
+from panther_em.inference.search.features import FeatureLayout
+from panther_em.inference.search.featurization import (
+    BaseImageFeaturization,
+    DirectFeaturization,
+    FeatureStore,
+    FFTFeaturization,
+    choose_mode,
+    make_featurization,
 )
 from panther_em.inference.search.hypotheses import (
     HypBatch,
@@ -152,11 +157,14 @@ from panther_em.inference.search.types import (
 )
 
 __all__ = [
+    "BaseImageFeaturization",
     "BatchShape",
     "Calibration",
     "Decision",
+    "DirectFeaturization",
     "ExecutionConfig",
     "Executor",
+    "FFTFeaturization",
     "FeatureLayout",
     "FeatureStore",
     "HypBatch",
@@ -184,16 +192,15 @@ __all__ = [
     "StageResult",
     "Template",
     "ThresholdTest",
-    "TileSchedule",
     "WeightSource",
+    "choose_mode",
     "estimate_spectra",
-    "featurize",
     "healpix_ipix",
     "healpix_level_ids",
     "healpix_orientations",
     "level_map",
+    "make_featurization",
     "psi_degrees",
-    "schedule_tiles",
     "zeta_quantile",
     "zscore_threshold",
 ]

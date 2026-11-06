@@ -17,47 +17,33 @@ from panther_em.inference.search.hypotheses import HypBatch
 from panther_em.inference.search.features import FeatureLayout
 from panther_em.inference.search.hypotheses import HypothesisSet, HypothesisSpace
 from panther_em.inference.search.stage import Stage
-from panther_em.inference.search.features import FeatureStore
-from panther_em.inference.search.types import (
-    BatchShape,
-    ImageSet,
-    PixelSelection,
-    SearchGeometry,
-)
+from panther_em.inference.search.featurization import FeatureChunk, FeatureStore
+from panther_em.inference.search.types import BatchShape
 
 CUDA = torch.cuda.is_available()
 pytestmark = pytest.mark.filterwarnings("ignore:ComplexHalf support is experimental")
 
 
-def _geometry(n_images=1):
-    images = ImageSet.from_stack(torch.zeros(n_images, 24, 24))
-    return SearchGeometry.from_images(images, (20, 20))  # 5 x 5 grid per image
-
-
-def _fill_store(result, spec, n_defocus, block_pixels, device, n_images=1, seed=0):
+def _fill_store(result, spec, n_defocus, block_pixels, device, n_pixels=25, seed=0):
     """A device store with random features for every rectangle of ``spec``."""
-    geo = _geometry(n_images)
-    pixels = PixelSelection.all(geo)
     store = FeatureStore(
-        geo,
-        pixels,
-        pixels.index,
-        block_pixels=block_pixels,
-        n_defocus=n_defocus,
-        device=device,
+        spec.rectangles, spec.precision, range(n_defocus), n_pixels, block_pixels, device
     )
     gen = torch.Generator().manual_seed(seed)
     features = {}
     for rect in spec.rectangles:
-        group = store.add_group(rect, spec.precision)
         n_cells = rect[2] * rect[3]
-        re = torch.randn(n_defocus, n_cells, store.n_pixels, generator=gen)
-        im = torch.randn(n_defocus, n_cells, store.n_pixels, generator=gen)
+        re = torch.randn(n_defocus, n_cells, n_pixels, generator=gen)
+        im = torch.randn(n_defocus, n_cells, n_pixels, generator=gen)
         data = torch.complex(re, im)
-        w = store.writer(group)
-        w.write(slice(0, n_cells), (0, store.n_pixels), data)
-        w.close()
+        for d in range(n_defocus):
+            # two column chunks per plane, as a featurization would stream them
+            for cols in (slice(0, n_pixels // 2), slice(n_pixels // 2, n_pixels)):
+                store.write(
+                    rect, FeatureChunk(d, slice(0, n_cells), cols, data[d][:, cols])
+                )
         features[rect] = data  # (D, cells, P)
+    store.check_complete()
     return store, features
 
 
@@ -120,7 +106,6 @@ def _run_stage(
         block_pixels=store.block_pixels,
         use_cuda_graph=use_cuda_graph,
         use_fused_kernel=use_fused_kernel,
-        store=store,
     )
     plan = plan_stage(ctx, 0, spec, store, memory)
     maps = ctx.run(store, plan)
@@ -169,9 +154,7 @@ def test_defocus_axis_reduces_over_planes(synthetic_result):
     for d in range(3):
         single_space = HypothesisSpace.from_result(result)
         single_store, _ = _fill_store(result, spec, 1, 8, "cpu")
-        single_store.groups[0].blocks = [
-            b[d : d + 1].clone() for b in store.groups[0].blocks
-        ]
+        single_store.groups[0].data = store.groups[0].data[:, d : d + 1].clone()
         _, m = _run_stage(
             ctx, result, spec, single_store, single_space, batch=BatchShape(4, 6)
         )
@@ -219,7 +202,7 @@ def test_plan_memory_defaults_and_overrides(synthetic_result):
     # the L2 budget allows more than the 120 hypotheses, so the batch is clamped to them
     assert plan.hyp_batch == 120 and plan.block_pixels % plan.gemm_pixels == 0
     assert plan.loop == "eager" and plan.n_sub >= 1 and not plan.fused
-    assert plan.residency == "device" and plan.hyps.hyp_batch == plan.hyp_batch
+    assert plan.hyps.hyp_batch == plan.hyp_batch
     assert plan.hyps.n_virtual == 3 * 40
     explicit = plan_memory(
         ctx,
@@ -312,120 +295,6 @@ def test_cuda_fused_eager_and_graph_match_reference(synthetic_result, precision)
         ctx, result, spec, store, space, batch=BatchShape(4, 4), use_cuda_graph=True
     )
     assert len(ctx.loops) == n_loops
-
-
-def _fill_store_split(result, spec, plane_groups, block_pixels, device, seed=0):
-    """Like ``_fill_store`` but each rectangle's planes live in several groups."""
-    n_defocus = sum(len(pg) for pg in plane_groups)
-    geo = _geometry(1)
-    pixels = PixelSelection.all(geo)
-    store = FeatureStore(
-        geo,
-        pixels,
-        pixels.index,
-        block_pixels=block_pixels,
-        n_defocus=n_defocus,
-        device=device,
-    )
-    gen = torch.Generator().manual_seed(seed)
-    features = {}
-    for rect in spec.rectangles:
-        n_cells = rect[2] * rect[3]
-        re = torch.randn(n_defocus, n_cells, store.n_pixels, generator=gen)
-        im = torch.randn(n_defocus, n_cells, store.n_pixels, generator=gen)
-        data = torch.complex(re, im)
-        for planes in plane_groups:
-            group = store.add_group(rect, spec.precision, planes)
-            w = store.writer(group)
-            for plane in planes:
-                w.write(
-                    slice(0, n_cells), (0, store.n_pixels), data[plane], plane=plane
-                )
-            w.close()
-        features[rect] = data
-    return store, features
-
-
-def test_planes_split_across_groups_match_dense_reference(synthetic_result):
-    result = synthetic_result()
-    space = HypothesisSpace.from_result(result, n_defocus=3)
-    spec = Stage.create([(0, 0, 4, 3), (0, 3, 2, 2)], n_psi=16)
-    store, features = _fill_store_split(result, spec, ((0, 2), (1,)), 8, "cpu")
-    assert [g.planes for g in store.groups] == [(0, 2), (1,), (0, 2), (1,)]
-    ctx = Executor("cpu", WeightSource(result, "cpu"))
-    plan, maps = _run_stage(ctx, result, spec, store, space, batch=BatchShape(4, 6))
-    assert len(plan.groups) == 4
-    # rect 0: planes 0,1,2 -> (group 0 local 0), (group 1 local 0), (group 0 local 1)
-    assert plan.plane_lookup[0] == ((0, 0), (1, 0), (0, 1))
-    assert plan.plane_lookup[1] == ((2, 0), (3, 0), (2, 1))
-    _assert_matches(
-        maps, _reference(result, spec, features, plan.hyps, 16), plan.hyps
-    )
-
-    # a stage restricted to plane 2 reads only the first group's local slab 1
-    plan2, maps2 = _run_stage(
-        ctx, result, spec, store, space, defocus_ids=torch.tensor([2]), batch=BatchShape(4, 6)
-    )
-    assert plan2.plane_lookup[0] == ((0, 1),) and len(plan2.groups) == 2
-    _assert_matches(
-        maps2, _reference(result, spec, features, plan2.hyps, 16), plan2.hyps
-    )
-    assert plan2.signature != plan.signature
-
-
-@pytest.mark.skipif(not CUDA, reason="needs CUDA")
-def test_cuda_pinned_host_store_streams_blocks_and_matches_device(synthetic_result):
-    """Blocks written through device staging, flushed to pinned memory and streamed
-    back through slots give the same maps as a device-resident store."""
-    device = torch.device("cuda")
-    result = synthetic_result(n_orientations=8)
-    space = HypothesisSpace.from_result(result, n_defocus=2)
-    spec = Stage.create([(0, 0, 4, 3), (0, 3, 2, 2)], precision="fp16", n_psi=128)
-    ctx = Executor(device, WeightSource(result, device))
-    runs = {}
-    for residency in ("device", "pinned_host"):
-        geo = _geometry(1)
-        pixels = PixelSelection.all(geo)
-        store = FeatureStore(
-            geo,
-            pixels,
-            pixels.index,
-            block_pixels=8,
-            n_defocus=2,
-            device=device,
-            residency=residency,
-        )
-        store.copy_stream = ctx.copy
-        gen = torch.Generator().manual_seed(0)
-        for rect in spec.rectangles:
-            group = store.add_group(rect, spec.precision)
-            n_cells = rect[2] * rect[3]
-            data = torch.complex(
-                torch.randn(2, n_cells, store.n_pixels, generator=gen),
-                torch.randn(2, n_cells, store.n_pixels, generator=gen),
-            )
-            w = store.writer(group)
-            # several writes so staging sees partial blocks before completion
-            for c0 in range(0, n_cells, 3):
-                w.write(
-                    slice(c0, min(n_cells, c0 + 3)),
-                    (0, store.n_pixels),
-                    data[:, c0 : c0 + 3],
-                )
-            w.close()
-            assert not store._staging
-        if residency == "pinned_host":
-            assert all(
-                not b.is_cuda and b.is_pinned() for g in store.groups for b in g.blocks
-            )
-        plan, maps = _run_stage(
-            ctx, result, spec, store, space, batch=BatchShape(4, 4), use_cuda_graph=True
-        )
-        torch.cuda.synchronize()
-        runs[residency] = maps
-    torch.testing.assert_close(runs["pinned_host"].mip, runs["device"].mip)
-    torch.testing.assert_close(runs["pinned_host"].mean, runs["device"].mean)
-    assert torch.equal(runs["pinned_host"].best_virtual, runs["device"].best_virtual)
 
 
 def test_merge_stage_maps_matches_the_joint_statistics():

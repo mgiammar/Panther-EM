@@ -1,7 +1,7 @@
 """Stage planning and execution: plan a stage's shapes, then run its block loop.
 
-* :func:`plan_memory` fixes the GEMM batch, block size, residency and loop kind for a
-  stage before the store's groups are allocated (:class:`MemoryPlan`).
+* :func:`plan_memory` fixes the GEMM batch, block size and loop kind for a stage
+  before its store is allocated (:class:`MemoryPlan`).
 * :func:`plan_stage` freezes everything the loop needs against an existing store
   (:class:`StagePlan`).
 * :class:`HypLoop` is the inner loop for one pixel block: for each GEMM sub-batch,
@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 
 from panther_em.inference.search import fused_kernel_loader
-from panther_em.inference.search.features import Residency, Spectrum, make_engine
+from panther_em.inference.search.features import Spectrum, make_engine
 from panther_em.inference.search.hypotheses import HypothesisSet
 from panther_em.inference.search.statistics import (
     SpectrumSpec,
@@ -38,11 +38,13 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Hashable, Iterable, Sequence
 
     from panther_em.inference.search.features import (
-        ColumnGroup,
         ContractionEngine,
         FeatureLayout,
-        FeatureStore,
         KRun,
+    )
+    from panther_em.inference.search.featurization.store import (
+        ColumnGroup,
+        FeatureStore,
     )
     from panther_em.inference.search.hypotheses import HypBatch, HypothesisSpace
     from panther_em.inference.search.stage import Stage
@@ -80,27 +82,6 @@ def feature_bytes_per_pixel(
     return total
 
 
-def resident_groups(
-    spec: Stage, planes: Sequence[int], store: FeatureStore | None
-) -> list[tuple[tuple[int, int, int, int], Precision, int]]:
-    """``(rect, precision, n_planes)`` per group the stage will have resident."""
-    out: list[tuple[tuple[int, int, int, int], Precision, int]] = []
-    for rect in spec.rectangles:
-        if store is None:
-            out.append((rect, spec.precision, len(planes)))
-            continue
-        seen: set[int] = set()
-        for g in store.groups:
-            if g.rect == rect and g.precision is spec.precision and g.id not in seen:
-                if any(g.holds(p) for p in planes):
-                    seen.add(g.id)
-                    out.append((rect, spec.precision, g.n_defocus))
-        missing = store.missing_planes(rect, spec.precision, planes)
-        if missing:
-            out.append((rect, spec.precision, len(missing)))
-    return out
-
-
 # --------------------------------------------------------------------------- #
 # Plans
 # --------------------------------------------------------------------------- #
@@ -108,7 +89,7 @@ def resident_groups(
 
 @dataclass(frozen=True, eq=False)
 class MemoryPlan:
-    """Shapes and residency of one stage, fixed before its store groups exist.
+    """Shapes of one stage, fixed before its store exists.
 
     Attributes
     ----------
@@ -118,8 +99,6 @@ class MemoryPlan:
         Hypotheses per contraction ``N_b``.
     block_pixels : int
         Pixels per store block (a multiple of ``gemm_pixels``).
-    residency : {"device", "pinned_host"}
-        Where the stage's feature store lives.
     loop : {"eager", "graph"}
         Whether the block loop is replayed as a CUDA graph.
     fused : bool
@@ -135,7 +114,6 @@ class MemoryPlan:
     gemm_pixels: int
     hyp_batch: int
     block_pixels: int
-    residency: Residency
     loop: LoopKind
     fused: bool
     engine: ContractionEngine
@@ -160,14 +138,11 @@ def plan_memory(
     block_pixels: int | None = None,
     use_cuda_graph: bool = True,
     use_fused_kernel: bool = True,
-    residency: Residency | Literal["auto"] = "auto",
-    store: FeatureStore | None = None,
     l2_target: int | None = None,
     block_bytes_max: int = 256 * MIB,
-    device_store_fraction: float = 0.5,
     gemm_pixel_choices: Sequence[int] = (1024, 512),
 ) -> MemoryPlan:
-    """Resolve a stage's GEMM batch, block size, residency, loop kind and hypotheses.
+    """Resolve a stage's GEMM batch, block size, loop kind and hypotheses.
 
     Parameters
     ----------
@@ -184,12 +159,6 @@ def plan_memory(
         Explicit overrides of the L2-residency rule and the block budget.
     use_cuda_graph, use_fused_kernel : bool, optional
         Allow the graphed loop / the fused statistics kernels.
-    residency : optional
-        ``"auto"`` keeps the store on the device when it fits ``device_store_fraction``
-        of the free memory, else pins it on the host and streams blocks.
-    store : FeatureStore, optional
-        Lets the per-pixel byte estimate count the groups that will actually be
-        resident, including planes held beyond the stage's own.
     l2_target : int, optional
         Bytes of spectrum per contraction to keep L2-resident; defaults to a quarter
         of the device's L2 (24 MiB when unknown). Measured on an RTX 6000 Ada (96 MiB
@@ -197,8 +166,6 @@ def plan_memory(
         once it passes a third of L2.
     block_bytes_max : int, optional
         Byte budget of one store block.
-    device_store_fraction : float, optional
-        See ``residency``.
     gemm_pixel_choices : sequence of int, optional
         Candidate ``P_g`` values, preferred first.
     """
@@ -207,7 +174,9 @@ def plan_memory(
         space, template_ids, defocus_ids, hyp_batch=1, n_psi=spec.n_psi
     )
     planes = provisional.defocus_planes()
-    per_pixel = feature_bytes_per_pixel(resident_groups(spec, planes, store))
+    per_pixel = feature_bytes_per_pixel(
+        (rect, spec.precision, len(planes)) for rect in spec.rectangles
+    )
 
     probe = SpectrumSpec(
         dtype=engine.spectrum_dtype,
@@ -249,15 +218,6 @@ def plan_memory(
         if use_cuda_graph and executor.is_cuda and executor.cuda_graphs and fused
         else "eager"
     )
-    store_residency: Residency
-    if residency == "auto":
-        store_bytes = per_pixel * max(1, n_pixels)
-        limit = int((executor.free_bytes or 0) * device_store_fraction)
-        store_residency = (
-            "pinned_host" if executor.is_cuda and store_bytes > limit else "device"
-        )
-    else:
-        store_residency = residency
     hyps = HypothesisSet.create(
         space, template_ids, defocus_ids, hyp_batch=hyp_batch, n_psi=spec.n_psi
     )
@@ -265,7 +225,6 @@ def plan_memory(
         gemm_pixels=gemm_pixels,
         hyp_batch=hyp_batch,
         block_pixels=block_pixels,
-        residency=store_residency,
         loop=loop,
         fused=fused,
         engine=engine,
@@ -607,9 +566,8 @@ class HypLoop:
             torch.cuda.synchronize(device)
             graph = torch.cuda.CUDAGraph()
             # NOTE: Not ``torch.cuda.graph(...)``: that context also empties the caching
-            # allocators, including the pinned-host cache, and a capture that follows
-            # a dropped pinned store (stage 1 after stage 0 of the first micrograph)
-            # would release its 52 GB only for the next micrograph to pin them again.
+            # allocator, releasing a dropped store's memory only for the next band or
+            # micrograph to allocate it again.
             with torch.cuda.stream(side):
                 graph.capture_begin(pool=pool)
                 try:
@@ -659,9 +617,8 @@ class Executor:
         extension compiled (probing it triggers the JIT build).
     l2_bytes, free_bytes : int or None
         L2 cache size and free device memory at construction, when known.
-    compute, featurize, copy : torch.cuda.Stream or None
-        The three streams stages run on (compute), featurize on, and stream blocks
-        through (copy).
+    compute : torch.cuda.Stream or None
+        The stream the block loop runs on.
     loops : dict
         Captured or eager hypothesis loops keyed by ``StagePlan.signature``.
     """
@@ -697,12 +654,8 @@ class Executor:
         self.loops: dict[tuple, HypLoop] = {}
         self.graph_pool: Any = torch.cuda.graph_pool_handle() if self.is_cuda else None
         self.compute: torch.cuda.Stream | None = None
-        self.featurize: torch.cuda.Stream | None = None
-        self.copy: torch.cuda.Stream | None = None
         if self.is_cuda:
             self.compute = torch.cuda.Stream(device=self.device)  # type: ignore[no-untyped-call]
-            self.featurize = torch.cuda.Stream(device=self.device)  # type: ignore[no-untyped-call]
-            self.copy = torch.cuda.Stream(device=self.device)  # type: ignore[no-untyped-call]
 
     def refresh_free_bytes(self) -> int | None:
         """Re-measure ``free_bytes``: driver-free plus the allocator's idle reserve."""
@@ -823,17 +776,14 @@ class Executor:
         )
         with stream:
             if self.compute is not None:
-                # Inputs (store blocks, prepared weights) came from other streams.
+                # Inputs (store blocks, prepared weights) came from another stream.
                 self.compute.wait_stream(torch.cuda.current_stream(self.device))
             for block in store.blocks(plan.groups):
                 if loop is None:
                     loop = self.loop_for(plan, prepared, block.operands)
-                if block.ready is not None:
-                    torch.cuda.current_stream(self.device).wait_event(block.ready)
                 loop.run(block.operands, block.n_valid)
                 start, n_valid = block.col_range[0], block.n_valid
                 loop.stats.finalize_into(targets, start, n_valid)
-                block.release(None)
                 if progress is not None:
                     progress(block.n_valid)
         if self.compute is not None:

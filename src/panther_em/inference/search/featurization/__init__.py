@@ -7,6 +7,9 @@
 * :class:`DirectFeaturization` -- box gather + :class:`BoxContraction` per position
   (sparse selections); the contraction is :class:`AdjointContraction`, with
   :class:`PlanarContraction` as the fallback.
+* :func:`choose_mode` / :func:`make_featurization` -- which engine a selection gets.
+* :class:`FeatureStore` -- one pixel set's features in the search loop's block layout,
+  filled from the chunks.
 """
 
 from panther_em.inference.search.featurization.base import (
@@ -24,15 +27,35 @@ from panther_em.inference.search.featurization.direct_featurization import (
 from panther_em.inference.search.featurization.fft_featurization import (
     FFTFeaturization,
 )
+from panther_em.inference.search.featurization.selection import (
+    DIRECT_MAX_BOX_EXCESS,
+    DIRECT_MAX_DENSITY,
+    Mode,
+    choose_mode,
+    make_featurization,
+)
+from panther_em.inference.search.featurization.store import (
+    ColumnGroup,
+    FeatureStore,
+    ReadyBlock,
+)
 
 __all__ = [
+    "DIRECT_MAX_BOX_EXCESS",
+    "DIRECT_MAX_DENSITY",
     "AdjointContraction",
     "BaseImageFeaturization",
     "BoxContraction",
+    "ColumnGroup",
     "DirectFeaturization",
     "FFTFeaturization",
     "FeatureChunk",
+    "FeatureStore",
+    "Mode",
     "PlanarContraction",
+    "ReadyBlock",
     "box_contraction",
+    "choose_mode",
+    "make_featurization",
     "rectangle_cells",
 ]
