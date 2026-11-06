@@ -23,7 +23,9 @@ from typing import TYPE_CHECKING, Any, Literal, overload
 
 import torch
 
-from panther_em.inference.search.packed import decode_argmax_packed
+from panther_em.inference.search.correlation.kernels.packed import (
+    decode_argmax_packed,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -404,7 +406,7 @@ def fused_irfft_stats(
 ):
     """Fused psi-recovery + statistics-update for one hypothesis batch.
 
-    Matches :func:`panther_em.inference.search.statistics._reduce_stats`'s I/O
+    Matches :func:`panther_em.inference.search.correlation.reduction._reduce_stats`'s I/O
     contract (except ``corr`` is never materialized)::
 
         corr = torch.fft.irfft(c, n=n_psi, dim=-1, norm="forward")
@@ -421,7 +423,7 @@ def fused_irfft_stats(
         ``(vmax, amax)`` before returning. Pass ``False`` to skip that decode and get
         the raw packed value back instead -- useful when a caller wants to batch
         several calls' raw outputs together and decode the whole batch once (see
-        :func:`panther_em.inference.search.packed.decode_argmax_packed`).
+        :func:`panther_em.inference.search.correlation.kernels.packed.decode_argmax_packed`).
 
     Returns
     -------
