@@ -11,8 +11,12 @@ The search's inner loop, per block of pixels and batch of hypotheses:
 3. **loop** (:mod:`.loop`): the two above for every sub-batch and hypothesis batch of
    a block, captured once as a CUDA graph where the kernels allow;
 4. **correlator** (:mod:`.correlator`): the resources that outlive a pass (prepared
-   weights, captured loops, the stream) and the run over a store's blocks into
-   :class:`~.maps.StageMaps`, given a pass's :class:`~.loop.LoopPlan`.
+   weights, captured loops, moment forms, the stream) and the run over a store's
+   blocks into :class:`~.maps.StageMaps`, given a pass's :class:`~.loop.LoopPlan`.
+
+A *local* pass (:mod:`.local`) scores each pixel over its own small neighborhood of
+hypotheses instead, with the mean and variance of the whole set from the
+closed-form moments (:mod:`.moments`).
 
 The package knows store blocks and weights, not images, pixel positions or decisions.
 """
@@ -32,12 +36,14 @@ from panther_em.inference.search.correlation.layout import (
     as_rectangle,
     rectangles_disjoint,
 )
+from panther_em.inference.search.correlation.local import LocalWork
 from panther_em.inference.search.correlation.loop import HypLoop, LoopPlan
 from panther_em.inference.search.correlation.maps import (
     StageMaps,
     concat_stage_maps,
     merge_stage_maps,
 )
+from panther_em.inference.search.correlation.moments import MomentForms
 
 __all__ = [
     "ComplexGemmEngine",
@@ -48,7 +54,9 @@ __all__ = [
     "HypLoop",
     "KRun",
     "LayoutPart",
+    "LocalWork",
     "LoopPlan",
+    "MomentForms",
     "Spectrum",
     "StageMaps",
     "as_rectangle",

@@ -49,6 +49,32 @@ if TYPE_CHECKING:
 # --------------------------------------------------------------------------- #
 
 
+def hermitian_spectrum(spectrum: torch.Tensor, n_psi: int) -> tuple[torch.Tensor, bool]:
+    """``(spectrum, nyquist)``: complex64 with real-valued DC (and a Nyquist) bin."""
+    spectrum = spectrum.to(torch.complex64)
+    n_freq = spectrum.shape[-1]
+    nyquist = n_psi % 2 == 0 and n_freq == n_psi // 2 + 1
+    stop = n_freq - 1 if nyquist and n_freq > 1 else n_freq
+    parts = [spectrum[..., :1].real.to(torch.complex64), spectrum[..., 1:stop]]
+
+    if stop < n_freq:
+        parts.append(spectrum[..., stop:].real.to(torch.complex64))
+
+    return torch.cat(parts, dim=-1), nyquist
+
+
+def max_spectrum(
+    spectrum: torch.Tensor, n_psi: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(vmax, amax)`` of :func:`reduce_spectrum` without the moment sums."""
+    corr = torch.fft.irfft(
+        hermitian_spectrum(spectrum, n_psi)[0], n=n_psi, dim=-1, norm="forward"
+    )
+    vmax, amax = corr.reshape(corr.shape[0], -1).max(dim=1)
+
+    return vmax, amax
+
+
 def reduce_spectrum(
     spectrum: torch.Tensor, n_psi: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -81,14 +107,7 @@ def reduce_spectrum(
     imaginary Nyquist part its output depends on the batch shape (up to 4 % on the
     maximum).
     """
-    spectrum = spectrum.to(torch.complex64)
-    n_freq = spectrum.shape[-1]
-    nyquist = n_psi % 2 == 0 and n_freq == n_psi // 2 + 1
-    stop = n_freq - 1 if nyquist and n_freq > 1 else n_freq
-    parts = [spectrum[..., :1].real.to(torch.complex64), spectrum[..., 1:stop]]
-    if stop < n_freq:
-        parts.append(spectrum[..., stop:].real.to(torch.complex64))
-    spectrum = torch.cat(parts, dim=-1)
+    spectrum, nyquist = hermitian_spectrum(spectrum, n_psi)
     corr = torch.fft.irfft(spectrum, n=n_psi, dim=-1, norm="forward")
     p = corr.shape[0]
 

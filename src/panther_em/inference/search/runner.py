@@ -4,8 +4,9 @@
 for every band and every pass of the band it fills a fresh
 :class:`~.featurization.FeatureStore` with the pass's features (the plan's engine),
 correlates the store against the pass's hypotheses
-(:class:`~.correlation.Correlator`), then merges the passes of a band
-(:func:`~.correlation.merge_stage_maps`) and concatenates the bands
+(:class:`~.correlation.Correlator`; a local stage scores each pixel over its group's
+neighborhood, :meth:`~.correlation.Correlator.run_local`), then merges the passes of a
+band (:func:`~.correlation.merge_stage_maps`) and concatenates the bands
 (:func:`~.correlation.concat_stage_maps`). One store is alive at a time: a pass's
 store is dropped before the next one is allocated.
 """
@@ -20,6 +21,7 @@ import torch
 from tqdm import tqdm
 
 from panther_em.inference.search.correlation import (
+    LocalWork,
     LoopPlan,
     concat_stage_maps,
     merge_stage_maps,
@@ -103,6 +105,8 @@ class StageRunner:
         Records a mark at every phase boundary (the session's).
     show_progress : bool, optional
         Print a progress bar per stage.
+    local_bytes : int, optional
+        Working-memory budget of one chunk of a local stage's tiles.
 
     Attributes
     ----------
@@ -121,6 +125,7 @@ class StageRunner:
         device: DeviceInfo,
         timeline: Timeline | None = None,
         show_progress: bool = False,
+        local_bytes: int = 512 * 1024**2,
     ) -> None:
         self.images = images
         self.geometry = geometry
@@ -129,6 +134,7 @@ class StageRunner:
         self.device = device
         self.timeline = timeline or Timeline(device)
         self.show_progress = show_progress
+        self.local_bytes = int(local_bytes)
         self.store: FeatureStore | None = None
 
     def release(self) -> None:
@@ -170,7 +176,17 @@ class StageRunner:
         self.timeline.mark(f"stage{plan.index}:featurized")
         loop_plan = LoopPlan.create(plan.stage, store, step.memory)
         self.timeline.mark(f"stage{plan.index}:planned")
-        maps = self.correlator.run(store, loop_plan, progress=progress)
+        if plan.local is None:
+            maps = self.correlator.run(store, loop_plan, progress=progress)
+        else:
+            assert band.cells is not None
+            maps = self.correlator.run_local(
+                store,
+                loop_plan,
+                LocalWork(band.cells, plan.local.rows),
+                chunk_bytes=self.local_bytes,
+                progress=progress,
+            )
         self._synchronize()
         t2 = time.perf_counter()
         self.timeline.mark(f"stage{plan.index}:executed")

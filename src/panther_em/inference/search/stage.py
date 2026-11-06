@@ -61,6 +61,9 @@ class Stage:
     decision : Decision, optional
         Applied to the stage's pixels after the search; ``None`` leaves them
         AMBIGUOUS (sweeps and benchmarks).
+    local_rings : int, optional
+        Search each pixel in only the local neighborhood of orientations from the
+        previous search stage.
     name : str
         Free-form label.
     """
@@ -71,6 +74,7 @@ class Stage:
     orientations: int | torch.Tensor | None = None
     planes: tuple[int, ...] | None = None
     decision: Decision | None = None
+    local_rings: int | None = None
     name: str = ""
 
     @classmethod
@@ -83,6 +87,7 @@ class Stage:
         orientations: int | Sequence[int] | torch.Tensor | None = None,
         planes: Sequence[int] | None = None,
         decision: Decision | None = None,
+        local_rings: int | None = None,
         name: str = "",
     ) -> Stage:
         """Build a stage from loose inputs: one rectangle or many, precision by name,
@@ -102,6 +107,7 @@ class Stage:
             orientations=orientations,
             planes=None if planes is None else tuple(sorted({int(p) for p in planes})),
             decision=decision,
+            local_rings=None if local_rings is None else int(local_rings),
             name=str(name),
         )
 
@@ -149,6 +155,24 @@ class Stage:
             )
         if self.decision is not None and not isinstance(self.decision, Decision):
             raise ValueError("decision must be a Decision or None")
+        if self.local_rings is not None:
+            if not isinstance(self.local_rings, int) or self.local_rings < 0:
+                raise ValueError("local_rings must be an int >= 0; see Stage.create()")
+            if isinstance(self.orientations, torch.Tensor):
+                raise ValueError(
+                    "a local stage samples orientations on a HEALPix grid: leave "
+                    "orientations None or give a level"
+                )
+
+    @property
+    def is_local(self) -> bool:
+        """Whether the stage searches per-pixel neighborhoods."""
+        return self.local_rings is not None
+
+    @property
+    def level(self) -> int:
+        """HEALPix sampling level (0 = the template's grid, also for explicit ids)."""
+        return self.orientations if isinstance(self.orientations, int) else 0
 
     @property
     def k_stop(self) -> int:
@@ -218,6 +242,7 @@ def stage_to_json(stage: Stage) -> dict:
         "orientations": orientations,
         "planes": None if stage.planes is None else list(stage.planes),
         "decision": decision,
+        "local_rings": stage.local_rings,
         "name": stage.name,
     }
 
@@ -245,6 +270,7 @@ def stage_from_json(data: dict) -> Stage:
         orientations=orientations,
         planes=data.get("planes"),
         decision=decision,
+        local_rings=data.get("local_rings"),
         name=data.get("name", ""),
     )
 

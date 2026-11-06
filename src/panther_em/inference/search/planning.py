@@ -7,7 +7,8 @@
 * :func:`plan_stage` -- the whole stage (:class:`StagePlan`): its hypotheses, the
   featurization engine, the *bands* (row-contiguous chunks of its pixels whose
   features fit the device) and, per band, the *passes* (one defocus plane at a
-  time, or all at once), each with its memory plan.
+  time, or all at once), each with its memory plan. A local stage's plan also
+  carries its neighborhoods and, per band, each pixel's group.
 
 A plan is a value: it can be built and inspected (and tested) without running
 anything; :class:`~panther_em.inference.search.runner.StageRunner` executes it.
@@ -39,7 +40,7 @@ if TYPE_CHECKING:
 
     from panther_em.inference.search.correlation.contraction import ContractionEngine
     from panther_em.inference.search.featurization import Mode
-    from panther_em.inference.search.hypotheses import HypothesisSpace
+    from panther_em.inference.search.hypotheses import HypothesisSpace, LocalHypotheses
     from panther_em.inference.search.stage import Stage
     from panther_em.inference.search.types import Precision, SearchGeometry
 
@@ -303,10 +304,14 @@ class PassPlan:
 
 @dataclass(frozen=True, eq=False)
 class BandPlan:
-    """One band: a row-contiguous chunk of the stage's pixels and its passes."""
+    """One band: a row-contiguous chunk of the stage's pixels and its passes.
+
+    ``cells`` (a local stage only) is each pixel's group, in ``pixels`` order.
+    """
 
     pixels: PixelSelection
     passes: tuple[PassPlan, ...]
+    cells: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -326,6 +331,8 @@ class StagePlan:
     bands : tuple[BandPlan, ...]
         The stage's pixels in bands (one band unless the features do not fit), each
         searched in its passes; the maps are concatenated in band order.
+    local : LocalHypotheses, optional
+        A local stage's neighborhoods (``None``: every pixel over ``hyps``).
     """
 
     index: int
@@ -333,6 +340,7 @@ class StagePlan:
     hyps: HypothesisSet
     mode: Mode
     bands: tuple[BandPlan, ...]
+    local: LocalHypotheses | None = None
 
     @property
     def pixel_index(self) -> torch.Tensor:
@@ -387,6 +395,8 @@ def plan_stage(
     execution: ExecutionConfig | None = None,
     ipix: np.ndarray | None = None,
     free_bytes: int | None = None,
+    local: LocalHypotheses | None = None,
+    seeds: torch.Tensor | None = None,
 ) -> StagePlan:
     """Plan one stage over ``pixels``.
 
@@ -412,8 +422,26 @@ def plan_stage(
     free_bytes : int, optional
         Free device memory; with ``execution.device_store_fraction`` it bounds one
         band's features. ``None`` keeps the stage in one band.
+    local : LocalHypotheses, optional
+        A local stage's neighborhoods (with ``seeds``).
+    seeds : torch.Tensor, optional
+        ``(P,)`` seed orientation of each pixel, in ``pixels`` order (local only).
     """
     execution = execution or ExecutionConfig()
+    if (local is None) != (seeds is None) or (local is None) == stage.is_local:
+        raise ValueError("a local stage is planned with its neighborhoods and seeds")
+    cells = None
+    if local is not None and seeds is not None:
+        if seeds.numel() != len(pixels):
+            raise ValueError(f"{seeds.numel()} seeds for {len(pixels)} pixels")
+        cells = local.groups(seeds)
+        index_cpu = pixels.index.to("cpu")
+        if not bool(torch.all(index_cpu[1:] >= index_cpu[:-1])):
+            order = torch.sort(index_cpu).indices
+            pixels = PixelSelection(
+                pixels.index[order.to(pixels.device)], pixels.geometry
+            )
+            cells = cells[order]
     tuning = execution.tuning
     template_ids, defocus_ids = stage.hypothesis_ids(space, ipix)
 
@@ -451,6 +479,10 @@ def plan_stage(
         else int(free_bytes * execution.device_store_fraction)
     )
     bands = plan_bands(pixels, per_pixel, limit, memory.gemm_pixels)
+    # the bands are consecutive slices of the (sorted) selection
+    offsets = [0]
+    for band in bands:
+        offsets.append(offsets[-1] + len(band))
 
     def pass_memory(planes: tuple[int, ...], band: PixelSelection) -> MemoryPlan:
         if len(passes) == 1 and len(bands) == 1:
@@ -463,7 +495,12 @@ def plan_stage(
         hyps=memory.hyps,
         mode=mode,
         bands=tuple(
-            BandPlan(band, tuple(PassPlan(p, pass_memory(p, band)) for p in passes))
-            for band in bands
+            BandPlan(
+                band,
+                tuple(PassPlan(p, pass_memory(p, band)) for p in passes),
+                None if cells is None else cells[offsets[i] : offsets[i + 1]],
+            )
+            for i, band in enumerate(bands)
         ),
+        local=local,
     )

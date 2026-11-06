@@ -44,9 +44,11 @@ against the template (warp, box, rows, rectangles, decomposition filter). A
 (:class:`~.noise_model.ImageSet`) or one plain :class:`~.types.SearchImages` stack:
 stage 0 searches every unmasked pixel, each later stage re-scores the pixels the
 previous decision left AMBIGUOUS or ACCEPTED, and the session stops early when that
-set is empty. A stage whose decision runs the threshold test needs the micrograph's
-noise model (an ``ImageSet`` on the table's frequency axis); the session refuses to
-start without it.
+set is empty. A *local* stage (``Stage.local_rings``) scores each of those pixels only
+over a HEALPix neighborhood of the orientation the previous stage found best there,
+with the mean and variance of its whole set from the closed-form moments. A stage
+whose decision runs the threshold test needs the micrograph's noise model (an
+``ImageSet`` on the table's frequency axis); the session refuses to start without it.
 """
 
 from __future__ import annotations
@@ -61,7 +63,11 @@ from panther_em.inference.search.config import ExecutionConfig
 from panther_em.inference.search.correlation import Correlator
 from panther_em.inference.search.decision import PixelLabel
 from panther_em.inference.search.featurization import make_featurization
-from panther_em.inference.search.hypotheses import HypothesisSpace, healpix_ipix
+from panther_em.inference.search.hypotheses import (
+    HypothesisSpace,
+    LocalHypotheses,
+    healpix_ipix,
+)
 from panther_em.inference.search.noise_model import ImageSet
 from panther_em.inference.search.planning import DeviceInfo, plan_stage
 from panther_em.inference.search.results import PixelLedger, SearchResult, StageResult
@@ -119,6 +125,11 @@ class Searcher:
     ----------
     space : HypothesisSpace
         Every hypothesis of the template and the defocus planes.
+    nside, ipix : int and numpy.ndarray, or None
+        The template's HEALPix grid and its orientations' NESTED pixel ids, when a
+        stage samples orientations by level or searches neighborhoods.
+    local : dict[int, LocalHypotheses]
+        The neighborhoods of each local stage, by stage index.
     device_info : DeviceInfo
         The compute device's capabilities (probed once).
     correlator : Correlator
@@ -158,11 +169,15 @@ class Searcher:
         )
         self._featurizations: dict[tuple[Rectangle, Mode], BaseImageFeaturization] = {}
         # NESTED HEALPix ids of the template's orientations, when a stage samples
-        # orientations by HEALPix level (None otherwise, or when not HEALPix)
+        # orientations by HEALPix level or is local (None otherwise, or when the
+        # template is not on a HEALPix grid)
+        self.nside: int | None = None
         self.ipix = None
-        if any(isinstance(s.orientations, int) for s in self.stages):
+        if any(isinstance(s.orientations, int) or s.is_local for s in self.stages):
             found = healpix_ipix(self.space)
-            self.ipix = None if found is None else found[1]
+            if found is not None:
+                self.nside, self.ipix = found
+        self.local: dict[int, LocalHypotheses] = {}
         self.device_info = DeviceInfo.probe(template.device)
         self.correlator = Correlator(
             self.device_info.device,
@@ -196,6 +211,8 @@ class Searcher:
                 and int(template_ids.max()) >= self.space.n_templates
             ):
                 raise ValueError(f"stage {i}: orientation ids exceed the template's")
+            if stage.is_local:
+                self.local[i] = self._local_hypotheses(i, template_ids)
             if stage.decision is not None and stage.decision.test is not None:
                 table = stage.decision.test.table
                 try:
@@ -208,6 +225,34 @@ class Searcher:
                         f"rectangles {table.rectangles}, not the stage's "
                         f"{stage.rectangles}"
                     )
+
+    def _local_hypotheses(
+        self, index: int, template_ids: torch.Tensor | None
+    ) -> LocalHypotheses:
+        stage = self.stages[index]
+        assert stage.local_rings is not None
+        if index == 0:
+            raise ValueError(
+                "stage 0 cannot be local: a local stage searches around the "
+                "orientation the previous stage found best"
+            )
+        if self.ipix is None or self.nside is None:
+            raise ValueError(
+                f"stage {index}: a local stage needs a template whose orientations "
+                "are HEALPix pixel centers (see healpix_orientations)"
+            )
+        try:
+            return LocalHypotheses.build(
+                self.space,
+                self.nside,
+                self.ipix,
+                level=stage.level,
+                seed_level=self.stages[index - 1].level,
+                rings=stage.local_rings,
+                template_ids=template_ids,
+            )
+        except ValueError as exc:
+            raise ValueError(f"stage {index}: {exc}") from exc
 
     @property
     def device(self) -> torch.device:
@@ -224,9 +269,16 @@ class Searcher:
         return found
 
     def plan(
-        self, index: int, pixels: PixelSelection, geometry: SearchGeometry
+        self,
+        index: int,
+        pixels: PixelSelection,
+        geometry: SearchGeometry,
+        seeds: torch.Tensor | None = None,
     ) -> StagePlan:
-        """Plan stage ``index`` over ``pixels`` against the device's free memory now."""
+        """Plan stage ``index`` over ``pixels`` against the device's free memory now.
+
+        A local stage needs ``seeds``: each pixel's previous best orientation.
+        """
         return plan_stage(
             index,
             self.stages[index],
@@ -237,6 +289,8 @@ class Searcher:
             execution=self.execution,
             ipix=self.ipix,
             free_bytes=self.device_info.free_bytes(),
+            local=self.local.get(index),
+            seeds=seeds,
         )
 
     def session(self, images: ImageSet | SearchImages) -> SearchSession:
@@ -345,6 +399,7 @@ class SearchSession:
             device=searcher.device_info,
             timeline=self.timeline,
             show_progress=exe.show_progress,
+            local_bytes=exe.tuning.local_bytes,
         )
         self._mark("session")
 
@@ -366,7 +421,12 @@ class SearchSession:
         t0 = time.perf_counter()
         self._mark(f"stage{index}:start")
         self.runner.release()  # the previous stage's features: not counted as in use
-        plan = self.searcher.plan(index, self.pixels, self.geometry)
+        seeds = (
+            self._seed_orientations(self.pixels)
+            if self.searcher.stages[index].is_local
+            else None
+        )
+        plan = self.searcher.plan(index, self.pixels, self.geometry, seeds)
         run = self.runner.run(plan)
         pixel_index = plan.pixel_index
         self.ledger.write(run.maps, pixel_index, index, plan.hyps)
@@ -377,6 +437,16 @@ class SearchSession:
         self.pixels = self.ledger.next_stage_pixels()
         self._mark(f"stage{index}:decided")
         return self._stage_result(plan, run, pixel_index, time.perf_counter() - t0)
+
+    def _seed_orientations(self, pixels: PixelSelection) -> torch.Tensor:
+        """``(P,)`` best orientation the previous stage found at each pixel."""
+        best = self.ledger.best_index[pixels.index.to(self.ledger.device)]
+        if bool((best < 0).any()):
+            raise RuntimeError(
+                "a local stage needs the previous stage's best hypothesis at every "
+                "pixel it searches"
+            )
+        return self.searcher.space.decode(best.cpu())[2]
 
     def _stage_result(
         self, plan: StagePlan, run: StageRun, pixel_index: torch.Tensor, elapsed: float

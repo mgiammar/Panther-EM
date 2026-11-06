@@ -7,7 +7,7 @@ predicted from the stage's maps under the coloured-noise model of the micrograph
 where the stage's own z-score exceeds the threshold -- when ``accept`` is set, the
 final stage -- and AMBIGUOUS otherwise. Without a test the rule is the plain
 threshold: REJECTED below it, ACCEPTED above it. An optional post-step ABSORBS
-ambiguous pixels within a radius of an accepted one (the same particle's neighbours).
+ambiguous pixels within a radius of an accepted one (the same particle's Neighbors).
 
 The test's distance ``D`` of every tested pixel is kept as its ``score``.
 """

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
+import healpy as hp
 import numpy as np
 import torch
 
@@ -74,12 +75,14 @@ class HypothesisSpace:
             n_filters=int(result.num_fourier_filters),
             n_orientations=int(result.num_orientations),
             phi_deg=None if phi is None else torch.as_tensor(phi, dtype=torch.float32),
-            theta_deg=None
-            if theta is None
-            else torch.as_tensor(theta, dtype=torch.float32),
-            defocus_values=None
-            if defocus_values is None
-            else torch.as_tensor(defocus_values, dtype=torch.float32),
+            theta_deg=(
+                None if theta is None else torch.as_tensor(theta, dtype=torch.float32)
+            ),
+            defocus_values=(
+                None
+                if defocus_values is None
+                else torch.as_tensor(defocus_values, dtype=torch.float32)
+            ),
         )
 
     @property
@@ -424,3 +427,192 @@ def healpix_level_ids(ipix: np.ndarray, level: int) -> torch.Tensor:
     ipix = np.asarray(ipix, dtype=np.int64)
     keep = np.nonzero(ipix % (4**level) == 0)[0]
     return torch.from_numpy(keep.astype(np.int64))
+
+
+# --------------------------------------------------------------------------- #
+# Local neighborhoods on a HEALPix grid
+# --------------------------------------------------------------------------- #
+
+
+def _unique_rows(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-row sorted unique non-negative values of a 2-D array (``-1`` = absent).
+
+    Parameters
+    ----------
+    values : numpy.ndarray
+        ``(N, M)`` int64 array of values, where ``-1`` marks absent values.
+
+    Returns
+    -------
+    table : numpy.ndarray
+        ``(N, W)`` int64 array of each row's distinct values in ascending order, padded
+        by repeating the first value.
+    counts : numpy.ndarray
+        ``(N,)`` int64 array of each row's distinct value count (0 = no value).
+    """
+    big = np.iinfo(np.int64).max
+    s = np.sort(np.where(values < 0, big, values), axis=1)
+    dup = np.zeros_like(s, dtype=bool)
+    dup[:, 1:] = s[:, 1:] == s[:, :-1]
+    s = np.sort(np.where(dup, big, s), axis=1)
+    counts = (s != big).sum(axis=1)
+    width = max(1, int(counts.max()))
+    s = s[:, :width]
+    first = np.where(counts > 0, s[:, 0], -1)
+    return np.where(s == big, first[:, None], s), counts
+
+
+@dataclass(frozen=True, eq=False)
+class LocalHypotheses:
+    """Per-seed orientation neighborhoods of a local stage on its HEALPix grid.
+
+    Attributes
+    ----------
+    cell_of : torch.Tensor
+        ``(O,)`` int64 base cell (group) of each orientation as a seed.
+    rows : torch.Tensor
+        ``(n_cells, W)`` int64 positions in the stage's selected template rows
+        (``HypothesisSet.template_rows()``) of each cell's neighborhood, padded by
+        repeating the first (a repeated hypothesis changes no maximum).
+    counts : torch.Tensor
+        ``(n_cells,)`` distinct template rows of each neighborhood (0 = no
+        orientation of the template lies in it).
+    level : int
+        The stage's HEALPix sampling level (0 = the template's grid).
+    base_level : int
+        Level of the cells seeds are grouped by.
+    rings : int
+        Neighbor rings around the base cell.
+    """
+
+    cell_of: torch.Tensor
+    rows: torch.Tensor
+    counts: torch.Tensor
+    level: int
+    base_level: int
+    rings: int
+
+    @property
+    def width(self) -> int:
+        """``W``: hypotheses per pixel and plane (padded)."""
+        return int(self.rows.shape[1])
+
+    @classmethod
+    def build(
+        cls,
+        space: HypothesisSpace,
+        nside: int,
+        ipix: np.ndarray,
+        *,
+        level: int,
+        seed_level: int,
+        rings: int,
+        template_ids: torch.Tensor | None,
+    ) -> LocalHypotheses:
+        """neighborhoods of every base cell.
+
+        Parameters
+        ----------
+        space : HypothesisSpace
+            The searcher's space.
+        nside, ipix : int, numpy.ndarray
+            The template's HEALPix grid and its orientations' NESTED pixel ids
+            (:func:`healpix_ipix`).
+        level : int
+            The local stage's sampling level (its ``orientations``, 0 when ``None``).
+        seed_level : int
+            The sampling level of the stage that found the seeds.
+        rings : int
+            Neighbor rings on the stage's grid.
+        template_ids : torch.Tensor, optional
+            The stage's selected template rows (sorted; ``None`` = all).
+        """
+        if rings < 0 or level < 0 or seed_level < 0:
+            raise ValueError("rings and levels must be >= 0")
+
+        nside_l = int(nside) >> level
+
+        if nside_l < 1 or nside_l << level != int(nside):
+            raise ValueError(f"level {level} is beyond the nside-{nside} grid")
+
+        base = max(level, seed_level)
+
+        if int(nside) >> base < 1:
+            raise ValueError(
+                f"seed level {seed_level} is beyond the nside-{nside} grid"
+            )
+        ipix = np.asarray(ipix, dtype=np.int64)
+        inverse = np.full(12 * int(nside) ** 2, -1, dtype=np.int64)
+        inverse[ipix] = np.arange(ipix.size)
+        npix_l = 12 * nside_l**2
+
+        # every stage-grid pixel's ring neighborhood (itself first, padded)
+        ring = np.arange(npix_l, dtype=np.int64)[:, None]
+
+        for _ in range(int(rings)):
+            nb = hp.get_all_Neighbors(nside_l, ring.reshape(-1), nest=True)
+            nb = np.asarray(nb, dtype=np.int64).T.reshape(npix_l, -1)
+            ring, _ = _unique_rows(np.concatenate([ring, nb], axis=1))
+
+        # a base cell's stage-grid pixels, widened, restricted to the template's
+        children = 4 ** (base - level)
+        n_cells = 12 * (int(nside) >> base) ** 2
+        members = (np.arange(n_cells, dtype=np.int64)[:, None] * children) + np.arange(
+            children, dtype=np.int64
+        )
+        widened = ring[members].reshape(n_cells, -1)
+        orientation = inverse[widened << (2 * level)]
+        orientation, n_orient = _unique_rows(orientation)
+
+        # every filter of each orientation, as positions in the stage's rows
+        o_count = space.n_orientations
+        filters = np.arange(space.n_filters, dtype=np.int64)
+        rows = (filters[None, :, None] * o_count + orientation[:, None, :]).reshape(
+            n_cells, -1
+        )
+
+        # the distinct entries first (each filter's block is padded), then padding
+        real = np.arange(orientation.shape[1])[None, :] < n_orient[:, None]
+        real = np.broadcast_to(real[:, None, :], (n_cells, filters.size, real.shape[1]))
+        order = np.argsort(~real.reshape(n_cells, -1), axis=1, kind="stable")
+        rows = np.take_along_axis(rows, order, axis=1)
+        counts = n_orient * space.n_filters
+        rows = np.where(
+            np.arange(rows.shape[1])[None, :] < counts[:, None], rows, rows[:, :1]
+        )
+
+        if template_ids is not None:
+            selected = template_ids.cpu().numpy()
+            pos = np.searchsorted(selected, rows).clip(max=selected.size - 1)
+            ok = selected[pos] == rows
+            if not bool(ok[counts > 0].all()):
+                raise ValueError(
+                    "a neighborhood orientation is missing from the stage's "
+                    "orientations (the stage must sample a whole HEALPix level)"
+                )
+            rows = pos
+
+        rows = np.where(counts[:, None] > 0, rows, 0)
+
+        return cls(
+            cell_of=torch.from_numpy(ipix >> (2 * base)),
+            rows=torch.from_numpy(np.ascontiguousarray(rows)),
+            counts=torch.from_numpy(counts),
+            level=int(level),
+            base_level=int(base),
+            rings=int(rings),
+        )
+
+    def groups(self, seeds: torch.Tensor) -> torch.Tensor:
+        """``(P,)`` base cell of each seed orientation (raises on empty)."""
+        seeds = torch.as_tensor(seeds, dtype=torch.long).cpu()
+
+        if seeds.numel() and int(seeds.min()) < 0:
+            raise ValueError("every pixel of a local stage needs a seed orientation")
+
+        cells = self.cell_of[seeds]
+
+        if cells.numel() and int(self.counts[cells].min()) == 0:
+            raise ValueError("a seed's neighborhood holds no orientation of the stage")
+
+        return cells

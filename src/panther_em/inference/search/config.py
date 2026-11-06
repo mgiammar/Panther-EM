@@ -47,6 +47,8 @@ class Tuning:
         Byte budget of the prepared-weight cache (``None`` = unbounded).
     ledger_device : device, optional
         Where the dense per-pixel state lives; defaults to the compute device.
+    local_bytes : int
+        Working-memory budget of one chunk of a local stage's tiles (512 MiB).
     """
 
     batch: BatchShape | None = None
@@ -60,6 +62,7 @@ class Tuning:
     image_batch: int = 1024
     prepared_budget: int | None = None
     ledger_device: torch.device | str | None = None
+    local_bytes: int = 512 * MIB
 
 
 @dataclass(frozen=True)

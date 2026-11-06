@@ -1,8 +1,10 @@
 """The correlator: what outlives a pass, and the run over a store's blocks.
 
 :class:`Correlator` owns the prepared-weight cache, the cache of built (captured)
-loops, the compute stream and the graph pool; :meth:`Correlator.run` correlates
-every block of a store against a pass's hypotheses into :class:`StageMaps`.
+loops, the closed-form moment forms, the compute stream and the graph pool;
+:meth:`Correlator.run` correlates every block of a store against a pass's
+hypotheses into :class:`StageMaps`, :meth:`Correlator.run_local` every column
+against its own neighborhood (:mod:`.local`).
 """
 
 from __future__ import annotations
@@ -13,15 +15,18 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from panther_em.inference.search.correlation.local import correlate_local
 from panther_em.inference.search.correlation.loop import HypLoop
 from panther_em.inference.search.correlation.maps import StageMaps
+from panther_em.inference.search.correlation.moments import MomentForms
 from panther_em.inference.search.correlation.reduction import make_block_stats
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Hashable, Mapping
+    from collections.abc import Callable, Hashable, Iterator, Mapping
 
     from panther_em.inference.search.correlation.contraction import ContractionEngine
     from panther_em.inference.search.correlation.layout import FeatureLayout, KRun
+    from panther_em.inference.search.correlation.local import LocalWork
     from panther_em.inference.search.correlation.loop import LoopPlan, Prepared
     from panther_em.inference.search.featurization.store import FeatureStore
     from panther_em.inference.search.hypotheses import HypBatch
@@ -78,6 +83,8 @@ class Correlator:
         The stream the block loop runs on (CUDA only).
     loops : dict
         Captured or eager hypothesis loops keyed by ``LoopPlan.signature``.
+    forms : dict
+        Closed-form moment forms keyed by layout, engine, template set and ``n_psi``.
     """
 
     def __init__(
@@ -91,6 +98,7 @@ class Correlator:
         self.weights = weights
         self._prepared = _ByteLRU(prepared_budget)
         self.loops: dict[tuple, HypLoop] = {}
+        self.forms: dict[tuple, MomentForms] = {}
         is_cuda = self.device.type == "cuda"
         self.graph_pool: Any = torch.cuda.graph_pool_handle() if is_cuda else None
         self.compute: torch.cuda.Stream | None = None
@@ -198,15 +206,7 @@ class Correlator:
         maps = StageMaps.empty(store.n_pixels, self.device, hyps.n_evaluated)
         targets = maps.as_targets()
         loop = None
-        stream: contextlib.AbstractContextManager[object] = (
-            torch.cuda.stream(self.compute)
-            if self.compute is not None
-            else contextlib.nullcontext()
-        )
-        with stream:
-            if self.compute is not None:
-                # Inputs (store blocks, prepared weights) came from another stream.
-                self.compute.wait_stream(torch.cuda.current_stream(self.device))
+        with self._on_compute():
             for block in store.blocks(plan.groups):
                 if loop is None:
                     loop = self.loop_for(plan, prepared, block.operands)
@@ -215,12 +215,71 @@ class Correlator:
                 loop.stats.finalize_into(targets, start, n_valid)
                 if progress is not None:
                     progress(block.n_valid)
-        if self.compute is not None:
-            # Hand the maps back to the caller's stream.
-            torch.cuda.current_stream(self.device).wait_stream(self.compute)
+        return maps
+
+    @contextlib.contextmanager
+    def _on_compute(self) -> Iterator[None]:
+        """Run the body on the compute stream, between the caller's work around it."""
+        if self.compute is None:
+            yield
+            return
+        caller = torch.cuda.current_stream(self.device)
+        self.compute.wait_stream(caller)
+        with torch.cuda.stream(self.compute):
+            yield
+        caller.wait_stream(self.compute)
+
+    # -- local passes ------------------------------------------------------------
+
+    def moment_forms(self, plan: LoopPlan) -> MomentForms:
+        """The closed-form moments of ``plan``'s template set (built once, cached)."""
+        hyps = plan.hyps
+        key = (
+            plan.layout.rectangles,
+            plan.engine.precision,
+            hyps.template_signature,
+            plan.stage.n_psi,
+        )
+        forms = self.forms.get(key)
+        if forms is None:
+            forms = MomentForms.build(
+                self.weights,
+                plan.layout,
+                plan.engine,
+                plan.stage.n_psi,
+                template_rows=None if hyps.is_contiguous else hyps.template_rows(),
+            )
+            self.forms[key] = forms
+        return forms
+
+    @torch.no_grad()
+    def run_local(
+        self,
+        store: FeatureStore,
+        plan: LoopPlan,
+        work: LocalWork,
+        *,
+        chunk_bytes: int,
+        progress: Callable[[int], None] | None = None,
+    ) -> StageMaps:
+        """Score every column of ``store`` over its group's hypotheses only."""
+        forms = self.moment_forms(plan)
+        maps = StageMaps.empty(store.n_pixels, self.device, plan.hyps.n_evaluated)
+        with self._on_compute():
+            correlate_local(
+                store,
+                plan,
+                work,
+                self.weights,
+                forms,
+                chunk_bytes=chunk_bytes,
+                progress=progress,
+                out=maps,
+            )
         return maps
 
     def release(self) -> None:
-        """Drop cached loops and prepared weights."""
+        """Drop cached loops, prepared weights and moment forms."""
         self.loops.clear()
         self._prepared.clear()
+        self.forms.clear()
