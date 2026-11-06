@@ -1,4 +1,4 @@
-"""noise_model.WhiteningFilter: parity with panther_em.spectra and its guards."""
+"""noise_model.WhiteningFilter: the filters, the corrections and the guards."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 from torch_fourier_filter.bandpass import low_pass_filter
+from torch_fourier_filter.whitening import calculate_num_freq_bins, whitening_filter
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
 from panther_em.inference.search.noise_model import whitening as whitening_module
@@ -13,7 +14,6 @@ from panther_em.inference.search.noise_model.whitening import (
     WhiteningFilter,
     canonical_device,
 )
-from panther_em.spectra import WhiteningFilter as LegacyWhiteningFilter
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -41,24 +41,49 @@ def whitening():
     )
 
 
-def test_matches_the_legacy_filter(whitening):
-    legacy = LegacyWhiteningFilter.from_images(micrographs(), max_freq=0.5)
-    torch.testing.assert_close(whitening.frequencies, legacy.freq)
-    torch.testing.assert_close(whitening.spectra, legacy.spectra)
-    torch.testing.assert_close(whitening.average_curve, legacy.average_1d)
-    torch.testing.assert_close(
-        whitening.correction_curve("m1"), legacy.correction_1d(1)
+def test_single_micrograph_filter_is_torch_fourier_filters():
+    """One micrograph: ``W_avg`` is torch_fourier_filter's whitening filter of it,
+    its correction is 1, and the template filter adds the band."""
+    # a large mean: whitening_filter keeps the DC term (1 / huge ~ 0), we zero it
+    x = coloured(SHAPE, 3) + 1.0e4
+    single = WhiteningFilter.from_images(
+        [("x", x)], band_cutoff=BAND[0], band_falloff=BAND[1], max_freq=0.5
     )
-    torch.testing.assert_close(
-        whitening.image_filter("m1", SHAPE), legacy.image_grid("m1", SHAPE)
+    n_bins = calculate_num_freq_bins(SHAPE)
+    reference = whitening_filter(
+        torch.fft.rfft2(x), rfft=True, num_freq_bins=n_bins, max_freq=0.5
     )
-    torch.testing.assert_close(
-        whitening.correction_grid("m2", SHAPE), legacy.correction_grid("m2", SHAPE)
+    torch.testing.assert_close(single.average_filter(SHAPE), reference)
+    torch.testing.assert_close(single.image_filter("x", SHAPE), reference)
+    assert torch.all(single.correction_grid("x", SHAPE) == 1.0)
+    on_box = whitening_filter(
+        torch.fft.rfft2(x),
+        rfft=True,
+        num_freq_bins=n_bins,
+        max_freq=0.5,
+        output_shape=BOX,
     )
     band = low_pass_filter(*BAND, BOX, rfft=True, fftshift=False)
+    torch.testing.assert_close(single.template_filter(BOX), on_box * band)
+
+
+def test_corrections_relate_each_micrograph_to_the_average(whitening):
+    """``C_i = W_i / W_avg`` and the search-image filter ``W_avg * C_i^2``."""
     torch.testing.assert_close(
-        whitening.template_filter(BOX), legacy.average_grid(BOX) * band
+        whitening.average_spectrum, whitening.spectra.square().mean(0).sqrt()
     )
+    for name in ("m0", "m1", "m2"):
+        c = whitening.correction_curve(name)
+        ok = whitening.average_curve > 0  # 0 / 0 at the zeroed DC: C_i is 1 there
+        torch.testing.assert_close(
+            c[ok], (whitening.image_curve(name) / whitening.average_curve)[ok]
+        )
+        assert torch.all(c[~ok] == 1.0)
+        torch.testing.assert_close(
+            whitening.image_filter(name, SHAPE),
+            whitening.average_filter(SHAPE)
+            * whitening.correction_grid(name, SHAPE) ** 2,
+        )
 
 
 def test_from_images_needs_named_pairs():

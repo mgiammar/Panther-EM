@@ -33,7 +33,7 @@ import torch
 from torch_fourier_filter.bandpass import low_pass_filter
 from torch_fourier_filter.whitening import calculate_num_freq_bins
 
-from panther_em.spectra import (
+from panther_em.inference.search.noise_model.curves import (
     CORNER_FREQ,
     amplitude_spectrum_1d,
     curve_to_grid,

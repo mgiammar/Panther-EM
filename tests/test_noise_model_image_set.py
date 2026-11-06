@@ -10,14 +10,16 @@ from torch_fourier_filter.utils import bin_1dim_with_lerp
 from torch_fourier_filter.whitening import calculate_num_freq_bins
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
+from panther_em.inference.search.noise_model.curves import (
+    curve_to_grid,
+    frequency_axis,
+)
 from panther_em.inference.search.noise_model.image_set import FLATTEN_FLOOR, ImageSet
 from panther_em.inference.search.noise_model.spatial_frequency_error import (
     PerSpatialFrequencyErrorTable,
 )
 from panther_em.inference.search.noise_model.whitening import WhiteningFilter
 from panther_em.inference.template import KernelConfig
-from panther_em.spectra import WhiteningFilter as LegacyWhiteningFilter
-from panther_em.spectra import curve_to_grid, frequency_axis
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -148,12 +150,12 @@ def test_level_flattens_by_the_image_curve(whitening):
     assert inner > 2.0
 
 
-def test_search_image_matches_the_legacy_whitening(whitening):
-    """The same search image as ``panther_em.spectra.WhiteningFilter`` gives."""
+def test_search_image_is_the_micrograph_under_its_image_filter(whitening):
+    """``W_avg * C_i^2`` applied, then zero mean and unit variance."""
     images = prepare(whitening)
-    legacy = LegacyWhiteningFilter.from_images(micrographs())
     raw = dict(micrographs())["m2"]
-    x = torch.fft.irfft2(torch.fft.rfft2(raw) * legacy.image_grid("m2", SHAPE), s=SHAPE)
+    grid = whitening.image_filter("m2", SHAPE)
+    x = torch.fft.irfft2(torch.fft.rfft2(raw) * grid, s=SHAPE)
     x = (x - x.mean()) / x.std()
     torch.testing.assert_close(images.image, x)
 

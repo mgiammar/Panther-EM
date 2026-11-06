@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from panther_em.spectra import curve_to_grid
+from panther_em.inference.search.noise_model.curves import curve_to_grid
 
 if TYPE_CHECKING:
     from panther_em.inference.search.noise_model.spatial_frequency_error import (

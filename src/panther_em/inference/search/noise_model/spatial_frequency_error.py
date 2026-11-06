@@ -25,13 +25,13 @@ from panther_em.decomposition.pipeline_projections import (
     generate_projection_batch,
     precompute_volume_dft,
 )
+from panther_em.inference.search.noise_model.curves import frequency_axis
 from panther_em.inference.search.noise_model.whitening import (
     FILTER_ATOL,
     FILTER_RTOL,
     canonical_device,
 )
 from panther_em.inference.template import KernelConfig
-from panther_em.spectra import frequency_axis
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
