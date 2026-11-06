@@ -1,5 +1,8 @@
-"""The synthetic end-to-end pipeline (whitening, decomposition, tables, spectra,
-two-stage search with the threshold test) runs and every file it writes reloads."""
+"""The synthetic end-to-end pipeline runs and every file it writes reloads.
+
+Whitening, decomposition, error tables, image sets and the two-stage search with the
+threshold test.
+"""
 
 from __future__ import annotations
 
@@ -10,14 +13,14 @@ from pathlib import Path
 
 import torch
 
+from panther_em.decomposition.result import DecompositionResult
 from panther_em.inference.search import (
-    ImageSpectra,
-    NoiseScales,
+    PerSpatialFrequencyErrorTable,
     PixelLabel,
-    RadialTables,
     SearchResult,
+    WhiteningFilter,
 )
-from panther_em.spectra import WhiteningFilter
+from panther_em.inference.template import Template
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "threshold_test_pipeline.py"
 
@@ -36,29 +39,28 @@ def test_threshold_test_pipeline_runs_end_to_end(tmp_path):
 
     whitening = WhiteningFilter.load(tmp_path / "whitening.h5")
     assert whitening.names == ("m0", "m1", "m2")
+    template = Template(
+        DecompositionResult.load(tmp_path / "decomposition.h5"), device="cpu"
+    )
+    whitening.check_template_filter(template.result.fourier_filters)
     tables = {
-        tag: RadialTables.load(tmp_path / f"tables_{tag}.h5")
+        tag: PerSpatialFrequencyErrorTable.load(tmp_path / f"tables_{tag}.h5")
         for tag in ("coarse", "full")
     }
-    assert tables["coarse"].signal_source == "projection"
     assert tables["coarse"].rectangles == ((0, 0, 6, 4),)
     assert tables["full"].n_templates == 12
+    for table in tables.values():
+        table.check_template(template)
 
     for name in whitening.names:
-        spectra = ImageSpectra.load(tmp_path / f"{name}_spectra.h5")
-        scales = NoiseScales.load(tmp_path / f"{name}_scales_coarse.h5")
-        assert spectra.noise.shape == (1, 2, spectra.n_bins)  # two CTF planes
-        assert spectra.level.shape == (1, 96, 96)
-        assert scales.q_kept.shape == (1, 2, 12)
-        assert scales.rectangles == ((0, 0, 6, 4),)
-        result = SearchResult.load(tmp_path / f"{name}_result.h5")
-        assert result.spectra is not None
-        torch.testing.assert_close(result.spectra.level, spectra.level)
-        assert len(result.stage_results) == 2
-        searched = result.last_stage >= 0
-        assert searched.all()  # every pixel was decided by one of the stages
-        assert torch.isfinite(result.score).all()
         record = summary["micrographs"][name]
+        assert record["noise_shape"] == [2, tables["coarse"].n_bins]  # 2 CTF planes
+        lo, hi = record["level_range"]
+        assert 0.0 < lo < 1.0 < hi
+        result = SearchResult.load(tmp_path / f"{name}_result.h5")
+        assert len(result.stage_results) == 2
+        assert (result.last_stage >= 0).all()  # every pixel decided by a stage
+        assert torch.isfinite(result.score).all()
         coarse, full = record["stages"]
         assert coarse["ACCEPTED"] == 0 and coarse["REJECTED"] > 0  # reject or abstain
         assert full["n_pixels"] == coarse["AMBIGUOUS"]
@@ -71,3 +73,6 @@ def test_threshold_test_pipeline_runs_end_to_end(tmp_path):
     assert particle["label"] == "ACCEPTED"
     assert particle["orientation"] == 3 and particle["defocus"] == 1
     assert particle["zscore"] > summary["threshold"]
+    # the empty micrographs accept nothing
+    for name in ("m1", "m2"):
+        assert summary["micrographs"][name]["final"]["ACCEPTED"] == 0

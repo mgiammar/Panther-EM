@@ -571,6 +571,9 @@ class SearchSession:
                 self._mark(f"stage{index}:executed")
                 featurize_s += t_featurized - t_pass
                 execute_s += t_executed - t_featurized
+                # only self.store may keep the features, which the next pass drops
+                # before allocating its own: two band stores never coexist
+                del store, plan
             band_maps.append(merge_stage_maps(parts, hyps.n_selected))
             band_columns.append(band.index.to("cpu"))
         maps = band_maps[0] if len(band_maps) == 1 else _concat_stage_maps(band_maps)

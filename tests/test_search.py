@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+import weakref
 from dataclasses import replace
 
 import pytest
@@ -10,6 +11,7 @@ import torch
 from noise_case import BOX, noise_case
 
 from panther_em.inference.correlation import compute_feature_stack
+from panther_em.inference.search import search as search_module
 from panther_em.inference.search.decision import Decision, PixelLabel
 from panther_em.inference.search.featurization import (
     BaseImageFeaturization,
@@ -511,6 +513,49 @@ def test_search_result_round_trip_and_masked_pixels(template, tmp_path):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         res.to("cpu")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_cuda_bands_match_one_band_and_never_coexist(synthetic_result, monkeypatch):
+    """A stage cut into bands gives the maps of one band, and every band's store is
+    released before the next one is allocated (two would not fit a real device)."""
+    template = Template(synthetic_result(), device="cuda")
+    image = _image(h=40, w=36, seed=7)  # 21 x 17 = 357 pixels
+    stages = [
+        Stage.create([(0, 0, 3, 4)], n_psi=16, decision=Decision(0.0, accept=False)),
+        Stage.create([(0, 0, 4, 5)], n_psi=16),
+    ]
+    exe = replace(EXEC, batch=BatchShape(64, 5))
+    alive_at_allocation: list[int] = []
+    stores: list[weakref.ref] = []
+
+    class Tracked(search_module.FeatureStore):
+        def __init__(self, *args, **kwargs):
+            alive_at_allocation.append(sum(r() is not None for r in stores))
+            super().__init__(*args, **kwargs)
+            stores.append(weakref.ref(self))
+
+    monkeypatch.setattr(search_module, "FeatureStore", Tracked)
+
+    def run(fraction):
+        searcher = Searcher(
+            template,
+            stages,
+            execution=replace(exe, device_store_fraction=fraction),
+            featurization=StubFeaturizer(),
+            keep_stage_results=True,
+        )
+        return searcher.run(SearchImages.single(image.cuda()))
+
+    one = run(0.5)
+    assert len(stores) == 2  # one store per stage
+    banded = run(1e-9)  # every band holds a single GEMM batch of pixels
+    assert len(stores) > 2 + 5
+    assert alive_at_allocation[2:] == [0] * (len(stores) - 2)
+    for name in MAP_NAMES:
+        torch.testing.assert_close(
+            getattr(banded, name), getattr(one, name), equal_nan=True
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
