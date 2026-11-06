@@ -664,9 +664,12 @@ def test_session_store_is_released_after_the_session(template):
     session.run_all()
     store_ref = weakref.ref(session.store)
     block_ref = weakref.ref(session.store.groups[0].data)  # the bytes themselves
-    del session
-    gc.collect()
-    assert store_ref() is None  # only the session owned the store
+    gc.disable()  # freed by reference counting alone: no cycle holds the session
+    try:
+        del session
+        assert store_ref() is None  # only the session owned the store
+    finally:
+        gc.enable()
     assert block_ref() is None  # and nothing (the cached loop's plan) kept its blocks
     assert searcher.correlator.loops  # the loop cache survives for the next image set
 

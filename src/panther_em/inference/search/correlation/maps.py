@@ -40,7 +40,7 @@ class StageMaps:
         return cls(f.clone(), f.clone(), f.clone(), f, i.clone(), i, n_evaluated)
 
     def as_targets(self) -> dict[str, torch.Tensor]:
-        """Keyed like ``PixelStats.finalize`` for :meth:`BlockStats.finalize_into`."""
+        """Keyed for :meth:`~.reduction.BlockStats.finalize_into`."""
         return {
             "mip": self.mip,
             "mean": self.mean,

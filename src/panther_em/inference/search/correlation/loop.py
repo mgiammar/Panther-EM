@@ -10,6 +10,7 @@ it will see.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from functools import cached_property
@@ -31,6 +32,33 @@ if TYPE_CHECKING:
     from panther_em.inference.search.hypotheses import HypothesisSet
     from panther_em.inference.search.planning import MemoryPlan
     from panther_em.inference.search.stage import Stage
+
+
+@functools.cache
+def cuda_graph_capture_supported(device_index: int) -> bool:
+    """Whether a CUDA graph captured on device ``device_index`` replays correctly.
+
+    Probed once per device. The capture runs on a private stream bound to the device:
+    a capture on the lazily created process-wide default capture stream records
+    nothing (and replays as a no-op) when that stream belongs to another device.
+    """
+    try:
+        device = torch.device("cuda", device_index)
+        x = torch.zeros(1, device=device)
+        stream = torch.cuda.Stream(device=device)  # type: ignore[no-untyped-call]
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            x.add_(1)  # warm-up
+        torch.cuda.current_stream(device).wait_stream(stream)
+        torch.cuda.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            x.add_(1)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        return bool(x.item() == 2.0)
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True, eq=False)
@@ -202,7 +230,7 @@ def _loop_body(
                 engine.contract(
                     a_parts, [prepared[(run_index, batch_index)]], run, spectrum
                 )
-            stats.consume(spectrum.pnf(), batch, sub)
+            stats.consume(spectrum, batch, sub)
 
 
 class HypLoop:

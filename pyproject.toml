@@ -60,7 +60,7 @@ dependencies = [
 [project.optional-dependencies]
 cuda13 = ["cupy-cuda13x", "cucim-cu13"]
 cuda12 = ["cupy-cuda12x", "cucim-cu12"]
-fused-kernels = ["nvidia-mathdx", "ninja"]
+fused-kernels = ["ninja"]
 
 [project.urls]
 homepage = "https://github.com/mgiammar/panther-em"

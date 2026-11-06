@@ -48,6 +48,32 @@ if TYPE_CHECKING:
     )
 
 
+class Timeline:
+    """``(name, time, allocated_bytes)`` marks at every phase boundary of a session.
+
+    Parameters
+    ----------
+    device : DeviceInfo
+        The compute device (its allocated bytes are recorded on CUDA).
+    trace : bool, optional
+        Synchronise the device at every mark, so the deltas are device times.
+    """
+
+    def __init__(self, device: DeviceInfo, *, trace: bool = False) -> None:
+        self.device = device
+        self.trace = bool(trace)
+        self.marks: list[tuple[str, float, int]] = []
+
+    def mark(self, name: str) -> None:
+        """Record a mark now."""
+        allocated = 0
+        if self.device.is_cuda:
+            if self.trace:
+                torch.cuda.synchronize(self.device.device)
+            allocated = torch.cuda.memory_allocated(self.device.device)
+        self.marks.append((name, time.perf_counter(), allocated))
+
+
 @dataclass(frozen=True, eq=False)
 class StageRun:
     """A stage's maps (in the plan's pixel order) and where the time went."""
@@ -73,8 +99,8 @@ class StageRunner:
         The searcher's correlation resources.
     device : DeviceInfo
         The compute device.
-    mark : callable, optional
-        ``mark(name)`` at every phase boundary (the session's timeline).
+    timeline : Timeline, optional
+        Records a mark at every phase boundary (the session's).
     show_progress : bool, optional
         Print a progress bar per stage.
 
@@ -93,7 +119,7 @@ class StageRunner:
         featurization: Callable[[Rectangle, Mode], BaseImageFeaturization],
         correlator: Correlator,
         device: DeviceInfo,
-        mark: Callable[[str], None] | None = None,
+        timeline: Timeline | None = None,
         show_progress: bool = False,
     ) -> None:
         self.images = images
@@ -101,7 +127,7 @@ class StageRunner:
         self.featurization = featurization
         self.correlator = correlator
         self.device = device
-        self.mark = mark or (lambda name: None)
+        self.timeline = timeline or Timeline(device)
         self.show_progress = show_progress
         self.store: FeatureStore | None = None
 
@@ -141,13 +167,13 @@ class StageRunner:
         store = self._featurize(plan, band.pixels, step)
         self._synchronize()
         t1 = time.perf_counter()
-        self.mark(f"stage{plan.index}:featurized")
+        self.timeline.mark(f"stage{plan.index}:featurized")
         loop_plan = LoopPlan.create(plan.stage, store, step.memory)
-        self.mark(f"stage{plan.index}:planned")
+        self.timeline.mark(f"stage{plan.index}:planned")
         maps = self.correlator.run(store, loop_plan, progress=progress)
         self._synchronize()
         t2 = time.perf_counter()
-        self.mark(f"stage{plan.index}:executed")
+        self.timeline.mark(f"stage{plan.index}:executed")
         timing[0] += t1 - t0
         timing[1] += t2 - t1
         return maps
@@ -166,7 +192,7 @@ class StageRunner:
             step.memory.block_pixels,
             self.device.device,
         )
-        self.mark("store:allocated")
+        self.timeline.mark("store:allocated")
         image, rows, cols = self.geometry.positions(pixels.index.to("cpu"))
         # the selection is sorted, so each image's positions are one run of columns
         ids, counts = torch.unique_consecutive(image, return_counts=True)

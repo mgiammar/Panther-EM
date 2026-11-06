@@ -65,7 +65,7 @@ from panther_em.inference.search.hypotheses import HypothesisSpace, healpix_ipix
 from panther_em.inference.search.noise_model import ImageSet
 from panther_em.inference.search.planning import DeviceInfo, plan_stage
 from panther_em.inference.search.results import PixelLedger, SearchResult, StageResult
-from panther_em.inference.search.runner import StageRunner
+from panther_em.inference.search.runner import StageRunner, Timeline
 from panther_em.inference.search.types import (
     PixelSelection,
     Precision,
@@ -289,8 +289,8 @@ class SearchSession:
         Executes the stage plans over the images.
     stage_results : list[StageResult]
         Filled when the searcher keeps stage results.
-    marks : list[tuple[str, float, int]]
-        ``(name, time, allocated_bytes)`` timeline marks of every phase.
+    timeline : Timeline
+        ``(name, time, allocated_bytes)`` marks of every phase (:attr:`marks`).
     """
 
     def __init__(self, searcher: Searcher, images: ImageSet | SearchImages) -> None:
@@ -334,14 +334,16 @@ class SearchSession:
         self.stage_results: list[StageResult] = []
         self.elapsed_s = 0.0
         self._finished = False
-        self.marks: list[tuple[str, float, int]] = []
+        # the runner shares the timeline, not the session: no session <-> runner
+        # cycle, so a finished session (and its last store) is freed at once
+        self.timeline = Timeline(searcher.device_info, trace=exe.trace)
         self.runner = StageRunner(
             images,
             self.geometry,
             featurization=searcher.featurization,
             correlator=searcher.correlator,
             device=searcher.device_info,
-            mark=self._mark,
+            timeline=self.timeline,
             show_progress=exe.show_progress,
         )
         self._mark("session")
@@ -351,14 +353,13 @@ class SearchSession:
         """The last pass's features (kept until the next stage starts)."""
         return self.runner.store
 
+    @property
+    def marks(self) -> list[tuple[str, float, int]]:
+        """``(name, time, allocated_bytes)`` marks of every phase so far."""
+        return self.timeline.marks
+
     def _mark(self, name: str) -> None:
-        """Record ``(name, time, allocated_bytes)`` (synchronised under ``trace``)."""
-        allocated = 0
-        if self.searcher.device_info.is_cuda:
-            if self.searcher.execution.trace:
-                torch.cuda.synchronize(self.searcher.device)
-            allocated = torch.cuda.memory_allocated(self.searcher.device)
-        self.marks.append((name, time.perf_counter(), allocated))
+        self.timeline.mark(name)
 
     def _run_stage(self, index: int) -> StageResult:
         """Plan, run, record and decide stage ``index``."""

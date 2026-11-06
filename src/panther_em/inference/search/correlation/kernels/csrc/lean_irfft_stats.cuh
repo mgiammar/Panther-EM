@@ -1,7 +1,6 @@
 /* lean_irfft_stats.cuh -- register-resident fused iRFFT + Parseval moments + max/argmax.
  *
- * Replaces the cuFFTDx block FFT with a hand-scheduled transform that never touches
- * shared memory. Generated straight-line code (lean_fft_gen.cuh, from gen_lean_fft.py):
+ * A hand-scheduled transform that never touches shared memory. Generated straight-line code (lean_fft_gen.cuh, from gen_lean_fft.py):
  *
  *   corr[psi] = Re(C_0) + 2 sum_{k>=1} Re(C_k e^{2 pi i k psi / NPSI}),   NPSI = 64*R
  *   corr[R j + r] = Re IDFT64( X_r )[j],   X_r[k'] = sum_m D_{k'+64m} t^{(k'+64m) r}
@@ -60,7 +59,7 @@ __device__ __forceinline__ float2 load_bin(const InT* __restrict__ c, size_t pq,
   return active ? v : make_float2(0.f, 0.f);
 }
 
-// Parseval contribution of bin k (matches _reduce_stats / the cuFFTDx kernel): DC and
+// Parseval contribution of bin k (matches reduction.reduce_spectrum): DC and
 // Nyquist bins count once (real part), every other bin twice.
 template <unsigned NYQ>
 __device__ __forceinline__ void accumulate_moments(unsigned k, float2 v, float& dc, float& pw) {

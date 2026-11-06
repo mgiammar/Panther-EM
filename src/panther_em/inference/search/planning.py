@@ -23,9 +23,9 @@ import torch
 from panther_em.inference.search.config import ExecutionConfig, Tuning
 from panther_em.inference.search.correlation.contraction import make_engine
 from panther_em.inference.search.correlation.kernels import fused_kernel_loader
+from panther_em.inference.search.correlation.loop import cuda_graph_capture_supported
 from panther_em.inference.search.correlation.reduction import (
     SpectrumSpec,
-    _cuda_graph_capture_supported,
     fused_stats_supported,
 )
 from panther_em.inference.search.featurization import choose_mode
@@ -88,7 +88,7 @@ class DeviceInfo:
         props = torch.cuda.get_device_properties(index)
         return cls(
             torch.device("cuda", index),
-            cuda_graphs=_cuda_graph_capture_supported(index),
+            cuda_graphs=cuda_graph_capture_supported(index),
             fused_kernel=fused_kernel_loader._try_compile() is not None,
             l2_bytes=int(getattr(props, "L2_cache_size", 0)) or None,
         )
