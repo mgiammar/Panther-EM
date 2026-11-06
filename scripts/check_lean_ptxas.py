@@ -62,7 +62,7 @@ def _min_blocks_per_sm(fmax: int, r: int) -> int:
 
 _BUILD_SNIPPET = """
 import sys
-from panther_em.inference.search import fused_kernel_loader as loader
+from panther_em.inference.search.correlation.kernels import fused_kernel_loader as loader
 module = getattr(loader, sys.argv[1])()
 sys.exit(0 if module is not None else 3)
 """
@@ -79,7 +79,7 @@ def _build_log(rebuild: bool) -> str:
         if ext_dir is None:
             sys.exit("--rebuild needs TORCH_EXTENSIONS_DIR to be set")
         shutil.rmtree(
-            os.path.join(ext_dir, "panther_em_fused_irfft_stats"), ignore_errors=True
+            os.path.join(ext_dir, "panther_em_lean_irfft_stats"), ignore_errors=True
         )
     env = {**os.environ, "PANTHER_EM_FUSED_KERNEL_VERBOSE": "1"}
     proc = subprocess.run(

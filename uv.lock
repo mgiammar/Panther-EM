@@ -1935,14 +1935,6 @@ wheels = [
 ]
 
 [[package]]
-name = "nvidia-mathdx"
-version = "25.6.0"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/20/1a/a418b8c1adc58abd87fd69414c19883af5c1b10514e3dbfcc27cde831b13/nvidia_mathdx-25.6.0-py3-none-any.whl", hash = "sha256:22e6ad5d0d005f836be5cbd14e836cf2e9ea42c82deb602707246ce8198eaa96", size = 23013087, upload-time = "2025-11-13T18:25:11.228Z" },
-]
-
-[[package]]
 name = "nvidia-nccl-cu13"
 version = "2.30.7"
 source = { registry = "https://pypi.org/simple" }
@@ -2103,7 +2095,6 @@ cuda13 = [
 ]
 fused-kernels = [
     { name = "ninja" },
-    { name = "nvidia-mathdx" },
 ]
 
 [package.dev-dependencies]
@@ -2135,7 +2126,6 @@ requires-dist = [
     { name = "mrcfile" },
     { name = "ninja", marker = "extra == 'fused-kernels'" },
     { name = "numpy" },
-    { name = "nvidia-mathdx", marker = "extra == 'fused-kernels'" },
     { name = "roma" },
     { name = "scikit-image" },
     { name = "scipy" },
