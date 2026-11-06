@@ -15,7 +15,9 @@ from typing import TYPE_CHECKING, NamedTuple
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from panther_em.inference.search.types import Rectangle
+# (k_start, m_start, k_extent, m_extent) block of ``(angular frequency, eigenvector)``
+# feature space.
+Rectangle = tuple[int, int, int, int]
 
 
 def as_rectangle(rect: Sequence[int]) -> Rectangle:
@@ -45,9 +47,7 @@ def rectangles_disjoint(rectangles: Sequence[Rectangle]) -> bool:
 
 
 class LayoutPart(NamedTuple):
-    """One rectangle's contribution to a :class:`KRun`: its index into
-    :attr:`FeatureLayout.rectangles` and its global eigenvector range.
-    """
+    """One rectangle's contribution to a :class:`KRun`."""
 
     rect: int
     m_start: int

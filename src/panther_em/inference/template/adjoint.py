@@ -37,7 +37,8 @@ if TYPE_CHECKING:
 
     from panther_em.coordinates.transform_base import CoordinateTransform
     from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-    from panther_em.inference.search.types import Precision, Rectangle
+    from panther_em.inference.search.correlation.contraction import Precision
+    from panther_em.inference.search.correlation.layout import Rectangle
     from panther_em.inference.template.warp import KernelConfig
 
 NPAD = 12

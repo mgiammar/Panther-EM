@@ -1,4 +1,4 @@
-"""Searcher / SearchSession end to end: single stage and two stages vs dense references."""
+"""Searcher / SearchSession end to end: one and two stages vs dense references."""
 
 from __future__ import annotations
 
@@ -12,12 +12,14 @@ from noise_case import BOX, noise_case
 
 from panther_em.inference.search import runner as runner_module
 from panther_em.inference.search.config import ExecutionConfig, Tuning
+from panther_em.inference.search.correlation.contraction import BatchShape
 from panther_em.inference.search.decision import Decision, PixelLabel
 from panther_em.inference.search.featurization import (
     BaseImageFeaturization,
     FeatureChunk,
 )
 from panther_em.inference.search.hypotheses import HypothesisSet
+from panther_em.inference.search.images import SearchImages
 from panther_em.inference.search.noise_model import Calibration, ThresholdTest
 from panther_em.inference.search.results import (
     MAP_NAMES,
@@ -27,7 +29,6 @@ from panther_em.inference.search.results import (
 )
 from panther_em.inference.search.search import Searcher
 from panther_em.inference.search.stage import Stage
-from panther_em.inference.search.types import BatchShape, SearchImages
 from panther_em.inference.template import Template
 
 pytestmark = pytest.mark.filterwarnings(
@@ -100,8 +101,11 @@ def _image(h=30, w=30, seed=0):
 
 
 def compute_feature_stack(image, kernels):
-    """Valid cross-correlation ``(B, L, H - kH + 1, W - kW + 1)`` of ``image (B, H, W)``
-    with ``kernels (L, kH, kW)`` by a full-size FFT (the test's independent reference)."""
+    """Valid cross-correlation ``(B, L, H - kH + 1, W - kW + 1)`` of ``image``.
+
+    ``image (B, H, W)`` with ``kernels (L, kH, kW)`` by a full-size FFT (the test's
+    independent reference).
+    """
     _, h, w = image.shape
     _, kh, kw = kernels.shape
     spectrum = torch.fft.fft2(image)[:, None] * torch.fft.fft2(kernels, s=(h, w)).conj()
@@ -114,9 +118,14 @@ def _dense_reference(template, image, rects, n_psi, planes=None, filters=None):
     us = torch.as_tensor(recon.result.U) * torch.as_tensor(recon.result.S)[None, None]
     us = us.reshape(-1, *us.shape[2:]).to(torch.complex64)  # (N, K, E)
     k_stop = max(k0 + ke for k0, _, ke, _ in rects)
-    images = [image] if filters is None else [
-        torch.fft.irfft2(torch.fft.rfft2(image) * filters[d], s=image.shape) for d in planes
-    ]
+    images = (
+        [image]
+        if filters is None
+        else [
+            torch.fft.irfft2(torch.fft.rfft2(image) * filters[d], s=image.shape)
+            for d in planes
+        ]
+    )
     C = None
     for d, img in enumerate(images):
         for k0, m0, ke, me in rects:
@@ -177,7 +186,9 @@ def test_single_stage_matches_dense_reference_and_decides(template):
     assert torch.equal(res.best_index[0][unique], best[unique])
     assert torch.equal(res.best_psi[0][unique], psi[unique])
     # no decision: every searched pixel stays AMBIGUOUS
-    assert torch.all(res.label == int(PixelLabel.AMBIGUOUS)) and torch.all(res.last_stage == 0)
+    assert torch.all(res.label == int(PixelLabel.AMBIGUOUS)) and torch.all(
+        res.last_stage == 0
+    )
 
     # a plain threshold decides every pixel and scores none
     decided = Searcher(
@@ -224,11 +235,19 @@ def test_two_stage_rescored_pixels_match_fresh_searches(template):
     assert torch.isnan(results[0].score).all()  # plain thresholds score nothing
 
     for stage, rects in zip(results, (rects0, rects1), strict=True):
-        mip, mean, var, best, _psi, unique = _dense_reference(template, image, rects, 16)
+        mip, mean, var, best, _psi, unique = _dense_reference(
+            template, image, rects, 16
+        )
         rows, cols = stage.pixel_index // 11, stage.pixel_index % 11
-        torch.testing.assert_close(stage.maps.mip, mip[rows, cols], rtol=1e-4, atol=1e-4)
-        torch.testing.assert_close(stage.maps.mean, mean[rows, cols], rtol=1e-4, atol=1e-4)
-        torch.testing.assert_close(stage.maps.variance, var[rows, cols], rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(
+            stage.maps.mip, mip[rows, cols], rtol=1e-4, atol=1e-4
+        )
+        torch.testing.assert_close(
+            stage.maps.mean, mean[rows, cols], rtol=1e-4, atol=1e-4
+        )
+        torch.testing.assert_close(
+            stage.maps.variance, var[rows, cols], rtol=1e-4, atol=1e-4
+        )
         u = unique[rows, cols]
         assert torch.equal(stage.best_index[u], best[rows, cols][u])
 
@@ -256,7 +275,9 @@ def test_two_stage_healpix_level_and_planes(synthetic_result):
         ),
         Stage.create([(0, 0, 4, 5)], n_psi=16, decision=test1),
     ]
-    searcher = Searcher(template, stages, execution=EXEC_JOINT, featurization=stub, n_defocus=3)
+    searcher = Searcher(
+        template, stages, execution=EXEC_JOINT, featurization=stub, n_defocus=3
+    )
     assert searcher.ipix is not None and searcher.ipix.tolist() == list(range(48))
     t_ids, d_ids = stages[0].hypothesis_ids(searcher.space, searcher.ipix)
     assert t_ids.numel() == 12 * 2 and d_ids.tolist() == [
@@ -269,7 +290,9 @@ def test_two_stage_healpix_level_and_planes(synthetic_result):
     results = list(session)
     # stage 1's larger rectangle is a new group, so it is produced on all three planes
     assert stub.calls == 2 and stub.planes_produced == 4
-    assert [(g.rect, g.planes) for g in session.store.groups] == [((0, 0, 4, 5), (0, 1, 2))]
+    assert [(g.rect, g.planes) for g in session.store.groups] == [
+        ((0, 0, 4, 5), (0, 1, 2))
+    ]
     assert results[0].maps.n_evaluated == 24 * 16
     assert results[1].maps.n_evaluated == 3 * 96 * 16
     final = session.snapshot()
@@ -296,7 +319,9 @@ def test_session_stops_when_no_pixel_is_left(template):
     assert results[0].n_ambiguous_after == 0 and stub.calls == 2  # one per image
     res = session.snapshot()
     assert len(res.stage_results) == 1 and isinstance(res.stage_results[0], StageResult)
-    assert torch.all(res.label == int(PixelLabel.REJECTED)) and torch.all(res.last_stage == 0)
+    assert torch.all(res.label == int(PixelLabel.REJECTED)) and torch.all(
+        res.last_stage == 0
+    )
 
     # everything accepted: stage 1 re-scores every pixel
     stages = [
@@ -326,7 +351,9 @@ def test_searcher_validation(template):
             template, [Stage.create([(0, 0, 2, 2)], n_psi=16, planes=(3,))], n_defocus=2
         )
     with pytest.raises(ValueError, match="planes"):
-        Searcher(template, [Stage.create([(0, 0, 2, 2)], n_psi=16, planes=(3,))], n_defocus=2)
+        Searcher(
+            template, [Stage.create([(0, 0, 2, 2)], n_psi=16, planes=(3,))], n_defocus=2
+        )
     with pytest.raises(ValueError, match="HEALPix"):
         Searcher(template, [Stage.create([(0, 0, 2, 2)], n_psi=16, orientations=1)])
     with pytest.raises(ValueError):
@@ -485,11 +512,17 @@ def test_search_result_round_trip_and_masked_pixels(template, tmp_path):
         Stage.create([(0, 0, 4, 5)], n_psi=32),
     ]
     searcher = Searcher(
-        template, stages, execution=EXEC, featurization=StubFeaturizer(), keep_stage_results=True
+        template,
+        stages,
+        execution=EXEC,
+        featurization=StubFeaturizer(),
+        keep_stage_results=True,
     )
     res = searcher.run(SearchImages.single(torch.zeros(30, 30), mask=mask))
     assert (res.label[0][~mask] == int(PixelLabel.MASKED)).all()
-    assert torch.isnan(res.mip[0][~mask]).all() and (res.last_stage[0][~mask] == -1).all()
+    assert (
+        torch.isnan(res.mip[0][~mask]).all() and (res.last_stage[0][~mask] == -1).all()
+    )
     assert torch.isnan(res.score).all()  # plain thresholds score nothing
     n_rescored = int((z > threshold).sum())
     assert n_rescored == 10
@@ -510,15 +543,25 @@ def test_search_result_round_trip_and_masked_pixels(template, tmp_path):
         loaded.geometry == res.geometry and loaded.n_psi_of_stage == res.n_psi_of_stage
     )
     assert [s.rectangles for s in loaded.stages] == [s.rectangles for s in res.stages]
-    assert loaded.stages[0].decision.threshold == threshold and loaded.stages[1].decision is None
-    torch.testing.assert_close(loaded.decode()["psi"], res.decode()["psi"], equal_nan=True)
-    torch.testing.assert_close(loaded.decode()["phi"], res.decode()["phi"], equal_nan=True)
+    assert (
+        loaded.stages[0].decision.threshold == threshold
+        and loaded.stages[1].decision is None
+    )
+    torch.testing.assert_close(
+        loaded.decode()["psi"], res.decode()["psi"], equal_nan=True
+    )
+    torch.testing.assert_close(
+        loaded.decode()["phi"], res.decode()["phi"], equal_nan=True
+    )
     assert [r.stage_index for r in loaded.stage_results] == [0, 1]
     for got, want in zip(loaded.stage_results, res.stage_results, strict=True):
         assert torch.equal(got.pixel_index, want.pixel_index)
         torch.testing.assert_close(got.maps.zscore, want.maps.zscore)
         assert torch.equal(got.best_index, want.best_index)
-        assert got.n_ambiguous_after == want.n_ambiguous_after and got.elapsed_s == want.elapsed_s
+        assert (
+            got.n_ambiguous_after == want.n_ambiguous_after
+            and got.elapsed_s == want.elapsed_s
+        )
     arrays = res.to_numpy()
     assert arrays["mip"].shape == (1, 11, 11)
     with warnings.catch_warnings():
@@ -577,7 +620,9 @@ def test_cuda_mixed_precision_two_stage_matches_cpu(synthetic_result):
 
     def stages(precision0):
         return [
-            Stage.create([(0, 0, 2, 3)], precision=precision0, n_psi=128, decision=Decision(0.0)),
+            Stage.create(
+                [(0, 0, 2, 3)], precision=precision0, n_psi=128, decision=Decision(0.0)
+            ),
             Stage.create([(0, 0, 4, 5)], n_psi=128, decision=Decision(0.0)),
         ]
 
@@ -598,7 +643,9 @@ def test_cuda_mixed_precision_two_stage_matches_cpu(synthetic_result):
         keep_stage_results=True,
     )
     gpu = gpu_searcher.run(SearchImages.single(image)).to("cpu")
-    assert any(loop.graph is not None for loop in gpu_searcher.correlator.loops.values())
+    assert any(
+        loop.graph is not None for loop in gpu_searcher.correlator.loops.values()
+    )
     # stage 0 ran in fp16 on the GPU: the re-scored set may differ at near-ties, so
     # compare the final maps only where both searched the pixel in the same stage
     same = (gpu.last_stage == cpu.last_stage) & (cpu.last_stage >= 0)
@@ -619,7 +666,12 @@ def test_stage_planes_are_featurized_only_where_needed(template):
         Stage.create([rect], n_psi=16),
     ]
     searcher = Searcher(
-        template, stages, execution=EXEC_JOINT, featurization=stub, n_defocus=3, keep_stage_results=True
+        template,
+        stages,
+        execution=EXEC_JOINT,
+        featurization=stub,
+        n_defocus=3,
+        keep_stage_results=True,
     )
     images = SearchImages.from_stack(
         torch.zeros(1, 30, 30), filters=torch.ones(3, 30, 16)
@@ -636,7 +688,10 @@ def test_stage_planes_are_featurized_only_where_needed(template):
     mask = torch.zeros(1, 11, 11, dtype=torch.bool)
     mask.reshape(-1)[results[1].pixel_index] = True
     fresh = Searcher(
-        template, [Stage.create([rect], n_psi=16)], execution=EXEC, featurization=StubFeaturizer(),
+        template,
+        [Stage.create([rect], n_psi=16)],
+        execution=EXEC,
+        featurization=StubFeaturizer(),
         n_defocus=3,
     ).run(
         SearchImages.from_stack(
@@ -648,7 +703,8 @@ def test_stage_planes_are_featurized_only_where_needed(template):
         results[1].maps.mip[order], fresh.mip.reshape(-1)[results[1].pixel_index[order]]
     )
     assert torch.equal(
-        results[1].best_index[order], fresh.best_index.reshape(-1)[results[1].pixel_index[order]]
+        results[1].best_index[order],
+        fresh.best_index.reshape(-1)[results[1].pixel_index[order]],
     )
 
 
@@ -658,7 +714,10 @@ def test_session_store_is_released_after_the_session(template):
     import weakref
 
     searcher = Searcher(
-        template, [Stage.create([(0, 0, 4, 5)], n_psi=16)], execution=EXEC, featurization=StubFeaturizer()
+        template,
+        [Stage.create([(0, 0, 4, 5)], n_psi=16)],
+        execution=EXEC,
+        featurization=StubFeaturizer(),
     )
     session = searcher.session(SearchImages.single(torch.zeros(30, 30)))
     session.run_all()
@@ -681,28 +740,60 @@ def test_plane_major_passes_match_the_joint_search(template):
     stage = Stage.create([rect], n_psi=16, planes=(0, 2), decision=Decision(0.5))
 
     def run(exe, stub):
-        searcher = Searcher(template, [stage], execution=exe, featurization=stub, n_defocus=3, keep_stage_results=True)
+        searcher = Searcher(
+            template,
+            [stage],
+            execution=exe,
+            featurization=stub,
+            n_defocus=3,
+            keep_stage_results=True,
+        )
         session = searcher.session(image)
         result = session.run_all()
         return session, result
 
     joint_stub, major_stub = StubFeaturizer(), StubFeaturizer()
-    joint_session, joint = run(EXEC_JOINT, joint_stub)
+    _, joint = run(EXEC_JOINT, joint_stub)
     major_session, major = run(EXEC, major_stub)
     assert joint_stub.calls == 1 and joint_stub.planes_produced == 2
-    assert major_stub.calls == 2 and major_stub.planes_produced == 2  # one pass per plane
+    assert (
+        major_stub.calls == 2 and major_stub.planes_produced == 2
+    )  # one pass per plane
     # each pass featurized its own plane; the session keeps the last pass's store
     assert [g.planes for g in major_session.store.groups] == [(2,)]
     for name in MAP_NAMES:
-        torch.testing.assert_close(getattr(major, name), getattr(joint, name), rtol=1e-5, atol=1e-5, equal_nan=True)
-    torch.testing.assert_close(major.stage_results[0].best_index, joint.stage_results[0].best_index)
-    assert major.stage_results[0].maps.n_evaluated == joint.stage_results[0].maps.n_evaluated
+        torch.testing.assert_close(
+            getattr(major, name),
+            getattr(joint, name),
+            rtol=1e-5,
+            atol=1e-5,
+            equal_nan=True,
+        )
+    torch.testing.assert_close(
+        major.stage_results[0].best_index, joint.stage_results[0].best_index
+    )
+    assert (
+        major.stage_results[0].maps.n_evaluated
+        == joint.stage_results[0].maps.n_evaluated
+    )
     # the two passes shared one loop and the prepared weights of the hypotheses
     assert len(major_session.searcher.correlator.loops) == 1
     # a later stage over the same planes starts from an empty store (featurizes again)
-    stages = [stage, Stage.create([rect], n_psi=16, planes=(0, 2), decision=Decision(0.5))]
+    stages = [
+        stage,
+        Stage.create([rect], n_psi=16, planes=(0, 2), decision=Decision(0.5)),
+    ]
     stub = StubFeaturizer()
-    searcher = Searcher(template, stages, execution=EXEC, featurization=stub, n_defocus=3, keep_stage_results=True)
+    searcher = Searcher(
+        template,
+        stages,
+        execution=EXEC,
+        featurization=stub,
+        n_defocus=3,
+        keep_stage_results=True,
+    )
     two = searcher.run(image)
     assert stub.calls == 4
-    torch.testing.assert_close(two.stage_results[1].maps.mip, joint.stage_results[0].maps.mip)
+    torch.testing.assert_close(
+        two.stage_results[1].maps.mip, joint.stage_results[0].maps.mip
+    )

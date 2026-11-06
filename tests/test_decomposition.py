@@ -39,11 +39,15 @@ def _make_result(is_complex: bool) -> DecompositionResult:
     rng = np.random.default_rng(0)
     num_freq_blocks = K_MAX * 2 if is_complex else K_MAX
 
-    # Use complex arrays even for real-valued decompositions so conjugation paths are tested.
+    # Complex arrays even for real-valued decompositions: conjugation paths are tested.
     U = (
-        rng.standard_normal((NUM_FF, NUM_OR, num_freq_blocks, EIG_MAX)).astype(np.float32)
+        rng.standard_normal((NUM_FF, NUM_OR, num_freq_blocks, EIG_MAX)).astype(
+            np.float32
+        )
         + 1j
-        * rng.standard_normal((NUM_FF, NUM_OR, num_freq_blocks, EIG_MAX)).astype(np.float32)
+        * rng.standard_normal((NUM_FF, NUM_OR, num_freq_blocks, EIG_MAX)).astype(
+            np.float32
+        )
     ).astype(np.complex64)
     S = rng.random((num_freq_blocks, EIG_MAX)).astype(np.float32)
     Vh = (

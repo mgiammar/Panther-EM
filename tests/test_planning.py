@@ -8,19 +8,19 @@ import pytest
 import torch
 
 from panther_em.inference.search.config import ExecutionConfig, Tuning
+from panther_em.inference.search.correlation.contraction import BatchShape
 from panther_em.inference.search.hypotheses import HypothesisSpace
+from panther_em.inference.search.images import (
+    PixelSelection,
+    SearchGeometry,
+    SearchImages,
+)
 from panther_em.inference.search.planning import (
     DeviceInfo,
     feature_bytes_per_pixel,
     plan_stage,
 )
 from panther_em.inference.search.stage import Stage
-from panther_em.inference.search.types import (
-    BatchShape,
-    PixelSelection,
-    SearchGeometry,
-    SearchImages,
-)
 
 CPU = DeviceInfo(torch.device("cpu"))
 RECT = (0, 0, 4, 5)

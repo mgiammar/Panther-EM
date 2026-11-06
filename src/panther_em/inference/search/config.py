@@ -8,10 +8,10 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     import torch
 
+    from panther_em.inference.search.correlation.contraction import BatchShape
     from panther_em.inference.search.featurization.direct_featurization import (
         ContractionName,
     )
-    from panther_em.inference.search.types import BatchShape
 
 MIB = 1024**2
 
@@ -37,7 +37,7 @@ class Tuning:
     plane_major : bool
         Search a multi-plane stage one defocus plane at a time. When True, each pass
         holds only one plane features and the per-pixel maxima, means and variances are
-        merged across passes. When False, the passes hold all planes' features and the 
+        merged across passes. When False, the passes hold all planes' features and the
         statistics are computed in one pass.
     cell_chunk : int
         Kernel spectra per chunk of the FFT engine.

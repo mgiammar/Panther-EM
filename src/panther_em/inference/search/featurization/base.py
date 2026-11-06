@@ -18,7 +18,7 @@ import torch
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
-    from panther_em.inference.search.types import Rectangle
+    from panther_em.inference.search.correlation.layout import Rectangle
     from panther_em.inference.template import TemplateWarp
 
 

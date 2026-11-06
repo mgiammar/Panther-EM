@@ -37,8 +37,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
+    from panther_em.inference.search.correlation.layout import Rectangle
     from panther_em.inference.search.noise_model.whitening import WhiteningFilter
-    from panther_em.inference.search.types import Rectangle
     from panther_em.inference.template import Template
 
 TABLE_NAMES = (

@@ -12,6 +12,7 @@ from panther_em.inference.search.correlation import (
     FeatureLayout,
     LoopPlan,
 )
+from panther_em.inference.search.correlation.contraction import BatchShape
 from panther_em.inference.search.featurization import FeatureChunk, FeatureStore
 from panther_em.inference.search.hypotheses import (
     HypBatch,
@@ -23,7 +24,6 @@ from panther_em.inference.search.planning import (
     plan_memory,
 )
 from panther_em.inference.search.stage import Stage
-from panther_em.inference.search.types import BatchShape
 from panther_em.inference.template import WeightSource
 
 CUDA = torch.cuda.is_available()
@@ -33,7 +33,12 @@ pytestmark = pytest.mark.filterwarnings("ignore:ComplexHalf support is experimen
 def _fill_store(result, spec, n_defocus, block_pixels, device, n_pixels=25, seed=0):
     """A device store with random features for every rectangle of ``spec``."""
     store = FeatureStore(
-        spec.rectangles, spec.precision, range(n_defocus), n_pixels, block_pixels, device
+        spec.rectangles,
+        spec.precision,
+        range(n_defocus),
+        n_pixels,
+        block_pixels,
+        device,
     )
     gen = torch.Generator().manual_seed(seed)
     features = {}
@@ -140,9 +145,7 @@ def test_cpu_eager_matches_reference_any_block_size(synthetic_result, block_pixe
     plan, maps = _run_stage(ctx, result, spec, store, space, batch=BatchShape(4, 4))
     assert plan.memory.block_pixels == block_pixels and plan.memory.loop == "eager"
     assert plan.fused is False
-    _assert_matches(
-        maps, _reference(result, spec, features, plan.hyps, 16), plan.hyps
-    )
+    _assert_matches(maps, _reference(result, spec, features, plan.hyps, 16), plan.hyps)
 
 
 def test_defocus_axis_reduces_over_planes(synthetic_result):
@@ -224,7 +227,11 @@ def test_plan_memory_defaults_and_overrides(synthetic_result):
         defocus_ids=torch.tensor([1]),
         tuning=Tuning(batch=BatchShape(4, 3), block_pixels=9),
     )
-    assert (explicit.gemm_pixels, explicit.hyp_batch, explicit.block_pixels) == (4, 3, 8)
+    assert (explicit.gemm_pixels, explicit.hyp_batch, explicit.block_pixels) == (
+        4,
+        3,
+        8,
+    )
     assert explicit.hyps.defocus_planes() == (1,)
     assert hyp_batch_multiple(256) == 64 and hyp_batch_multiple(128) == 128
 
@@ -261,7 +268,9 @@ def test_executor_prepared_weights_hit_and_evict(synthetic_result):
 
     tiny = Correlator("cpu", src, prepared_budget=got.numel() * got.element_size())
     a = tiny.prepared(layout, run, batch, engine)
-    b = tiny.prepared(layout, layout.k_runs[1], batch, engine)  # over budget: newest kept
+    b = tiny.prepared(
+        layout, layout.k_runs[1], batch, engine
+    )  # over budget: newest kept
     assert tiny.prepared(layout, layout.k_runs[1], batch, engine) is b
     assert tiny.prepared(layout, run, batch, engine) is not a  # the older entry went
     tiny.release()
@@ -313,27 +322,59 @@ def test_merge_stage_maps_matches_the_joint_statistics():
 
     gen = torch.Generator().manual_seed(3)
     n_planes, n_sel, n_psi, n_px = 3, 5, 4, 7
-    corr = torch.randn(n_planes, n_sel * n_psi, n_px, generator=gen)  # per-plane (hyp*psi, pixel)
+    corr = torch.randn(
+        n_planes, n_sel * n_psi, n_px, generator=gen
+    )  # per-plane (hyp*psi, pixel)
     parts = []
     for d in range(n_planes):
         x = corr[d]
         mip, arg = x.max(dim=0)
         mean = x.mean(dim=0)
         var = x.var(dim=0, unbiased=False)
-        parts.append(StageMaps(mip, mean, var, (mip - mean) / var.sqrt(), arg // n_psi, arg % n_psi, n_sel * n_psi))
+        parts.append(
+            StageMaps(
+                mip,
+                mean,
+                var,
+                (mip - mean) / var.sqrt(),
+                arg // n_psi,
+                arg % n_psi,
+                n_sel * n_psi,
+            )
+        )
     merged = merge_stage_maps(parts, n_sel)
-    joint = corr.permute(1, 0, 2).reshape(-1, n_px)  # hyp-major within plane? no: planes outer
-    joint = corr.reshape(-1, n_px)  # virtual id = d * n_sel + j, psi inner -> row = (d*n_sel + j)*n_psi + psi
+    joint = corr.permute(1, 0, 2).reshape(
+        -1, n_px
+    )  # hyp-major within plane? no: planes outer
+    joint = corr.reshape(
+        -1, n_px
+    )  # virtual id = d * n_sel + j, psi inner -> row = (d*n_sel + j)*n_psi + psi
     mip, arg = joint.max(dim=0)
     torch.testing.assert_close(merged.mip, mip)
     torch.testing.assert_close(merged.mean, joint.mean(dim=0))
-    torch.testing.assert_close(merged.variance, joint.var(dim=0, unbiased=False), rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(merged.zscore, (mip - joint.mean(dim=0)) / joint.var(dim=0, unbiased=False).sqrt(), rtol=1e-4, atol=1e-5)
-    assert torch.equal(merged.best_virtual, arg // n_psi) and torch.equal(merged.best_psi, arg % n_psi)
+    torch.testing.assert_close(
+        merged.variance, joint.var(dim=0, unbiased=False), rtol=1e-5, atol=1e-6
+    )
+    torch.testing.assert_close(
+        merged.zscore,
+        (mip - joint.mean(dim=0)) / joint.var(dim=0, unbiased=False).sqrt(),
+        rtol=1e-4,
+        atol=1e-5,
+    )
+    assert torch.equal(merged.best_virtual, arg // n_psi) and torch.equal(
+        merged.best_psi, arg % n_psi
+    )
     assert merged.n_evaluated == n_planes * n_sel * n_psi
-    # an unsearched pixel (NaN everywhere) stays NaN / -1; a single part is returned as is
+    # an unsearched pixel (NaN everywhere) stays NaN / -1; one part is returned as is
     for p in parts:
-        p.mip[0] = float("nan"); p.mean[0] = float("nan"); p.variance[0] = float("nan"); p.best_virtual[0] = -1
+        p.mip[0] = float("nan")
+        p.mean[0] = float("nan")
+        p.variance[0] = float("nan")
+        p.best_virtual[0] = -1
     merged = merge_stage_maps(parts, n_sel)
-    assert torch.isnan(merged.mip[0]) and int(merged.best_virtual[0]) == -1 and int(merged.best_psi[0]) == -1
+    assert (
+        torch.isnan(merged.mip[0])
+        and int(merged.best_virtual[0]) == -1
+        and int(merged.best_psi[0]) == -1
+    )
     assert merge_stage_maps(parts[:1], n_sel) is parts[0]

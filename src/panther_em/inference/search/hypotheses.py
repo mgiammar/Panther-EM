@@ -132,7 +132,7 @@ def template_rows_for(
     orientation_ids: torch.Tensor,
     filter_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Template rows ``f * O + o`` of the given orientations x (default: all) filters."""
+    """Template rows ``f * O + o`` of the orientations x filters (default: all)."""
     o = torch.as_tensor(orientation_ids, dtype=torch.long).reshape(-1)
     f = (
         torch.arange(space.n_filters)
@@ -509,7 +509,7 @@ class LocalHypotheses:
         rings: int,
         template_ids: torch.Tensor | None,
     ) -> LocalHypotheses:
-        """neighborhoods of every base cell.
+        """Neighborhoods of every base cell.
 
         Parameters
         ----------
@@ -550,7 +550,7 @@ class LocalHypotheses:
         ring = np.arange(npix_l, dtype=np.int64)[:, None]
 
         for _ in range(int(rings)):
-            nb = hp.get_all_Neighbors(nside_l, ring.reshape(-1), nest=True)
+            nb = hp.get_all_neighbours(nside_l, ring.reshape(-1), nest=True)
             nb = np.asarray(nb, dtype=np.int64).T.reshape(npix_l, -1)
             ring, _ = _unique_rows(np.concatenate([ring, nb], axis=1))
 

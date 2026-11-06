@@ -6,6 +6,8 @@
   the real GEMM output is bit-identical to a complex spectrum).
 * :class:`Spectrum` -- the GEMM output, always the kernels' native contiguous
   ``(F, P, N)``.
+* :class:`Precision` / :class:`BatchShape` -- the contraction's precision and its
+  ``(pixels, hypotheses)`` batch.
 
 The store the engines' blocks live in is
 :class:`~panther_em.inference.search.featurization.store.FeatureStore`.
@@ -13,17 +15,49 @@ The store the engines' blocks live in is
 
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 
-from panther_em.inference.search.types import Precision
-
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from panther_em.inference.search.correlation.layout import KRun
+
+
+class Precision(str, enum.Enum):
+    """Numeric precision of the feature/weight contraction."""
+
+    FP32 = "fp32"
+    TF32 = "tf32"
+    FP16 = "fp16"
+
+    @classmethod
+    def coerce(cls, value: Precision | str) -> Precision:
+        """Accept either an enum member or its string value."""
+        if isinstance(value, Precision):
+            return value
+        try:
+            return cls(str(value).lower())
+        except ValueError as exc:
+            raise ValueError(
+                f"unknown precision {value!r}; expected one of {[p.value for p in cls]}"
+            ) from exc
+
+
+@dataclass(frozen=True)
+class BatchShape:
+    """Inner-loop batch sizes: pixels per GEMM and hypotheses per GEMM."""
+
+    pixel: int
+    hyp: int
+
+    def __post_init__(self) -> None:
+        """Validate positivity."""
+        if self.pixel <= 0 or self.hyp <= 0:
+            raise ValueError(f"batch sizes must be positive, got {self}")
 
 
 def _weights_fp16_4m(w_conj: torch.Tensor) -> torch.Tensor:

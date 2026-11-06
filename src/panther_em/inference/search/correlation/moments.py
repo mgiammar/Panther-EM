@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from panther_em.inference.search.types import Precision
+from panther_em.inference.search.correlation.contraction import Precision
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence

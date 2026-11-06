@@ -1,4 +1,4 @@
-"""Generate the unrolled, register-resident inverse-DFT code for ``lean_irfft_stats.cuh``.
+"""Generate the unrolled, register-resident inverse DFTs of ``lean_irfft_stats.cuh``.
 
 The lean reduce kernel keeps one complex 64-point spectrum per thread entirely in
 registers. For that to compile to straight-line FMA code, every loop has to be
@@ -8,7 +8,7 @@ This script emits that code::
     python gen_lean_fft.py --out lean_fft_gen.cuh          # regenerate the header
     python gen_lean_fft.py --check                          # numpy self-tests only
 
-What is emitted (all ``__device__ __forceinline__``, operating on ``float re[N], im[N]``):
+What is emitted (all ``__device__ __forceinline__``, on ``float re[N], im[N]``):
 
 ``ifftN_inplace(re, im)``
     Unnormalized inverse DFT, ``X[j] = sum_k x[k] e^{+2 pi i k j / N}``, mixed-radix
@@ -36,6 +36,10 @@ import cmath
 import math
 import sys
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
 
 # --------------------------------------------------------------------------- #
 # Transform plan: mixed-radix decimation-in-time
@@ -44,8 +48,10 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Butterfly:
-    """One radix-``len(indices)`` butterfly: inputs at ``indices``, input ``q`` pre-multiplied
-    by ``twiddles[q]`` (``twiddles[0] == 1``), outputs written back to ``indices``.
+    """One radix-``len(indices)`` butterfly.
+
+    Inputs at ``indices``, input ``q`` pre-multiplied by ``twiddles[q]``
+    (``twiddles[0] == 1``), outputs written back to ``indices``.
     """
 
     indices: tuple[int, ...]
@@ -85,7 +91,7 @@ def _permutation(n: int, radices: tuple[int, ...]) -> list[int]:
 
 
 def _stages(n: int, radices: tuple[int, ...], offset: int = 0) -> list[list[Butterfly]]:
-    """Butterfly stages for the block ``[offset, offset + n)``, innermost stage first."""
+    """Butterfly stages of the block ``[offset, offset + n)``, innermost first."""
     if not radices:
         return []
     r, inner = radices[0], radices[1:]
@@ -180,7 +186,8 @@ def emit_butterfly(bf: Butterfly) -> list[str]:
             f"  re[{i[1]}]=a0r-a1r; im[{i[1]}]=a0i-a1i;",
         ]
     elif len(i) == 4:
-        # y0 = a0+a1+a2+a3 ; y1 = a0 + i a1 - a2 - i a3 ; y2 = a0-a1+a2-a3 ; y3 = a0 - i a1 - a2 + i a3
+        # y0 = a0+a1+a2+a3 ; y1 = a0 + i a1 - a2 - i a3
+        # y2 = a0-a1+a2-a3 ; y3 = a0 - i a1 - a2 + i a3
         lines += [
             "  const float t0r=a0r+a2r, t0i=a0i+a2i, t1r=a0r-a2r, t1i=a0i-a2i;",
             "  const float t2r=a1r+a3r, t2i=a1i+a3i, t3r=a1r-a3r, t3i=a1i-a3i;",
@@ -199,15 +206,18 @@ def emit_ifft(plan: Plan) -> str:
     """``ifftN_inplace`` plus the ``IFFTN_PERM`` load-order macro."""
     n = plan.n
     out = [
-        f"// Unnormalized inverse DFT of size {n}, radices {plan.radices} (outermost first).",
-        f"// Load slot i from natural-order index IFFT{n}_PERM[i]; output is natural order.",
+        f"// Unnormalized inverse DFT of size {n}, radices {plan.radices}"
+        " (outermost first).",
+        f"// Load slot i from natural-order index IFFT{n}_PERM[i];"
+        " output is natural order.",
         f"#define IFFT{n}_PERM_LIST " + ",".join(map(str, plan.permutation)),
         f"__device__ __forceinline__ void ifft{n}_inplace(float* __restrict__ re,"
         f" float* __restrict__ im) {{",
     ]
     for depth, stage in enumerate(plan.stages):
         out.append(
-            f"  // ---- stage {depth}: {len(stage)} radix-{len(stage[0].indices)} butterflies"
+            f"  // ---- stage {depth}: {len(stage)}"
+            f" radix-{len(stage[0].indices)} butterflies"
         )
         for bf in stage:
             out += ["  " + s for s in emit_butterfly(bf)]
@@ -218,8 +228,10 @@ def emit_ifft(plan: Plan) -> str:
 def emit_residue_twiddle(n_psi: int, h: int, slots: int = 64) -> str:
     """Multiply slot ``k`` by ``e^{+2 pi i k h / n_psi}`` (residue shift by ``h``)."""
     out = [
-        f"// X[k] *= e^(+2 pi i k {h} / {n_psi}), k = 1..{slots - 1}: residue-0 -> residue-{h} spectrum.",
-        f"__device__ __forceinline__ void twiddle_residue_{n_psi}_{h}(float* __restrict__ re,"
+        f"// X[k] *= e^(+2 pi i k {h} / {n_psi}), k = 1..{slots - 1}:"
+        f" residue-0 -> residue-{h} spectrum.",
+        "__device__ __forceinline__ void"
+        f" twiddle_residue_{n_psi}_{h}(float* __restrict__ re,"
         f" float* __restrict__ im) {{",
     ]
     for k in range(1, slots):
@@ -241,9 +253,11 @@ def emit_residue_twiddle_dispatch(n_psi: int) -> str:
     """
     t_threads = n_psi // 128
     out = [
-        f"// Residue shift by runtime h in [0, {t_threads}) at n_psi = {n_psi} (h = 0: identity).",
+        f"// Residue shift by runtime h in [0, {t_threads}) at n_psi = {n_psi}"
+        " (h = 0: identity).",
         "template <> __device__ __forceinline__ void"
-        f" twiddle_residue<{n_psi}>(float* __restrict__ re, float* __restrict__ im, unsigned h) {{",
+        f" twiddle_residue<{n_psi}>(float* __restrict__ re,"
+        " float* __restrict__ im, unsigned h) {",
     ]
     if t_threads > 1:
         out.append("  switch (h) {")
@@ -257,7 +271,9 @@ def emit_residue_twiddle_dispatch(n_psi: int) -> str:
 
 
 def emit_hermitian_pack(slots: int = 64) -> str:
-    """``Z[k] = H_a[k] + i H_b[k]`` in place, from ``X_a`` in ``(re, im)`` and ``X_b = X_a * u``.
+    """``Z[k] = H_a[k] + i H_b[k]`` in place from ``X_a`` and ``X_b = X_a * u``.
+
+    ``X_a`` is held in ``(re, im)``.
 
     ``H[k] = (X[k] + conj X[N-k]) / 2`` and ``u_k = e^{+2 pi i k / 128}``. Pairs
     ``(k, N-k)`` are processed together so the update is in place: with
@@ -276,16 +292,19 @@ def emit_hermitian_pack(slots: int = 64) -> str:
 
     out = [
         "// In-place Hermitian pack of residues (a, b = a shifted by R/2):",
-        "//   Z[k] = H_a[k] + i H_b[k],  H[k] = (X[k] + conj X[N-k]) / 2,  X_b[k] = X_a[k] u_k.",
+        "//   Z[k] = H_a[k] + i H_b[k],  H[k] = (X[k] + conj X[N-k]) / 2,"
+        "  X_b[k] = X_a[k] u_k.",
         "__device__ __forceinline__ void hermitian_pack_inplace(float* __restrict__ re,"
         " float* __restrict__ im) {",
-        "  { const float r=re[0]; re[0]=r; im[0]=r; }  // k=0: H_a = Re X0, H_b = Re(X0 u_0) = Re X0",
+        "  { const float r=re[0]; re[0]=r; im[0]=r; }"
+        "  // k=0: H_a = Re X0, H_b = Re(X0 u_0) = Re X0",
     ]
     half = n // 2
     uh = u(half)  # e^{i pi/2} = i for slots=64
     if abs(uh - 1j) < 1e-12:
         out.append(
-            f"  {{ const float r=re[{half}], i=im[{half}]; re[{half}]=r; im[{half}]=-i; }}"
+            f"  {{ const float r=re[{half}], i=im[{half}];"
+            f" re[{half}]=r; im[{half}]=-i; }}"
             f"  // k={half}: H_a = Re X, H_b = Re(i X) = -Im X"
         )
     else:
@@ -330,13 +349,15 @@ def emit_header(
     """The whole generated header."""
     parts = [
         "// AUTO-GENERATED by gen_lean_fft.py -- do not edit by hand. Regenerate with",
-        f"//   python gen_lean_fft.py --out lean_fft_gen.cuh --sizes {' '.join(map(str, sizes))}",
+        "//   python gen_lean_fft.py --out lean_fft_gen.cuh --sizes "
+        + " ".join(map(str, sizes)),
         "// See that script's docstring for the maths and the conventions.",
         "#pragma once",
         "",
         "template <unsigned NPSI> __device__ __forceinline__ void"
         " twiddle_residue(float* __restrict__ re, float* __restrict__ im, unsigned h);",
-        "template <unsigned NPSI> __device__ __forceinline__ float2 lean_root(unsigned k);",
+        "template <unsigned NPSI> __device__ __forceinline__ float2"
+        " lean_root(unsigned k);",
         "",
     ]
     for n in sizes:
@@ -351,7 +372,8 @@ def emit_header(
             emit_constant_lookup(
                 f"lean_root<{n_psi}>",
                 [cmath.exp(2j * math.pi * k / n_psi) for k in range(n_psi)],
-                f"e^(+2 pi i k / {n_psi}), k < {n_psi}: residue twiddles for the fold pass.",
+                f"e^(+2 pi i k / {n_psi}), k < {n_psi}:"
+                " residue twiddles for the fold pass.",
                 template=True,
             ),
             "",
@@ -386,14 +408,15 @@ def _check_plans(sizes: tuple[int, ...]) -> None:
         ref = np.fft.ifft(x) * n
         err = np.abs(got - ref).max()
         print(
-            f"  ifft{n}: radices {plan.radices}, {sum(map(len, plan.stages))} butterflies, "
+            f"  ifft{n}: radices {plan.radices},"
+            f" {sum(map(len, plan.stages))} butterflies, "
             f"max |err| vs numpy = {err:.1e}"
         )
         assert err < 1e-11 * n
 
 
-def lean_corr_reference(c, n_psi: int) -> np.ndarray:
-    """Pure-numpy model of the kernel's maths (fold + residue twiddle + Hermitian pack)."""
+def lean_corr_reference(c: np.ndarray, n_psi: int) -> np.ndarray:
+    """Numpy model of the kernel's maths (fold, residue twiddle, Hermitian pack)."""
     import numpy as np
 
     f = len(c)
@@ -419,7 +442,7 @@ def lean_corr_reference(c, n_psi: int) -> np.ndarray:
         xa = a * t ** (ks * h)
         xb = b * t ** (ks * h) * np.exp(2j * np.pi * ks / 128)
 
-        def herm(x):
+        def herm(x: np.ndarray) -> np.ndarray:
             return 0.5 * (x + np.conj(x[(-ks) % 64]))
 
         z = np.fft.ifft(herm(xa) + 1j * herm(xb)) * 64
@@ -447,12 +470,14 @@ def _check_lean_math() -> None:
             got = lean_corr_reference(c, n_psi)
             err = np.abs(got - ref).max()
             print(
-                f"  n_psi={n_psi} F={f:3d}: fold/pack model vs irfft(norm=forward) max |err| = {err:.1e}"
+                f"  n_psi={n_psi} F={f:3d}: fold/pack model vs"
+                f" irfft(norm=forward) max |err| = {err:.1e}"
             )
             assert err < 1e-10
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Regenerate the header and/or run the numpy self-tests."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument(
         "--out", help="header to write (default: print nothing, just check)"

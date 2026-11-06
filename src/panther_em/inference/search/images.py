@@ -1,13 +1,15 @@
-"""Immutable value types shared across the inference search package.
+"""The image side of a search: what is searched, and where.
 
-Everything here is a plain value: no device work happens at construction beyond
-cheap shape/dtype validation, and every object is safe to use as a cache key or
-to hand between the planning, featurization and execution layers.
+* :class:`SearchImages` -- a stack of preprocessed images plus optional per-image
+  filters (CTF planes) and masks;
+* :class:`SearchGeometry` -- the grid of template positions over the stack;
+* :class:`PixelSelection` -- a subset of that grid (sorted flat indices).
+
+Plain values: no device work at construction beyond cheap validation.
 """
 
 from __future__ import annotations
 
-import enum
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -16,48 +18,6 @@ import torch
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-
-# (k_start, m_start, k_extent, m_extent) block of ``(angular frequency, eigenvector)``
-# feature space.
-Rectangle = tuple[int, int, int, int]
-
-
-class Precision(str, enum.Enum):
-    """Numeric precision of the feature/weight contraction.
-
-    ``FP32`` is cuBLAS cgemm, ``TF32`` the same on TF32 tensor cores, ``FP16`` the
-    real-valued "4M" GEMM on FP16 tensor cores (about 4x the cgemm rate, ~4e-4
-    relative error in the correlations).
-    """
-
-    FP32 = "fp32"
-    TF32 = "tf32"
-    FP16 = "fp16"
-
-    @classmethod
-    def coerce(cls, value: Precision | str) -> Precision:
-        """Accept either an enum member or its string value."""
-        if isinstance(value, Precision):
-            return value
-        try:
-            return cls(str(value).lower())
-        except ValueError as exc:
-            raise ValueError(
-                f"unknown precision {value!r}; expected one of {[p.value for p in cls]}"
-            ) from exc
-
-
-@dataclass(frozen=True)
-class BatchShape:
-    """Inner-loop batch sizes: pixels per GEMM and hypotheses per GEMM."""
-
-    pixel: int
-    hyp: int
-
-    def __post_init__(self) -> None:
-        """Validate positivity."""
-        if self.pixel <= 0 or self.hyp <= 0:
-            raise ValueError(f"batch sizes must be positive, got {self}")
 
 
 @dataclass(frozen=True, eq=False)

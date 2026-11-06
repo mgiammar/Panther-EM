@@ -31,13 +31,13 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from panther_em.inference.search.correlation.contraction import Precision
 from panther_em.inference.search.correlation.maps import StageMaps
 from panther_em.inference.search.correlation.moments import (
     block_moments,
     moments_to_stats,
 )
 from panther_em.inference.search.correlation.reduction import max_spectrum
-from panther_em.inference.search.types import Precision
 
 if TYPE_CHECKING:
     from collections.abc import Callable

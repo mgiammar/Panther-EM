@@ -19,11 +19,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from panther_em.inference.search.decision import PixelLabel
 from panther_em.inference.search.correlation.maps import StageMaps
+from panther_em.inference.search.decision import PixelLabel
 from panther_em.inference.search.hypotheses import HypothesisSpace
+from panther_em.inference.search.images import PixelSelection, SearchGeometry
 from panther_em.inference.search.stage import Stage, stage_from_json, stage_to_json
-from panther_em.inference.search.types import PixelSelection, SearchGeometry
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -177,7 +177,9 @@ class PixelLedger:
             return
         accepted = (self.label == int(PixelLabel.ACCEPTED)).to(torch.float32)
         grid = self.geometry.unflatten(accepted).unsqueeze(1)  # (B, 1, H, W)
-        offsets = torch.arange(-radius, radius + 1, device=self.device, dtype=torch.float32)
+        offsets = torch.arange(
+            -radius, radius + 1, device=self.device, dtype=torch.float32
+        )
         disk = (offsets[:, None] ** 2 + offsets[None, :] ** 2) <= radius**2
         kernel = disk.to(torch.float32)[None, None]
         near = F.conv2d(grid, kernel, padding=radius).squeeze(1).reshape(-1) > 0
@@ -330,7 +332,10 @@ class SearchResult:
     def psi_degrees(self) -> torch.Tensor:
         """Best in-plane angle in degrees (NaN where unsearched)."""
         out = torch.full(
-            self.best_psi.shape, float("nan"), dtype=torch.float32, device=self.best_psi.device
+            self.best_psi.shape,
+            float("nan"),
+            dtype=torch.float32,
+            device=self.best_psi.device,
         )
         for stage_index, n_psi in enumerate(self.n_psi_of_stage):
             if n_psi <= 0:
@@ -351,7 +356,9 @@ class SearchResult:
         phi = theta = defocus = None
         if self.space.phi_deg is not None and self.space.theta_deg is not None:
             safe = torch.where(valid, o_idx, torch.zeros_like(o_idx))
-            nan = torch.full(safe.shape, float("nan"), dtype=torch.float32, device=safe.device)
+            nan = torch.full(
+                safe.shape, float("nan"), dtype=torch.float32, device=safe.device
+            )
             phi = torch.where(valid, self.space.phi_deg.to(safe.device)[safe], nan)
             theta = torch.where(valid, self.space.theta_deg.to(safe.device)[safe], nan)
         if self.space.defocus_values is not None:
@@ -396,7 +403,8 @@ class SearchResult:
 
         Layout: the nine dense maps and the space's angle/defocus tables as root
         datasets; ``geometry``, ``space``, ``stages``, ``n_psi_of_stage`` and
-        ``elapsed_s`` as attributes; and, when stage results were kept, one group ``stages/stage{i}`` per stage holding the compact
+        ``elapsed_s`` as attributes; and, when stage results were kept, one group
+        ``stages/stage{i}`` per stage holding the compact
         ``pixel_index``, the six stage maps (``best_index`` global), ``labels_after``,
         ``score`` and timing attributes.
         """
@@ -433,9 +441,15 @@ class SearchResult:
                     grp = root.create_group(f"stage{r.stage_index}")
                     grp.create_dataset("pixel_index", data=r.pixel_index.cpu().numpy())
                     for name in STAGE_MAP_NAMES:
-                        source = r.best_index if name == "best_index" else getattr(r.maps, name)
+                        source = (
+                            r.best_index
+                            if name == "best_index"
+                            else getattr(r.maps, name)
+                        )
                         grp.create_dataset(name, data=source.detach().cpu().numpy())
-                    grp.create_dataset("labels_after", data=r.labels_after.cpu().numpy())
+                    grp.create_dataset(
+                        "labels_after", data=r.labels_after.cpu().numpy()
+                    )
                     grp.create_dataset("score", data=r.score.detach().cpu().numpy())
                     grp.attrs["n_pixels"] = r.n_pixels
                     grp.attrs["n_evaluated"] = int(r.maps.n_evaluated)
@@ -474,20 +488,28 @@ class SearchResult:
                 defocus_values=table("defocus_values"),
             )
             stages = tuple(stage_from_json(s) for s in json.loads(f.attrs["stages"]))
-            n_psi_of_stage = tuple(int(v) for v in json.loads(f.attrs["n_psi_of_stage"]))
+            n_psi_of_stage = tuple(
+                int(v) for v in json.loads(f.attrs["n_psi_of_stage"])
+            )
             elapsed = float(f.attrs.get("elapsed_s", 0.0))
             stage_results = []
             if "stages" in f:
-                for name in sorted(f["stages"], key=lambda n: int(n.removeprefix("stage"))):
+                for name in sorted(
+                    f["stages"], key=lambda n: int(n.removeprefix("stage"))
+                ):
                     grp = f["stages"][name]
                     i = int(name.removeprefix("stage"))
-                    tensors = {k: torch.from_numpy(np.asarray(grp[k])) for k in STAGE_MAP_NAMES}
+                    tensors = {
+                        k: torch.from_numpy(np.asarray(grp[k])) for k in STAGE_MAP_NAMES
+                    }
                     best_index = tensors.pop("best_index")
                     stage_results.append(
                         StageResult(
                             stage_index=i,
                             stage=stages[i],
-                            pixel_index=torch.from_numpy(np.asarray(grp["pixel_index"])),
+                            pixel_index=torch.from_numpy(
+                                np.asarray(grp["pixel_index"])
+                            ),
                             maps=StageMaps(
                                 mip=tensors["mip"],
                                 mean=tensors["mean"],
@@ -498,7 +520,9 @@ class SearchResult:
                                 n_evaluated=int(grp.attrs["n_evaluated"]),
                             ),
                             best_index=best_index,
-                            labels_after=torch.from_numpy(np.asarray(grp["labels_after"])),
+                            labels_after=torch.from_numpy(
+                                np.asarray(grp["labels_after"])
+                            ),
                             score=torch.from_numpy(np.asarray(grp["score"])),
                             n_ambiguous_after=int(grp.attrs["n_ambiguous_after"]),
                             elapsed_s=float(grp.attrs["elapsed_s"]),

@@ -4,7 +4,6 @@ import numpy as np
 import torch
 
 from panther_em.coordinates.transform_base import CoordinateTransform
-
 from panther_em.decomposition.result import DecompositionResult
 
 

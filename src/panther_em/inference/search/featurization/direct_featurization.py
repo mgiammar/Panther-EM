@@ -24,17 +24,17 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
+from panther_em.inference.search.correlation.contraction import Precision
 from panther_em.inference.search.featurization.base import (
     BaseImageFeaturization,
     FeatureChunk,
     rectangle_cells,
 )
-from panther_em.inference.search.types import Precision
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
-    from panther_em.inference.search.types import Rectangle
+    from panther_em.inference.search.correlation.layout import Rectangle
     from panther_em.inference.template import TemplateWarp
 
 ContractionName = Literal["adjoint", "planar"]

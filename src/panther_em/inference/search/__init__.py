@@ -127,6 +127,8 @@ Example
 
 from panther_em.inference.search.config import ExecutionConfig, Tuning
 from panther_em.inference.search.correlation import Correlator, FeatureLayout
+from panther_em.inference.search.correlation.contraction import BatchShape, Precision
+from panther_em.inference.search.correlation.layout import Rectangle
 from panther_em.inference.search.decision import Decision, PixelLabel
 from panther_em.inference.search.featurization import (
     BaseImageFeaturization,
@@ -144,6 +146,11 @@ from panther_em.inference.search.hypotheses import (
     healpix_level_ids,
     healpix_orientations,
     psi_degrees,
+)
+from panther_em.inference.search.images import (
+    PixelSelection,
+    SearchGeometry,
+    SearchImages,
 )
 from panther_em.inference.search.noise_model import (
     Calibration,
@@ -166,14 +173,6 @@ from panther_em.inference.search.results import PixelLedger, SearchResult, Stage
 from panther_em.inference.search.runner import StageRunner
 from panther_em.inference.search.search import Searcher, SearchSession
 from panther_em.inference.search.stage import Stage
-from panther_em.inference.search.types import (
-    BatchShape,
-    PixelSelection,
-    Precision,
-    Rectangle,
-    SearchGeometry,
-    SearchImages,
-)
 
 __all__ = [
     "BaseImageFeaturization",

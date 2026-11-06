@@ -31,18 +31,21 @@ from panther_em.inference.search.correlation.reduction import (
 )
 from panther_em.inference.search.featurization import choose_mode
 from panther_em.inference.search.hypotheses import HypothesisSet
-from panther_em.inference.search.types import PixelSelection
+from panther_em.inference.search.images import PixelSelection
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
     import numpy as np
 
-    from panther_em.inference.search.correlation.contraction import ContractionEngine
+    from panther_em.inference.search.correlation.contraction import (
+        ContractionEngine,
+        Precision,
+    )
     from panther_em.inference.search.featurization import Mode
     from panther_em.inference.search.hypotheses import HypothesisSpace, LocalHypotheses
+    from panther_em.inference.search.images import SearchGeometry
     from panther_em.inference.search.stage import Stage
-    from panther_em.inference.search.types import Precision, SearchGeometry
 
 LoopKind = Literal["eager", "graph"]
 MIB = 1024**2

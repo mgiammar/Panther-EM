@@ -1,5 +1,7 @@
-"""One search stage: feature rectangles, precision, ``n_psi``, orientation sampling,
-CTF planes and the decision that ends it.
+"""One search stage: what it searches and the decision that ends it.
+
+Feature rectangles, precision, ``n_psi``, orientation sampling, CTF planes, an
+optional local neighborhood, and the decision.
 
 A :class:`Stage` is a frozen value: build it with :meth:`Stage.create` (which
 coerces loose inputs) and read its derived state (``k_stop``, ``num_features``,
@@ -16,22 +18,22 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
-from panther_em.inference.search.decision import Decision
+from panther_em.inference.search.correlation.contraction import Precision
 from panther_em.inference.search.correlation.layout import (
     FeatureLayout,
     as_rectangle,
     rectangles_disjoint,
 )
+from panther_em.inference.search.decision import Decision
 from panther_em.inference.search.hypotheses import healpix_level_ids, template_rows_for
-from panther_em.inference.search.types import Precision
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     import numpy as np
 
+    from panther_em.inference.search.correlation.layout import Rectangle
     from panther_em.inference.search.hypotheses import HypothesisSpace
-    from panther_em.inference.search.types import Rectangle
 
 
 @dataclass(frozen=True, eq=False)
@@ -90,8 +92,10 @@ class Stage:
         local_rings: int | None = None,
         name: str = "",
     ) -> Stage:
-        """Build a stage from loose inputs: one rectangle or many, precision by name,
-        planes in any order, orientation ids as any int sequence or tensor.
+        """Build a stage from loose inputs.
+
+        One rectangle or many, precision by name, planes in any order, orientation
+        ids as any int sequence or tensor.
         """
         rects: tuple[Rectangle, ...]
         if len(rectangles) > 0 and isinstance(rectangles[0], int):
@@ -99,7 +103,9 @@ class Stage:
         else:
             rects = tuple(as_rectangle(cast("Sequence[int]", r)) for r in rectangles)
         if orientations is not None and not isinstance(orientations, int):
-            orientations = torch.as_tensor(orientations, dtype=torch.long).reshape(-1).cpu()
+            orientations = (
+                torch.as_tensor(orientations, dtype=torch.long).reshape(-1).cpu()
+            )
         return cls(
             rectangles=rects,
             precision=Precision.coerce(precision),
@@ -115,7 +121,9 @@ class Stage:
         """Validate (never coerce); :meth:`create` normalises loose inputs."""
         rects = self.rectangles
         if not isinstance(rects, tuple) or not rects:
-            raise ValueError("a stage needs a non-empty tuple of rectangles; see Stage.create()")
+            raise ValueError(
+                "a stage needs a non-empty tuple of rectangles; see Stage.create()"
+            )
         for r in rects:
             if r != as_rectangle(r):
                 raise ValueError(f"bad rectangle {r!r}; see Stage.create()")
@@ -128,9 +136,10 @@ class Stage:
             raise ValueError("precision must be a Precision; see Stage.create()")
         if self.k_stop > self.n_psi // 2 + 1:
             raise ValueError(
-                f"k_stop ({self.k_stop}) exceeds n_psi // 2 + 1 ({self.n_psi // 2 + 1}); "
-                f"increase n_psi to at least {2 * (self.k_stop - 1)} or cap k_extent at "
-                f"{self.n_psi // 2 + 1} so the angular-frequency content is not aliased"
+                f"k_stop ({self.k_stop}) exceeds n_psi // 2 + 1 "
+                f"({self.n_psi // 2 + 1}); increase n_psi to at least "
+                f"{2 * (self.k_stop - 1)} or cap k_extent at {self.n_psi // 2 + 1} so "
+                "the angular-frequency content is not aliased"
             )
         if self.planes is not None and (
             not isinstance(self.planes, tuple)
@@ -139,7 +148,8 @@ class Stage:
             or self.planes[0] < 0
         ):
             raise ValueError(
-                "planes must be a sorted tuple of distinct plane ids >= 0; see Stage.create()"
+                "planes must be a sorted tuple of distinct plane ids >= 0; see "
+                "Stage.create()"
             )
         if isinstance(self.orientations, int):
             if self.orientations < 0:
@@ -273,4 +283,3 @@ def stage_from_json(data: dict) -> Stage:
         local_rings=data.get("local_rings"),
         name=data.get("name", ""),
     )
-

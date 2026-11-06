@@ -138,7 +138,7 @@ class Correlator:
         template_rows: torch.Tensor | None = None,
         rows_key: Hashable = None,
     ) -> torch.Tensor:
-        """The engine-specific B operand of ``run`` for hypotheses ``batch.j0:batch.j1``.
+        """The engine's B operand of ``run`` for hypotheses ``batch.j0:batch.j1``.
 
         Entries are shared across defocus planes (weights do not depend on the
         image), across stages that reuse a run, and across image sets.
@@ -176,7 +176,7 @@ class Correlator:
     def loop_for(
         self, plan: LoopPlan, prepared: Prepared, example: Mapping[int, torch.Tensor]
     ) -> HypLoop:
-        """The cached hypothesis loop for ``plan``; built (captured) once per signature."""
+        """The hypothesis loop for ``plan``, built (captured) once per signature."""
         loop = self.loops.get(plan.signature)
         if loop is None:
             stats = make_block_stats(plan.spectrum, fused=plan.fused)

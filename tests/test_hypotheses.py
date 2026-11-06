@@ -95,7 +95,9 @@ def test_set_rejects_out_of_range_ids_bad_args_and_packed_index_overflow():
         HypothesisSet.create(space, None, None, hyp_batch=0, n_psi=8)
     # 42 hypotheses x 8 psi = 336 (virtual id, psi) pairs do not fit 8 bits
     with pytest.raises(ValueError, match="packed index"):
-        HypothesisSet.create(space, None, None, hyp_batch=4, n_psi=8, packed_index_bits=8)
+        HypothesisSet.create(
+            space, None, None, hyp_batch=4, n_psi=8, packed_index_bits=8
+        )
     # restricting the planes brings a stage back under the budget
     hyps = HypothesisSet.create(
         space, None, torch.tensor([1]), hyp_batch=4, n_psi=8, packed_index_bits=8
@@ -106,8 +108,12 @@ def test_set_rejects_out_of_range_ids_bad_args_and_packed_index_overflow():
 def test_set_signature_distinguishes_selections():
     space = _space()
     a = HypothesisSet.create(space, None, None, hyp_batch=4, n_psi=8).signature
-    b = HypothesisSet.create(space, torch.arange(0, 14, 2), None, hyp_batch=4, n_psi=8).signature
-    c = HypothesisSet.create(space, torch.arange(0, 14, 2), None, hyp_batch=4, n_psi=8).signature
+    b = HypothesisSet.create(
+        space, torch.arange(0, 14, 2), None, hyp_batch=4, n_psi=8
+    ).signature
+    c = HypothesisSet.create(
+        space, torch.arange(0, 14, 2), None, hyp_batch=4, n_psi=8
+    ).signature
     assert a != b and b == c
 
 

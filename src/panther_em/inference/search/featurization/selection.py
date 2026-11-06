@@ -17,11 +17,12 @@ from panther_em.inference.search.featurization.fft_featurization import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from panther_em.inference.search.correlation.contraction import Precision
     from panther_em.inference.search.featurization.base import BaseImageFeaturization
     from panther_em.inference.search.featurization.direct_featurization import (
         ContractionName,
     )
-    from panther_em.inference.search.types import Precision, SearchGeometry
+    from panther_em.inference.search.images import SearchGeometry
     from panther_em.inference.template import TemplateWarp
 
 Mode = Literal["fft", "direct"]

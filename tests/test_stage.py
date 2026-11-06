@@ -6,10 +6,10 @@ import pytest
 import torch
 from noise_case import noise_case
 
+from panther_em.inference.search.correlation.contraction import Precision
 from panther_em.inference.search.decision import Decision
 from panther_em.inference.search.noise_model import Calibration, ThresholdTest
 from panther_em.inference.search.stage import Stage, stage_from_json, stage_to_json
-from panther_em.inference.search.types import Precision
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",
@@ -23,7 +23,10 @@ def test_stage_create_and_validation():
     assert stage.num_features == 48 and stage.layout().num_features == 48
     single = Stage.create((0, 0, 4, 4), planes=[2, 0, 2], orientations=[5, 1])
     assert single.rectangles == ((0, 0, 4, 4),) and single.planes == (0, 2)
-    assert single.orientations.tolist() == [5, 1] and single.orientations.dtype is torch.long
+    assert (
+        single.orientations.tolist() == [5, 1]
+        and single.orientations.dtype is torch.long
+    )
     with pytest.raises(ValueError):
         Stage.create([])
     with pytest.raises(ValueError):
@@ -84,4 +87,3 @@ def test_stage_json_round_trip():
     explicit = Stage.create([(0, 0, 2, 2)], orientations=[3, 4])
     assert stage_from_json(stage_to_json(explicit)).orientations.tolist() == [3, 4]
     assert stage_from_json(stage_to_json(Stage.create([(0, 0, 2, 2)]))).decision is None
-

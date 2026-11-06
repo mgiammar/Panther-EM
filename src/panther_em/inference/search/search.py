@@ -41,7 +41,7 @@ rectangle and engine, holding its kernels or adjoint bases; prepared weights and
 captured hypothesis loops on the correlator); it checks every stage's error table
 against the template (warp, box, rows, rectangles, decomposition filter). A
 :class:`SearchSession` runs the stages over one micrograph
-(:class:`~.noise_model.ImageSet`) or one plain :class:`~.types.SearchImages` stack:
+(:class:`~.noise_model.ImageSet`) or one plain :class:`~.images.SearchImages` stack:
 stage 0 searches every unmasked pixel, each later stage re-scores the pixels the
 previous decision left AMBIGUOUS or ACCEPTED, and the session stops early when that
 set is empty. A *local* stage (``Stage.local_rings``) scores each of those pixels only
@@ -61,6 +61,7 @@ import torch
 
 from panther_em.inference.search.config import ExecutionConfig
 from panther_em.inference.search.correlation import Correlator
+from panther_em.inference.search.correlation.contraction import Precision
 from panther_em.inference.search.decision import PixelLabel
 from panther_em.inference.search.featurization import make_featurization
 from panther_em.inference.search.hypotheses import (
@@ -68,20 +69,20 @@ from panther_em.inference.search.hypotheses import (
     LocalHypotheses,
     healpix_ipix,
 )
+from panther_em.inference.search.images import (
+    PixelSelection,
+    SearchGeometry,
+    SearchImages,
+)
 from panther_em.inference.search.noise_model import ImageSet
 from panther_em.inference.search.planning import DeviceInfo, plan_stage
 from panther_em.inference.search.results import PixelLedger, SearchResult, StageResult
 from panther_em.inference.search.runner import StageRunner, Timeline
-from panther_em.inference.search.types import (
-    PixelSelection,
-    Precision,
-    SearchGeometry,
-    SearchImages,
-)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
 
+    from panther_em.inference.search.correlation.layout import Rectangle
     from panther_em.inference.search.featurization import (
         BaseImageFeaturization,
         FeatureStore,
@@ -90,7 +91,6 @@ if TYPE_CHECKING:
     from panther_em.inference.search.planning import StagePlan
     from panther_em.inference.search.runner import StageRun
     from panther_em.inference.search.stage import Stage
-    from panther_em.inference.search.types import Rectangle
     from panther_em.inference.template import Template, TemplateWarp
 
     FeaturizationFactory = Callable[
@@ -203,8 +203,8 @@ class Searcher:
                 and int(defocus_ids.max()) >= self.space.n_defocus
             ):
                 raise ValueError(
-                    f"stage {i}: planes {stage.planes} exceed the {self.space.n_defocus} "
-                    "defocus plane(s) of the searcher"
+                    f"stage {i}: planes {stage.planes} exceed the "
+                    f"{self.space.n_defocus} defocus plane(s) of the searcher"
                 )
             if (
                 template_ids is not None

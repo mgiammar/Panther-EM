@@ -18,6 +18,7 @@ from panther_em.inference.search.correlation import (
     LoopPlan,
     MomentForms,
 )
+from panther_em.inference.search.correlation.contraction import BatchShape
 from panther_em.inference.search.correlation.local import (
     choose_tile,
     correlate_local,
@@ -29,10 +30,10 @@ from panther_em.inference.search.correlation.moments import (
 )
 from panther_em.inference.search.featurization import FeatureChunk, FeatureStore
 from panther_em.inference.search.hypotheses import HypothesisSpace, LocalHypotheses
+from panther_em.inference.search.images import PixelSelection, SearchImages
 from panther_em.inference.search.planning import DeviceInfo, plan_memory
 from panther_em.inference.search.search import Searcher
 from panther_em.inference.search.stage import Stage, stage_from_json, stage_to_json
-from panther_em.inference.search.types import BatchShape, PixelSelection, SearchImages
 from panther_em.inference.template import Template
 
 pytestmark = pytest.mark.filterwarnings(

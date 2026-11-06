@@ -65,7 +65,7 @@ def _try_compile() -> Any:
             "-U__CUDA_NO_HALF2_OPERATORS__",
             "--expt-relaxed-constexpr",
             "-Xptxas",
-            "-v",  # register/spill report in the (PANTHER_EM_FUSED_KERNEL_VERBOSE) build log
+            "-v",  # register/spill report (PANTHER_EM_FUSED_KERNEL_VERBOSE build log)
             *gencode,
         ]
 
@@ -190,7 +190,7 @@ def lean_irfft_stats_transposed(
 
 
 def lean_debug_ifft(x: torch.Tensor) -> torch.Tensor | None:
-    """Unnormalized inverse DFT of complex64 ``(B, N)`` rows, ``N`` in ``{64, 128, 256}``.
+    """Unnormalized inverse DFT of complex64 ``(B, N)`` rows, ``N`` 64, 128 or 256.
 
     Runs the generated register-resident transforms (``csrc/lean_fft_gen.cuh``) on the
     device; equals ``torch.fft.ifft(x, norm="forward")``. Test entry point only;
@@ -201,6 +201,6 @@ def lean_debug_ifft(x: torch.Tensor) -> torch.Tensor | None:
 
 
 def lean_sentinel_packed() -> int | None:
-    """int64 bit pattern of the packed ``(-inf, 0)`` sentinel, or ``None`` if unavailable."""
+    """int64 bit pattern of the packed ``(-inf, 0)`` sentinel (``None``: no kernel)."""
     module = _try_compile()
     return int(module.lean_sentinel_packed()) if module is not None else None
