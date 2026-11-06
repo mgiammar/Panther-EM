@@ -1,7 +1,7 @@
 """The synthetic end-to-end pipeline runs and every file it writes reloads.
 
-Whitening, decomposition, error tables, image sets and the two-stage search with the
-threshold test.
+Whitening, decomposition, error tables, image sets and the two-stage search (a full
+stage 0, a local stage 1) with the threshold test.
 """
 
 from __future__ import annotations
@@ -48,7 +48,9 @@ def test_threshold_test_pipeline_runs_end_to_end(tmp_path):
         for tag in ("coarse", "full")
     }
     assert tables["coarse"].rectangles == ((0, 0, 6, 4),)
-    assert tables["full"].n_templates == 12
+    assert tables["full"].n_templates == 12  # the nside-1 HEALPix grid
+    # stage 1 scores each pixel over a 1-ring neighbourhood, not all 12 orientations
+    assert 1 < summary["local_orientations"][1] < 12
     for table in tables.values():
         table.check_template(template)
 

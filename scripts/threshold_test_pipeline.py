@@ -9,8 +9,16 @@ volume and three synthetic micrographs (one carries a particle):
 3. decompose the volume under ``whitening.template_filter`` (``W_avg * band``);
 4. per feature selection ``compute_error_tables``;
 5. per micrograph ``ImageSet.from_micrograph`` (search image ``W_avg C_i^2``, noise and
-   signal curves, level map), the two-stage search (stage 0 rejects or abstains,
-   stage 1 rejects, abstains or accepts) and ``SearchResult.save``.
+   signal curves, level map), the two-stage search and ``SearchResult.save``:
+
+   * stage 0, the coarse features over every orientation on one CTF plane, rejects
+     or abstains;
+   * stage 1, the full features, is *local*: each pixel is scored over the
+     orientations within one HEALPix ring of its stage-0 orientation, on both
+     planes, with the mean and variance of the whole set from the closed-form
+     moments; it rejects, abstains or accepts.
+
+The template's orientations are the nside-1 HEALPix pixel centers (12).
 
 Every file is written to ``--out`` and read back. CPU, well under a minute.
 """
@@ -48,6 +56,7 @@ from panther_em.inference.search import (
     ThresholdTest,
     WhiteningFilter,
     compute_error_tables,
+    healpix_orientations,
     zscore_threshold,
 )
 from panther_em.inference.template import Template
@@ -57,7 +66,9 @@ if TYPE_CHECKING:
 
 BOX = 32
 MICROGRAPH = 96
-N_ORIENTATIONS = 12
+NSIDE = 1
+N_ORIENTATIONS = 12 * NSIDE**2
+LOCAL_RINGS = 1
 N_ANGLE, N_RADIUS = 32, 16
 EIG_MAX = 8
 N_PSI = 64
@@ -77,11 +88,8 @@ def synthetic_volume(seed: int = 0) -> np.ndarray:
 
 
 def orientations() -> tuple[np.ndarray, np.ndarray]:
-    """``(phi, theta)`` in degrees of the template's orientations."""
-    return (
-        np.linspace(0.0, 330.0, N_ORIENTATIONS, dtype=np.float32),
-        np.linspace(10.0, 80.0, N_ORIENTATIONS, dtype=np.float32),
-    )
+    """``(phi, theta)`` in degrees of the template's orientations (HEALPix, NESTED)."""
+    return healpix_orientations(NSIDE)
 
 
 def ctf_planes(shape: tuple[int, int]) -> torch.Tensor:
@@ -197,8 +205,9 @@ def run(out: Path, device: str = "cpu") -> dict:
         Stage.create(
             [FULL],
             n_psi=N_PSI,
+            local_rings=LOCAL_RINGS,
             decision=Decision(threshold, tests["full"], absorb_radius=2),
-            name="full",
+            name="local",
         ),
     ]
     searcher = Searcher(
@@ -212,6 +221,12 @@ def run(out: Path, device: str = "cpu") -> dict:
         "z_alpha": calibration.z_alpha,
         "micrographs": {},
     }
+    if 1 in searcher.local:  # orientations per neighbourhood, of N_ORIENTATIONS
+        counts = searcher.local[1].counts
+        summary["local_orientations"] = [
+            int(counts[counts > 0].min()),
+            int(counts.max()),
+        ]
     for name, raw in raw_micrographs(volume):
         images = ImageSet.from_micrograph(
             raw.to(device),
