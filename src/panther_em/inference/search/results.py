@@ -5,8 +5,7 @@
 * :class:`StageResult` -- one stage's maps in its compact pixel order, with the
   labels and scores after its decision and timings.
 * :class:`SearchResult` -- dense final maps with decoding (orientation angles,
-  in-plane angle, defocus), the image set's spectra and HDF5 I/O, including
-  optional per-stage groups.
+  in-plane angle, defocus) and HDF5 I/O, including optional per-stage groups.
 """
 
 from __future__ import annotations
@@ -24,11 +23,7 @@ from panther_em.inference.search.decision import PixelLabel
 from panther_em.inference.search.executor import StageMaps
 from panther_em.inference.search.hypotheses import HypothesisSpace
 from panther_em.inference.search.stage import Stage, stage_from_json, stage_to_json
-from panther_em.inference.search.types import (
-    ImageSpectra,
-    PixelSelection,
-    SearchGeometry,
-)
+from panther_em.inference.search.types import PixelSelection, SearchGeometry
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -282,8 +277,6 @@ class SearchResult:
     stage_results : list[StageResult]
         Per-stage maps, kept when the searcher was built with
         ``keep_stage_results=True``.
-    spectra : ImageSpectra, optional
-        The image set's spectra the threshold tests ran with.
     """
 
     geometry: SearchGeometry
@@ -301,7 +294,6 @@ class SearchResult:
     n_psi_of_stage: tuple[int, ...]
     stage_results: list[StageResult] = field(default_factory=list)
     elapsed_s: float = 0.0
-    spectra: ImageSpectra | None = None
 
     @classmethod
     def from_ledger(
@@ -312,7 +304,6 @@ class SearchResult:
         *,
         stage_results: list[StageResult] | None = None,
         elapsed_s: float = 0.0,
-        spectra: ImageSpectra | None = None,
     ) -> SearchResult:
         """Snapshot a ledger (clones every field)."""
         g = ledger.geometry
@@ -332,7 +323,6 @@ class SearchResult:
             n_psi_of_stage=tuple(ledger.n_psi_of_stage),
             stage_results=list(stage_results or []),
             elapsed_s=elapsed_s,
-            spectra=spectra,
         )
 
     # -- derived -----------------------------------------------------------------
@@ -392,7 +382,6 @@ class SearchResult:
             n_psi_of_stage=self.n_psi_of_stage,
             stage_results=[s.to(device) for s in self.stage_results],
             elapsed_s=self.elapsed_s,
-            spectra=self.spectra,
             **moved,
         )
 
@@ -407,9 +396,7 @@ class SearchResult:
 
         Layout: the nine dense maps and the space's angle/defocus tables as root
         datasets; ``geometry``, ``space``, ``stages``, ``n_psi_of_stage`` and
-        ``elapsed_s`` as attributes; a ``spectra`` group (:meth:`ImageSpectra.save`'s
-        layout) when the image set carried spectra; and, when stage results were
-        kept, one group ``stages/stage{i}`` per stage holding the compact
+        ``elapsed_s`` as attributes; and, when stage results were kept, one group ``stages/stage{i}`` per stage holding the compact
         ``pixel_index``, the six stage maps (``best_index`` global), ``labels_after``,
         ``score`` and timing attributes.
         """
@@ -440,8 +427,6 @@ class SearchResult:
             f.attrs["n_psi_of_stage"] = json.dumps(list(self.n_psi_of_stage))
             f.attrs["stages"] = json.dumps([stage_to_json(s) for s in self.stages])
             f.attrs["elapsed_s"] = float(self.elapsed_s)
-            if self.spectra is not None:
-                self.spectra.write_group(f.create_group("spectra"))
             if self.stage_results:
                 root = f.create_group("stages")
                 for r in self.stage_results:
@@ -464,9 +449,6 @@ class SearchResult:
         """Read a result written by :meth:`save` (stage decisions are not restored)."""
         with h5py.File(path, "r") as f:
             maps = {name: torch.from_numpy(np.asarray(f[name])) for name in MAP_NAMES}
-            spectra = None
-            if "spectra" in f:
-                spectra = ImageSpectra.read_group(f["spectra"])
             geo = json.loads(f.attrs["geometry"])
             geometry = SearchGeometry(
                 n_images=int(geo["n_images"]),
@@ -540,5 +522,4 @@ class SearchResult:
             n_psi_of_stage=n_psi_of_stage,
             stage_results=stage_results,
             elapsed_s=elapsed,
-            spectra=spectra,
         )

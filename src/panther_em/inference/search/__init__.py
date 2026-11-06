@@ -13,9 +13,13 @@ Objects, by lifetime
   :class:`~panther_em.decomposition.result.DecompositionResult` with its kernel warp
   (:class:`~panther_em.inference.template.TemplateWarp`: Cartesian kernels on demand,
   the transposed warp the direct engine uses) and device-resident ``U * S``.
-* **Per template and feature selection** (:mod:`.noise`): :class:`RadialTables`, the
-  ring profiles of the kept, residual and signal templates of every orientation,
-  which the coloured-noise :class:`ThresholdTest` reads.
+* **Per dataset** (:mod:`.noise_model`): the
+  :class:`~.noise_model.WhiteningFilter` (``W_avg``, every micrograph's ``C_i``, the
+  template band) the decomposition and every search image are built under.
+* **Per template and feature selection** (:mod:`.noise_model`):
+  :class:`~.noise_model.PerSpatialFrequencyErrorTable`, the ring profiles of the
+  reconstruction, residual and signal of every template row, which the coloured-noise
+  :class:`~.noise_model.ThresholdTest` reads.
 * **Per search** (:mod:`.stage`, :mod:`.decision`, :mod:`.search`): a list of
   :class:`Stage` s (feature rectangles, precision, ``n_psi``, orientation sampling,
   CTF planes) each ending in a :class:`Decision` (threshold, optional threshold test,
@@ -23,8 +27,9 @@ Objects, by lifetime
   stages and owns the execution resources that amortise across image sets
   (:class:`~.executor.Executor`: prepared weights, captured hypothesis loops,
   streams).
-* **Per image set** (:class:`SearchSession`): the images' :class:`ImageSpectra`
-  (noise and signal curves, level map; :func:`estimate_spectra`), the dense
+* **Per micrograph** (:class:`SearchSession`): the
+  :class:`~.noise_model.ImageSet` (whitened search image, CTF planes, noise and
+  signal curves, level map), the dense
   :class:`PixelLedger`, the block-aligned :class:`FeatureStore`, and a
   :class:`StageResult` per stage; :meth:`SearchSession.snapshot` /
   :meth:`Searcher.run` give the :class:`SearchResult`.
@@ -90,19 +95,16 @@ The pipeline around a search
 Panther-EM supplies the steps; an external application drives the loops.
 
 1. Select the micrographs (names and a generator of pre-processed real-space images).
-2. :class:`~panther_em.spectra.WhiteningFilter` ``.from_images(generator)``: the
-   averaged whitening filter ``W_avg`` and every micrograph's spectrum and
-   correction ``C_i`` (saved once per dataset).
-3. Decompose the structure under ``W_avg`` (``PolarProjectionDecomposer`` with
-   ``fourier_filters=whitening.average_grid(box) * low_pass``).
-4. Per feature selection: :meth:`RadialTables.build` ``(template, rectangles,
-   volume=, whitening=)`` (saved once per template). Per micrograph: the search
-   image carries ``W_avg * C_i^2`` (:meth:`WhiteningFilter.image_grid`);
-   :func:`estimate_spectra` gives its noise/signal curves and level map
-   (:class:`SpectraConfig` holds the parameters), :meth:`RadialTables.scales` the
-   per-stage scales (both storable); ``ImageSet.with_spectra`` carries the spectra
-   into the search; :meth:`Searcher.run`; :meth:`SearchResult.save` (maps, ``score``
-   and the spectra).
+2. :class:`~.noise_model.WhiteningFilter` ``.from_images(generator)``: the averaged
+   whitening filter ``W_avg``, every micrograph's correction ``C_i`` and the template
+   band (saved once per dataset).
+3. Decompose the structure under ``W_avg * band`` (``PolarProjectionDecomposer`` with
+   ``fourier_filters=whitening.template_filter(box)[None]``).
+4. Per feature selection: :func:`~.noise_model.compute_error_tables` ``(volume,
+   template, rectangles, whitening)`` (saved once per template). Per micrograph:
+   :meth:`~.noise_model.ImageSet.from_micrograph` whitens it by ``W_avg * C_i^2`` and
+   estimates its curves and level map; :meth:`Searcher.run`;
+   :meth:`SearchResult.save` (maps and ``score``).
 
 ``scripts/threshold_test_pipeline.py`` runs the chain on synthetic data.
 
@@ -112,19 +114,15 @@ Example
 
     template = Template.from_hdf5("decomp_60S.h5", device="cuda:0")
     searcher = Searcher(template, stages, n_defocus=11, keep_stage_results=True)
-    images = ImageSet.single(micrograph, filters=ctf_planes)
-    images = images.with_spectra(estimate_spectra(images, tables_32x16, config))
+    images = ImageSet.from_micrograph(
+        micrograph, name, whitening, ctf_planes, table_32x16, pixel_size=1.06
+    )
     result = searcher.run(images)
     result.decode()["phi"], result.decode()["psi"], result.label, result.score
     result.save("search.h5")
 """
 
-from panther_em.inference.search.decision import (
-    Calibration,
-    Decision,
-    PixelLabel,
-    ThresholdTest,
-)
+from panther_em.inference.search.decision import Decision, PixelLabel
 from panther_em.inference.search.executor import Executor, MemoryPlan, StagePlan
 from panther_em.inference.search.features import FeatureLayout
 from panther_em.inference.search.featurization import (
@@ -144,12 +142,14 @@ from panther_em.inference.search.hypotheses import (
     healpix_orientations,
     psi_degrees,
 )
-from panther_em.inference.search.noise import (
+from panther_em.inference.search.noise_model import (
+    Calibration,
+    ImageSet,
     NoiseScales,
-    RadialTables,
-    SpectraConfig,
-    estimate_spectra,
-    level_map,
+    PerSpatialFrequencyErrorTable,
+    ThresholdTest,
+    WhiteningFilter,
+    compute_error_tables,
     zeta_quantile,
     zscore_threshold,
 )
@@ -158,12 +158,11 @@ from panther_em.inference.search.search import ExecutionConfig, Searcher, Search
 from panther_em.inference.search.stage import Stage
 from panther_em.inference.search.types import (
     BatchShape,
-    ImageSet,
-    ImageSpectra,
     PixelSelection,
     Precision,
     Rectangle,
     SearchGeometry,
+    SearchImages,
 )
 
 __all__ = [
@@ -181,30 +180,29 @@ __all__ = [
     "HypothesisSet",
     "HypothesisSpace",
     "ImageSet",
-    "ImageSpectra",
     "MemoryPlan",
     "NoiseScales",
+    "PerSpatialFrequencyErrorTable",
     "PixelLabel",
     "PixelLedger",
     "PixelSelection",
     "Precision",
-    "RadialTables",
     "Rectangle",
     "SearchGeometry",
+    "SearchImages",
     "SearchResult",
     "SearchSession",
     "Searcher",
-    "SpectraConfig",
     "Stage",
     "StagePlan",
     "StageResult",
     "ThresholdTest",
+    "WhiteningFilter",
     "choose_mode",
-    "estimate_spectra",
+    "compute_error_tables",
     "healpix_ipix",
     "healpix_level_ids",
     "healpix_orientations",
-    "level_map",
     "make_featurization",
     "psi_degrees",
     "zeta_quantile",

@@ -4,15 +4,11 @@ from __future__ import annotations
 
 import pytest
 import torch
+from noise_case import noise_case
 
-from panther_em.inference.search.decision import (
-    Calibration,
-    Decision,
-    ThresholdTest,
-)
-from panther_em.inference.search.noise import RadialTables
+from panther_em.inference.search.decision import Decision
+from panther_em.inference.search.noise_model import Calibration, ThresholdTest
 from panther_em.inference.search.stage import Stage, stage_from_json, stage_to_json
-from panther_em.inference.template import Template
 from panther_em.inference.search.types import Precision
 
 pytestmark = pytest.mark.filterwarnings(
@@ -49,10 +45,9 @@ def test_stage_create_and_validation():
         Stage(((0, 0, 4, 4),), planes=(2, 0))
 
 
-def test_stage_json_round_trip(synthetic_result):
-    template = Template(synthetic_result(), device="cpu")
-    tables = RadialTables.build(template, [(0, 0, 2, 3)])
-    test = ThresholdTest(tables, Calibration(alpha=1e-3, zeta=0.9, b_factor=10.0))
+def test_stage_json_round_trip():
+    table = noise_case().table([(0, 0, 2, 3)])
+    test = ThresholdTest(table, Calibration(alpha=1e-3, zeta=0.9, b_factor=10.0))
     stage = Stage.create(
         [(0, 0, 4, 4), (4, 0, 2, 2)],
         precision="tf32",
@@ -73,15 +68,15 @@ def test_stage_json_round_trip(synthetic_result):
             "zeta": 0.9,
             "eps_rho": 0.1,
             "b_factor": 10.0,
-            "tables": tables.summary(),
+            "table": table.summary(),
         },
     }
-    assert data["decision"]["test"]["tables"]["rectangles"] == [[0, 0, 2, 3]]
+    assert data["decision"]["test"]["table"]["rectangles"] == [[0, 0, 2, 3]]
     back = stage_from_json(data)
     assert back.rectangles == stage.rectangles and back.precision is Precision.TF32
     assert back.orientations == 1 and back.planes == (1, 3) and back.name == "coarse"
     assert back.decision is not None and back.decision.threshold == 7.8
-    # the test itself is not restored (its tables live in their own file)
+    # the test itself is not restored (its table lives in its own file)
     assert back.decision.test is None and not back.decision.accept
     assert back.decision.absorb_radius == 2
     plain = Stage.create([(0, 0, 2, 2)], decision=Decision(3.0))

@@ -25,7 +25,6 @@ from panther_em.decomposition.pipeline_projections import (
     generate_projection_batch,
     precompute_volume_dft,
 )
-from panther_em.inference.search.noise import NoiseScales
 from panther_em.inference.search.noise_model.whitening import (
     FILTER_ATOL,
     FILTER_RTOL,
@@ -38,8 +37,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
-    from panther_em.inference.search.hypotheses import HypothesisSet
-    from panther_em.inference.search.noise_model.image_set import ImageSet
     from panther_em.inference.search.noise_model.whitening import WhiteningFilter
     from panther_em.inference.search.types import Rectangle
     from panther_em.inference.template import Template
@@ -168,6 +165,17 @@ class PerSpatialFrequencyErrorTable:
         """``(kH, kW)``."""
         return int(self.support.shape[0]), int(self.support.shape[1])
 
+    def summary(self) -> dict:
+        """JSON-serialisable description (for result files)."""
+        return {
+            "n_templates": self.n_templates,
+            "n_bins": self.n_bins,
+            "template_shape": list(self.template_shape),
+            "rectangles": [list(r) for r in self.rectangles],
+            "kernel_config": dataclasses.asdict(self.kernel_config),
+            "pad": self.pad,
+        }
+
     # ------ template guard ----------------------------------------------------
 
     def check_template(self, template: Template) -> None:
@@ -240,76 +248,6 @@ class PerSpatialFrequencyErrorTable:
                 )
             self._image_bins[key] = bins
         return bins
-
-    # -- scales ----------------------------------------------------------------
-
-    def scales(
-        self,
-        images: ImageSet,
-        *,
-        hyps: HypothesisSet | None = None,
-        b_factor: float = 0.0,
-    ) -> NoiseScales:
-        """The micrograph's noise and signal scales of every ``(plane, row)``.
-
-        Parameters
-        ----------
-        images : ImageSet
-            The micrograph; its curves must be on this table's frequency axis.
-        hyps : HypothesisSet, optional
-            The stage's hypotheses; ``qbar_perp`` averages ``q_perp`` over their
-            template rows and planes (all of them when ``None``).
-        b_factor : float, optional
-            Envelope ``exp(-B s^2 / 4)`` (``s = f / pixel_size`` in 1/A) on the signal
-            weight. Defaults to 0.
-
-        Returns
-        -------
-        NoiseScales
-            ``(1, D, N)`` scales (one micrograph).
-        """
-        if not torch.equal(images.frequencies, self.frequencies):
-            raise ValueError(
-                "the image set's curves are on another frequency axis than the table "
-                "(prepare the micrograph with this table or one of the same box/pad)"
-            )
-
-        freq = self.frequencies.to(torch.float64)
-        envelope = torch.exp(-b_factor * (freq / images.pixel_size) ** 2 / 4.0)
-        noise = images.noise  # (D, F)
-        weight = images.signal * envelope
-        t = {name: getattr(self, name).to(torch.float64).T for name in TABLE_NAMES}
-
-        q_kept = noise @ t["reconstruction_autocorr"]  # (D, N)
-        q_residual = noise @ t["residual_autocorr"]
-        q_cross = noise @ t["reconstruction_residual_corr"]
-        lam = torch.where(q_kept > 0, q_cross / q_kept.clamp_min(1e-300), 0.0)
-        q_perp = (q_residual - lam**2 * q_kept).clamp_min(0.0)
-        g_kept = weight @ t["signal_reconstruction_corr"]
-        g_residual = weight @ t["signal_residual_corr"]
-        total = g_kept + g_residual
-        rho = torch.where(total > 0, g_residual / total.clamp_min(1e-300), 0.0)
-        rho = rho.clamp(0.0, 1.0 - 1e-6)
-
-        if hyps is None:
-            rows = torch.arange(self.n_templates)
-            planes = list(range(images.n_defocus))
-        else:
-            rows = hyps.template_rows()
-            planes = list(hyps.defocus_planes())
-        qbar_perp = q_perp[planes][:, rows].mean().reshape(1)
-
-        return NoiseScales(
-            q_kept[None],
-            q_residual[None],
-            q_cross[None],
-            lam[None],
-            q_perp[None],
-            rho[None],
-            qbar_perp,
-            self.rectangles,
-            float(b_factor),
-        )
 
     # -- I/O -------------------------------------------------------------------
 

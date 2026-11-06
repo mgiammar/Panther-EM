@@ -1,4 +1,4 @@
-"""Value types: ImageSet, SearchGeometry, PixelSelection, Precision."""
+"""Value types: SearchImages, SearchGeometry, PixelSelection, Precision."""
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ import torch
 
 from panther_em.inference.search.types import (
     BatchShape,
-    ImageSet,
     PixelSelection,
     Precision,
     SearchGeometry,
+    SearchImages,
 )
 
 
@@ -41,27 +41,27 @@ def test_kernel_config_kwargs_match_construct_cartesian_feature_signature():
 
 def test_image_set_promotes_single_image_and_validates_filters():
     img = torch.zeros(30, 32)
-    s = ImageSet.single(img)
+    s = SearchImages.single(img)
     assert s.images.shape == (1, 30, 32)
     assert s.n_defocus == 1 and s.filter_plane(0) is None
 
-    shared = ImageSet.single(img, filters=torch.ones(3, 30, 17))
+    shared = SearchImages.single(img, filters=torch.ones(3, 30, 17))
     assert shared.n_defocus == 3 and not shared.per_image_filters
     assert shared.filter_plane(2, 0).shape == (30, 17)
 
-    per_image = ImageSet(torch.zeros(4, 30, 32), filters=torch.ones(4, 2, 30, 17))
+    per_image = SearchImages(torch.zeros(4, 30, 32), filters=torch.ones(4, 2, 30, 17))
     assert per_image.n_defocus == 2 and per_image.per_image_filters
 
     with pytest.raises(ValueError):
-        ImageSet.single(img, filters=torch.ones(3, 30, 16))
+        SearchImages.single(img, filters=torch.ones(3, 30, 16))
     with pytest.raises(ValueError):
-        ImageSet(torch.zeros(4, 30, 32), filters=torch.ones(3, 2, 30, 17))
+        SearchImages(torch.zeros(4, 30, 32), filters=torch.ones(3, 2, 30, 17))
     with pytest.raises(ValueError):
-        ImageSet(torch.zeros(2, 3, 30, 32))
+        SearchImages(torch.zeros(2, 3, 30, 32))
 
 
 def test_geometry_grid_mode_and_flat_indexing():
-    images = ImageSet.from_stack(torch.zeros(2, 30, 30))
+    images = SearchImages.from_stack(torch.zeros(2, 30, 30))
     geo = SearchGeometry.from_images(images, (20, 20))
     assert geo.mode == "grid" and geo.grid == (11, 11)
     assert geo.n_pixels == 2 * 121 and geo.dense_shape == (2, 11, 11)
@@ -83,21 +83,21 @@ def test_geometry_grid_mode_and_flat_indexing():
 
 
 def test_geometry_center_mode_by_box_size_and_override():
-    boxes = ImageSet.from_boxes(torch.zeros(5, 20, 20))
+    boxes = SearchImages.from_boxes(torch.zeros(5, 20, 20))
     geo = SearchGeometry.from_images(boxes, (20, 20))
     assert geo.mode == "center" and geo.grid == (1,) and geo.n_pixels == 5
     assert geo.validate_mask(torch.ones(5, dtype=torch.bool)).shape == (5, 1)
 
-    larger = ImageSet.from_boxes(torch.zeros(5, 24, 24), center_only=True)
+    larger = SearchImages.from_boxes(torch.zeros(5, 24, 24), center_only=True)
     assert SearchGeometry.from_images(larger, (20, 20)).mode == "center"
 
     with pytest.raises(ValueError):
-        SearchGeometry.from_images(ImageSet.single(torch.zeros(10, 10)), (20, 20))
+        SearchGeometry.from_images(SearchImages.single(torch.zeros(10, 10)), (20, 20))
 
 
 def test_pixel_selection_all_subset_scatter():
     geo = SearchGeometry.from_images(
-        ImageSet.from_stack(torch.zeros(2, 30, 30)), (20, 20)
+        SearchImages.from_stack(torch.zeros(2, 30, 30)), (20, 20)
     )
     sel = PixelSelection.all(geo)
     assert len(sel) == geo.n_pixels and sel.is_full

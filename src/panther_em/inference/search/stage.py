@@ -5,8 +5,8 @@ A :class:`Stage` is a frozen value: build it with :meth:`Stage.create` (which
 coerces loose inputs) and read its derived state (``k_stop``, ``num_features``,
 ``layout()``, ``hypothesis_ids()``). ``stage_to_json`` / ``stage_from_json`` give
 the HDF5 attribute form used by :class:`~.results.SearchResult`; a saved decision
-records its threshold test's calibration and tables but is restored without the
-test (the tables are a separate file).
+records its threshold test's calibration and table summary but is restored without the
+test (the error table is a separate file).
 """
 
 from __future__ import annotations
@@ -203,7 +203,7 @@ def stage_to_json(stage: Stage) -> dict:
         if stage.decision.test is not None:
             test = {
                 **asdict(stage.decision.test.calibration),
-                "tables": stage.decision.test.tables.summary(),
+                "table": stage.decision.test.table.summary(),
             }
         decision = {
             "threshold": stage.decision.threshold,
@@ -225,7 +225,7 @@ def stage_to_json(stage: Stage) -> dict:
 def stage_from_json(data: dict) -> Stage:
     """Inverse of :func:`stage_to_json`.
 
-    The decision's threshold test is not restored; its calibration and tables stay
+    The decision's threshold test is not restored; its calibration and table stay
     readable in the saved description.
     """
     decision = None

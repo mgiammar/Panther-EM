@@ -3,16 +3,18 @@ lives in :mod:`.stage`).
 
 ::
 
-    template = Template.from_hdf5("decomp.h5", device="cuda:0")  # under W_avg
+    # once per dataset and template
+    whitening = WhiteningFilter.from_images(micrographs)
+    template = Template.from_hdf5("decomp.h5", device="cuda:0")  # under W_avg * band
     coarse, full = [(0, 0, 32, 32)], [(0, 0, 64, 128)]
-    tables = {r[0]: RadialTables.load(path) for r, path in ...}  # .build once
+    tables = {
+        r[0]: PerSpatialFrequencyErrorTable.load(path) for r, path in ...
+    }  # compute_error_tables once
     calibration = Calibration(alpha=5e-3, zeta=0.95, eps_rho=0.1, b_factor=40.0)
     stages = [
         Stage.create(
             coarse,
             precision="fp16",
-            orientations=1,
-            planes=(5,),
             decision=Decision(
                 7.8, ThresholdTest(tables[coarse[0]], calibration), accept=False
             ),
@@ -22,11 +24,10 @@ lives in :mod:`.stage`).
         ),
     ]
     searcher = Searcher(template, stages, n_defocus=11)
-    images = ImageSet.single(micrograph, filters=ctf_planes)
-    images = images.with_spectra(
-        estimate_spectra(
-            images, tables[coarse[0]], correction=whitening.correction_1d(name)
-        )
+
+    # per micrograph
+    images = ImageSet.from_micrograph(
+        micrograph, name, whitening, ctf_planes, tables[coarse[0]], pixel_size=1.06
     )
     result = searcher.run(images)
     result.save("search.h5")
@@ -34,12 +35,15 @@ lives in :mod:`.stage`).
 A :class:`Searcher` is bound to one template and one list of stages and owns the
 execution resources that amortise across image sets (one featurization per
 rectangle and engine, holding its kernels or adjoint bases; prepared weights and
-captured hypothesis loops on the executor). A
-:class:`SearchSession` runs the stages over one :class:`ImageSet`: stage 0 searches
-every unmasked pixel, each later stage re-scores the pixels the previous decision
-left AMBIGUOUS or ACCEPTED, and the session stops early when that set is empty. A
-stage whose decision runs the threshold test needs the image set's spectra
-(``ImageSet.spectra``); the session refuses to start without them.
+captured hypothesis loops on the executor); it checks every stage's error table
+against the template (warp, box, rows, rectangles, decomposition filter). A
+:class:`SearchSession` runs the stages over one micrograph
+(:class:`~.noise_model.ImageSet`) or one plain :class:`~.types.SearchImages` stack:
+stage 0 searches every unmasked pixel, each later stage re-scores the pixels the
+previous decision left AMBIGUOUS or ACCEPTED, and the session stops early when that
+set is empty. A stage whose decision runs the threshold test needs the micrograph's
+noise model (an ``ImageSet`` on the table's frequency axis); the session refuses to
+start without it.
 """
 
 from __future__ import annotations
@@ -67,13 +71,14 @@ from panther_em.inference.search.featurization import (
     make_featurization,
 )
 from panther_em.inference.search.hypotheses import HypothesisSpace, healpix_ipix
+from panther_em.inference.search.noise_model import ImageSet
 from panther_em.inference.search.results import PixelLedger, SearchResult, StageResult
 from panther_em.inference.search.stage import Stage
 from panther_em.inference.search.types import (
-    ImageSet,
     PixelSelection,
     Precision,
     SearchGeometry,
+    SearchImages,
 )
 
 if TYPE_CHECKING:
@@ -201,7 +206,7 @@ class Searcher:
         Stages in execution order (typically increasing rank).
     execution : ExecutionConfig, optional
     n_defocus : int, optional
-        Defocus planes every image set must carry (``ImageSet.filters``). Defaults to 1.
+        Defocus planes every image set must carry (CTF planes). Defaults to 1.
     defocus_values : torch.Tensor, optional
         ``(n_defocus,)`` labels for the planes, reported by ``SearchResult.decode()``.
     keep_stage_results : bool, optional
@@ -283,23 +288,15 @@ class Searcher:
             ):
                 raise ValueError(f"stage {i}: orientation ids exceed the template's")
             if stage.decision is not None and stage.decision.test is not None:
-                tables = stage.decision.test.tables
-                if tables.n_templates != self.space.n_templates:
+                table = stage.decision.test.table
+                try:
+                    table.check_template(self.template)
+                except ValueError as exc:
+                    raise ValueError(f"stage {i}: {exc}") from exc
+                if sorted(table.rectangles) != sorted(stage.rectangles):
                     raise ValueError(
-                        f"stage {i}: the threshold test's tables hold "
-                        f"{tables.n_templates} template rows; the template has "
-                        f"{self.space.n_templates}"
-                    )
-                if tables.template_shape != self.template.template_shape:
-                    raise ValueError(
-                        f"stage {i}: the threshold test's tables were built on a "
-                        f"{tables.template_shape} box; the template's is "
-                        f"{self.template.template_shape}"
-                    )
-                if sorted(tables.rectangles) != sorted(stage.rectangles):
-                    raise ValueError(
-                        f"stage {i}: the threshold test's tables were built for "
-                        f"rectangles {tables.rectangles}, not the stage's "
+                        f"stage {i}: the threshold test's table was built for "
+                        f"rectangles {table.rectangles}, not the stage's "
                         f"{stage.rectangles}"
                     )
 
@@ -317,15 +314,17 @@ class Searcher:
             self._featurizations[key] = found
         return found
 
-    def session(self, images: ImageSet) -> SearchSession:
+    def session(self, images: ImageSet | SearchImages) -> SearchSession:
         """A session over one image set (iterate it for per-stage results)."""
         return SearchSession(self, images)
 
-    def run(self, images: ImageSet) -> SearchResult:
-        """Run every stage over ``images``."""
+    def run(self, images: ImageSet | SearchImages) -> SearchResult:
+        """Run every stage over one micrograph (or a plain image stack)."""
         return self.session(images).run_all()
 
-    def run_many(self, image_sets: Iterable[ImageSet]) -> Iterator[SearchResult]:
+    def run_many(
+        self, image_sets: Iterable[ImageSet | SearchImages]
+    ) -> Iterator[SearchResult]:
         """Run the stages over each image set in turn, reusing cached resources."""
         for images in image_sets:
             yield self.run(images)
@@ -338,8 +337,19 @@ class Searcher:
 class SearchSession:
     """One image set's walk through the stages.
 
+    Parameters
+    ----------
+    searcher : Searcher
+    images : ImageSet or SearchImages
+        One micrograph with its noise model (searched as its whitened image under its
+        CTF planes), or a plain stack for stages without a threshold test.
+
     Attributes
     ----------
+    images : SearchImages
+        What the stages search.
+    noise : ImageSet or None
+        The micrograph's noise model, read by the threshold tests.
     ledger : PixelLedger
         The dense per-pixel state.
     pixels : PixelSelection
@@ -350,22 +360,34 @@ class SearchSession:
         ``(name, time, allocated_bytes)`` timeline marks of every phase.
     """
 
-    def __init__(self, searcher: Searcher, images: ImageSet) -> None:
+    def __init__(self, searcher: Searcher, images: ImageSet | SearchImages) -> None:
+        noise: ImageSet | None = None
+        if isinstance(images, ImageSet):
+            noise = images
+            images = SearchImages.single(noise.image, filters=noise.ctf)
         if images.n_defocus != searcher.space.n_defocus:
             raise ValueError(
                 f"image set carries {images.n_defocus} defocus plane(s); the searcher "
                 f"expects {searcher.space.n_defocus}"
             )
-        if images.spectra is None:
-            for i, stage in enumerate(searcher.stages):
-                if stage.decision is not None and stage.decision.test is not None:
-                    raise ValueError(
-                        f"stage {i}: its decision runs the threshold test, which "
-                        "needs the image set's spectra (estimate_spectra, then "
-                        "ImageSet.with_spectra)"
-                    )
+        for i, stage in enumerate(searcher.stages):
+            if stage.decision is None or stage.decision.test is None:
+                continue
+            if noise is None:
+                raise ValueError(
+                    f"stage {i}: its decision runs the threshold test, which needs "
+                    "the micrograph's noise model (search a noise_model.ImageSet)"
+                )
+            if not torch.equal(
+                noise.frequencies, stage.decision.test.table.frequencies
+            ):
+                raise ValueError(
+                    f"stage {i}: the micrograph's curves are on another frequency "
+                    "axis than the threshold test's table"
+                )
         self.searcher = searcher
         self.images = images
+        self.noise = noise
         self.geometry = SearchGeometry.from_images(
             images, searcher.template.template_shape
         )
@@ -558,7 +580,7 @@ class SearchSession:
         self.ledger.write(maps, column_index, index, hyps)
         self._mark(f"stage{index}:ledger")
         if stage.decision is not None:
-            stage.decision.apply(self.ledger, column_index, hyps, self.images.spectra)
+            stage.decision.apply(self.ledger, column_index, hyps, self.noise)
         self.pixels = self.ledger.next_stage_pixels()
         self._mark(f"stage{index}:decided")
         ledger_index = column_index.to(self.ledger.device)
@@ -610,5 +632,4 @@ class SearchSession:
             self.searcher.stages,
             stage_results=self.stage_results,
             elapsed_s=self.elapsed_s,
-            spectra=self.images.spectra,
         )

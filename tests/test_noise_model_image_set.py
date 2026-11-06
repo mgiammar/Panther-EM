@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -12,8 +10,6 @@ from torch_fourier_filter.utils import bin_1dim_with_lerp
 from torch_fourier_filter.whitening import calculate_num_freq_bins
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
-from panther_em.inference.search import ImageSet as SearchImageSet
-from panther_em.inference.search import SpectraConfig, estimate_spectra
 from panther_em.inference.search.noise_model.image_set import FLATTEN_FLOOR, ImageSet
 from panther_em.inference.search.noise_model.spatial_frequency_error import (
     PerSpatialFrequencyErrorTable,
@@ -152,34 +148,14 @@ def test_level_flattens_by_the_image_curve(whitening):
     assert inner > 2.0
 
 
-def test_matches_the_legacy_pipeline(whitening):
-    """Same search image as the caller path; noise curves to a few percent.
-
-    The legacy curves are half-grid ring means (``power_spectral_density`` counts each
-    rfft column once); the new ones weight the columns as the full grid does, like the
-    error tables: a few percent per ring, most at DC and the corner. The legacy level
-    map flattens by the plane-averaged CTF-filtered curve, the new one by the image's
-    own, so the maps are not compared.
-    """
+def test_search_image_matches_the_legacy_whitening(whitening):
+    """The same search image as ``panther_em.spectra.WhiteningFilter`` gives."""
     images = prepare(whitening)
     legacy = LegacyWhiteningFilter.from_images(micrographs())
     raw = dict(micrographs())["m2"]
     x = torch.fft.irfft2(torch.fft.rfft2(raw) * legacy.image_grid("m2", SHAPE), s=SHAPE)
     x = (x - x.mean()) / x.std()
     torch.testing.assert_close(images.image, x)
-
-    tables = SimpleNamespace(n_bins=FREQ.numel(), support=support_disk())
-    spectra = estimate_spectra(
-        SearchImageSet.single(x, filters=ctf_planes(SHAPE)),
-        tables,
-        SpectraConfig(level="none"),
-        correction=(legacy.freq, legacy.correction_1d("m2")),
-    )
-    torch.testing.assert_close(images.frequencies, spectra.freq)
-    interior = slice(1, -1)
-    torch.testing.assert_close(
-        images.noise[:, interior], spectra.noise[0][:, interior], rtol=0.06, atol=0.0
-    )
 
 
 def test_shapes_and_normalization(whitening):
@@ -225,16 +201,6 @@ def test_wrong_micrograph_table_or_inputs_raise(whitening):
             table,
             pixel_size=PIXEL_SIZE,
         )
-
-
-def test_as_search_images(whitening):
-    images = prepare(whitening)
-    search = images.as_search_images()
-    assert search.n_images == 1 and search.n_defocus == 3
-    assert search.spectra is not None
-    assert tuple(search.spectra.noise.shape) == (1, 3, FREQ.numel())
-    assert tuple(search.spectra.level.shape) == (1, *SHAPE)
-    torch.testing.assert_close(search.images[0], images.image)
 
 
 @requires_cuda

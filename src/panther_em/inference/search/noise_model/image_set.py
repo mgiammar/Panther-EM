@@ -16,8 +16,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from panther_em.inference.search.types import ImageSet as SearchImageSet
-from panther_em.inference.search.types import ImageSpectra
 from panther_em.spectra import curve_to_grid
 
 if TYPE_CHECKING:
@@ -250,24 +248,6 @@ class ImageSet:
     def n_bins(self) -> int:
         """``F``."""
         return int(self.frequencies.numel())
-
-    # -- bridge to the current search API -----------------------------------------
-
-    def as_search_images(self, mask: torch.Tensor | None = None) -> SearchImageSet:
-        """The ``types.ImageSet`` (``B = 1``, spectra attached) the searcher takes.
-
-        A bridge until the search consumes this class directly.
-        """
-        spectra = ImageSpectra.create(
-            self.frequencies,
-            self.noise[None],
-            self.signal[None],
-            self.level[None],
-            self.pixel_size,
-        )
-        return SearchImageSet.single(
-            self.image, filters=self.ctf, mask=mask, spectra=spectra
-        )
 
 
 def _level_map(
