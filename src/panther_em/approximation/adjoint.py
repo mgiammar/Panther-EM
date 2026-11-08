@@ -35,11 +35,10 @@ import torch
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
+    from panther_em.approximation.reconstructor import Reconstructor
     from panther_em.coordinates.transform_base import CoordinateTransform
     from panther_em.coordinates.warp_config import WarpConfig
     from panther_em.decomposition.rectangles import Rectangle
-    from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-    from panther_em.inference.search.correlation.contraction import Precision
 
 NPAD = 12
 """ndimage's ``grid-constant`` pre-padding (samples of ``cval`` per edge) before the
@@ -50,11 +49,11 @@ SELF_CHECK_TOL = 1e-5
 angularly monochromatic image is the outer product the adjoint assumes."""
 
 
-def precision_name(precision: Precision | str) -> str:
-    """``"fp32"``, ``"tf32"`` or ``"fp16"`` of a ``Precision`` member or its value.
+def precision_name(precision: str) -> str:
+    """``"fp32"``, ``"tf32"`` or ``"fp16"`` of a precision name or ``str`` enum member.
 
-    Kept free of the search package (``Precision`` is a ``str`` enum there) so the
-    template package does not import it.
+    Takes the search's ``Precision`` (a ``str`` enum) without importing it, so this
+    package stays below the search.
     """
     value = precision.value if isinstance(precision, enum.Enum) else precision
     name = str(value).lower()
@@ -299,7 +298,7 @@ class WarpAdjoint:
 
     # -- the Cartesian side ------------------------------------------------------
 
-    def apply(self, boxes: torch.Tensor, precision: Precision | str) -> torch.Tensor:
+    def apply(self, boxes: torch.Tensor, precision: str) -> torch.Tensor:
         """``S^T boxes^T``: ``(B, H W)`` boxes -> ``(A2, R2 * B)`` padded polar images.
 
         fp16 on CUDA runs the sparse matmul in half precision (half the traffic, ~3e-4
@@ -347,14 +346,14 @@ class AdjointBases:
         """Eigenvectors in the rectangle."""
         return int(self.radial_re.shape[1])
 
-    def features(self, polar: torch.Tensor, precision: Precision | str) -> torch.Tensor:
+    def features(self, polar: torch.Tensor, precision: str) -> torch.Tensor:
         """``(K M, B)`` complex64 features ``<box, conj K_km>`` of scattered boxes.
 
         Parameters
         ----------
         polar : torch.Tensor
             ``(A2, R2 * B)`` from :meth:`WarpAdjoint.apply`.
-        precision : Precision
+        precision : str
             fp16: the angular GEMM on fp16 tensor cores (fp32 accumulation); tf32 or
             fp16: the radial contraction in tf32. fp32: CUDA cores throughout.
         """
@@ -383,7 +382,7 @@ class AdjointBases:
 
 def build_bases(
     adjoint: WarpAdjoint,
-    reconstructor: ProjectionReconstructor,
+    reconstructor: Reconstructor,
     rect: Rectangle,
 ) -> AdjointBases:
     """The :class:`AdjointBases` of a ``(k_start, m_start, k_extent, m_extent)``."""
@@ -393,7 +392,7 @@ def build_bases(
     device = adjoint.device
     angular = torch.stack(
         [
-            reconstructor.angular_phase_component(k, 0.0).to(torch.complex128).cpu()
+            reconstructor.angular_phase_component(k).to(torch.complex128).cpu()
             for k in ks
         ]
     )

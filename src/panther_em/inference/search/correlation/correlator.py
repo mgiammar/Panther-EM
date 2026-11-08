@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from panther_em.inference.search.correlation.loop import LoopPlan, Prepared
     from panther_em.inference.search.featurization.store import FeatureStore
     from panther_em.inference.search.hypotheses import HypBatch
-    from panther_em.inference.template import WeightSource
+    from panther_em.inference.search.weights import WeightSource
 
 
 class _ByteLRU:

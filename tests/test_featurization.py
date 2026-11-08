@@ -6,6 +6,7 @@ import pytest
 import torch
 from conftest import count_kernel_builds, requires_cuda
 
+from panther_em.approximation.reconstructor import Reconstructor
 from panther_em.inference.search.featurization import (
     AdjointContraction,
     DirectFeaturization,
@@ -17,7 +18,6 @@ from panther_em.inference.search.featurization import (
 from panther_em.inference.search.featurization import (
     direct_featurization as direct_module,
 )
-from panther_em.inference.template import TemplateWarp
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",
@@ -29,7 +29,7 @@ BOX = 20  # the synthetic template's box
 
 
 def make_warp(synthetic_result, device="cpu"):
-    return TemplateWarp(synthetic_result(), device=device)
+    return Reconstructor(synthetic_result(), device=device)
 
 
 @pytest.fixture
@@ -51,7 +51,7 @@ def positions(n, h, w, seed=1):
 
 def reference(warp, x, rows, cols, rect=RECT):
     """``(D, n_cells, P)`` features in float64 from the dense Cartesian kernels."""
-    kernels = warp.spatial(rectangle_cells(rect)).cpu().to(torch.complex128)
+    kernels = warp.kernels(rectangle_cells(rect)).cpu().to(torch.complex128)
     boxes = torch.stack(
         [
             x[:, r : r + BOX, c : c + BOX]

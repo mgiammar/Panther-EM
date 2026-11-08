@@ -15,7 +15,7 @@ the prediction lies:
 
 ``q_kept``, ``q_perp``, ``lam``, ``rho`` (:class:`NoiseScales`) are the micrograph's
 noise and signal curves weighted by the template's error tables
-(:class:`~.spatial_frequency_error.PerSpatialFrequencyErrorTable`); the rule itself
+(:class:`~panther_em.approximation.PerSpatialFrequencyErrorTable`); the rule itself
 (:meth:`ThresholdTest.distance`) is a function of per-pixel values only.
 """
 
@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 import torch
 from scipy.special import ndtri
 
-from panther_em.inference.search.noise_model.spatial_frequency_error import (
+from panther_em.approximation.errors import (
     TABLE_NAMES,
     PerSpatialFrequencyErrorTable,
 )

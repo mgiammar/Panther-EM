@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from panther_em.inference.search.correlation.contraction import ContractionEngine
     from panther_em.inference.search.correlation.layout import FeatureLayout
     from panther_em.inference.search.correlation.loop import LoopPlan
-    from panther_em.inference.template import WeightSource
+    from panther_em.inference.search.weights import WeightSource
 
 
 def real_weight_columns(

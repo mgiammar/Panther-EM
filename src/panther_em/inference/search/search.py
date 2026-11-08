@@ -79,6 +79,7 @@ from panther_em.orientations import healpix_ipix
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
 
+    from panther_em.approximation.reconstructor import Reconstructor
     from panther_em.decomposition.rectangles import Rectangle
     from panther_em.inference.search.featurization import (
         BaseImageFeaturization,
@@ -88,10 +89,10 @@ if TYPE_CHECKING:
     from panther_em.inference.search.planning import StagePlan
     from panther_em.inference.search.runner import StageRun
     from panther_em.inference.search.stage import Stage
-    from panther_em.inference.template import Template, TemplateWarp
+    from panther_em.inference.search.template import Template
 
     FeaturizationFactory = Callable[
-        [TemplateWarp, Rectangle, Mode], BaseImageFeaturization
+        [Reconstructor, Rectangle, Mode], BaseImageFeaturization
     ]
 
 
@@ -101,7 +102,7 @@ class Searcher:
     Parameters
     ----------
     template : Template
-        The SVD template (kernel warp and weights).
+        The SVD template (forward model and weights).
     stages : sequence of Stage
         Stages in execution order (typically increasing rank).
     execution : ExecutionConfig, optional
@@ -114,7 +115,7 @@ class Searcher:
         Retain every stage's compact maps on the final :class:`SearchResult` (and in
         its HDF5 file). Defaults to False.
     featurization : callable, optional
-        ``(warp, rect, mode) -> BaseImageFeaturization``; defaults to
+        ``(reconstructor, rect, mode) -> BaseImageFeaturization``; defaults to
         :func:`~.featurization.make_featurization` configured by ``execution`` (tests
         inject a stub).
 
@@ -215,7 +216,7 @@ class Searcher:
             if stage.decision is not None and stage.decision.test is not None:
                 table = stage.decision.test.table
                 try:
-                    table.check_template(self.template)
+                    table.check(self.template.reconstructor)
                 except ValueError as exc:
                     raise ValueError(f"stage {i}: {exc}") from exc
                 if sorted(table.rectangles) != sorted(stage.rectangles):
@@ -263,7 +264,7 @@ class Searcher:
         key = (rect, mode)
         found = self._featurizations.get(key)
         if found is None:
-            found = self.make_featurization(self.template.warp, rect, mode)
+            found = self.make_featurization(self.template.reconstructor, rect, mode)
             self._featurizations[key] = found
         return found
 

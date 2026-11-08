@@ -18,8 +18,8 @@ import torch
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
+    from panther_em.approximation.reconstructor import Reconstructor
     from panther_em.decomposition.rectangles import Rectangle
-    from panther_em.inference.template import TemplateWarp
 
 
 def rectangle_cells(rect: Rectangle) -> torch.Tensor:
@@ -85,13 +85,13 @@ class BaseImageFeaturization(ABC):
 
     Parameters
     ----------
-    warp : TemplateWarp
-        The template's kernel warp; features are computed on its device.
+    reconstructor : Reconstructor
+        The template's forward model; features are computed on its device.
     rect : Rectangle
         ``(k_start, m_start, k_extent, m_extent)`` within the stored decomposition.
     """
 
-    def __init__(self, warp: TemplateWarp, rect: Sequence[int]) -> None:
+    def __init__(self, reconstructor: Reconstructor, rect: Sequence[int]) -> None:
         if len(rect) != 4:
             raise ValueError(
                 f"a rectangle is (k_start, m_start, k_extent, m_extent), got {rect!r}"
@@ -104,7 +104,7 @@ class BaseImageFeaturization(ABC):
                 f"rectangle {tuple(rect)} needs starts >= 0 and extents >= 1"
             )
 
-        result = warp.result
+        result = reconstructor.result
 
         if k0 + k_ext > int(result.k_max) or m0 + m_ext > int(result.eig_max):
             raise ValueError(
@@ -112,20 +112,20 @@ class BaseImageFeaturization(ABC):
                 f"eig_max={result.eig_max}) feature space"
             )
 
-        self.warp = warp
+        self.reconstructor = reconstructor
         self.rect: Rectangle = (k0, m0, k_ext, m_ext)
 
     # -- geometry ---------------------------------------------------------------
 
     @property
     def device(self) -> torch.device:
-        """Where features are computed (the warp's device)."""
-        return self.warp.device
+        """Where features are computed (the reconstructor's device)."""
+        return self.reconstructor.device
 
     @property
     def box_shape(self) -> tuple[int, int]:
         """Kernel box ``(kH, kW)``."""
-        k_h, k_w = self.warp.box_shape
+        k_h, k_w = self.reconstructor.box_shape
         return int(k_h), int(k_w)
 
     @property

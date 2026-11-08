@@ -34,7 +34,7 @@ from panther_em.inference.search.images import PixelSelection, SearchImages
 from panther_em.inference.search.planning import DeviceInfo, plan_memory
 from panther_em.inference.search.search import Searcher
 from panther_em.inference.search.stage import Stage, stage_from_json, stage_to_json
-from panther_em.inference.template import Template
+from panther_em.inference.search.template import Template
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",

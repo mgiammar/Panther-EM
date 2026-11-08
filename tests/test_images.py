@@ -25,19 +25,6 @@ def test_batch_shape_validation():
         BatchShape(0, 4)
 
 
-def test_kernel_config_kwargs_match_construct_cartesian_feature_signature():
-    import inspect
-
-    from panther_em.coordinates import WarpConfig
-    from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-
-    params = inspect.signature(
-        ProjectionReconstructor.construct_cartesian_feature
-    ).parameters
-    for key in WarpConfig().cartesian_kwargs():
-        assert key in params
-
-
 def test_image_set_promotes_single_image_and_validates_filters():
     img = torch.zeros(30, 32)
     s = SearchImages.single(img)

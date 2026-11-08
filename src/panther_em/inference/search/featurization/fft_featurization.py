@@ -21,7 +21,7 @@ from panther_em.inference.search.featurization.base import (
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
-    from panther_em.inference.template import TemplateWarp
+    from panther_em.approximation.reconstructor import Reconstructor
 
 DEFAULT_CELL_CHUNK = 32
 """Kernel spectra computed (and held) per chunk."""
@@ -32,8 +32,8 @@ class FFTFeaturization(BaseImageFeaturization):
 
     Parameters
     ----------
-    warp : TemplateWarp
-        The template's kernel warp.
+    reconstructor : Reconstructor
+        The template's forward model (kernels and their adjoint).
     rect : Rectangle
         ``(k_start, m_start, k_extent, m_extent)``.
     cell_chunk : int, optional
@@ -42,12 +42,12 @@ class FFTFeaturization(BaseImageFeaturization):
 
     def __init__(
         self,
-        warp: TemplateWarp,
+        reconstructor: Reconstructor,
         rect: Sequence[int],
         *,
         cell_chunk: int = DEFAULT_CELL_CHUNK,
     ) -> None:
-        super().__init__(warp, rect)
+        super().__init__(reconstructor, rect)
 
         if int(cell_chunk) < 1:
             raise ValueError("cell_chunk must be >= 1")
@@ -57,7 +57,7 @@ class FFTFeaturization(BaseImageFeaturization):
     @cached_property
     def kernels(self) -> torch.Tensor:
         """``(n_cells, kH, kW)`` complex64 kernels of the rectangle (built once)."""
-        return self.warp.spatial(self.cells)
+        return self.reconstructor.kernels(self.cells)
 
     def region(
         self, rows: torch.Tensor, cols: torch.Tensor

@@ -1,4 +1,6 @@
-"""Per-spatial-frequency reconstruction error tables of an SVD template.
+"""Per-spatial-frequency error tables of a decomposition's truncated templates.
+
+The tables compare, ring by ring in Fourier space, every template row's
 
 - reconstruction ``m~``: the SVD template restricted to the feature rectangles,
 - exact template ``m``: the volume's projection under the decomposition's filter
@@ -37,9 +39,9 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
+    from panther_em.approximation.reconstructor import Reconstructor
     from panther_em.decomposition.rectangles import Rectangle
     from panther_em.filters.whitening import WhiteningFilter
-    from panther_em.inference.template import Template
 
 TABLE_NAMES = (
     "reconstruction_autocorr",
@@ -75,9 +77,9 @@ class PerSpatialFrequencyErrorTable:
         ``(kH, kW // 2 + 1)`` float32 ``W_avg * band`` the tables were built under.
     rectangles : tuple of Rectangle
         The kept ``(k_start, m_start, k_extent, m_extent)`` feature regions.
-    kernel_config : WarpConfig
+    warp : WarpConfig
         The warp the reconstructions and the support disk were built with; a search
-        must use a template with the same (:meth:`check_template`).
+        must warp its kernels the same way (:meth:`check`).
     pad : int
         Zero-padding factor of the spectra the tables were binned from. Default 2.
     """
@@ -91,7 +93,7 @@ class PerSpatialFrequencyErrorTable:
     support: torch.Tensor
     template_filter: torch.Tensor
     rectangles: tuple[Rectangle, ...]
-    kernel_config: WarpConfig
+    warp: WarpConfig
     pad: int = 2
 
     def __post_init__(self) -> None:
@@ -142,8 +144,8 @@ class PerSpatialFrequencyErrorTable:
             ):
                 raise ValueError(f"bad rectangle {r!r}; see compute_error_tables")
 
-        if not isinstance(self.kernel_config, WarpConfig):
-            raise ValueError("kernel_config must be a WarpConfig")
+        if not isinstance(self.warp, WarpConfig):
+            raise ValueError("warp must be a WarpConfig")
 
         if self.pad < 1:
             raise ValueError("pad must be >= 1")
@@ -172,38 +174,40 @@ class PerSpatialFrequencyErrorTable:
             "n_bins": self.n_bins,
             "template_shape": list(self.template_shape),
             "rectangles": [list(r) for r in self.rectangles],
-            "kernel_config": self.kernel_config.to_dict(),
+            "warp": self.warp.to_dict(),
             "pad": self.pad,
         }
 
-    # ------ template guard ----------------------------------------------------
+    # ------ decomposition guard -----------------------------------------------
 
-    def check_template(self, template: Template) -> None:
-        """Raise unless the tables describe ``template``'s kernels."""
-        if template.kernel_config != self.kernel_config:
+    def check(self, reconstructor: Reconstructor) -> None:
+        """Raise unless the tables describe ``reconstructor``'s templates and warp."""
+        result = reconstructor.result
+        if reconstructor.warp != self.warp:
             raise ValueError(
-                f"the tables were built with the kernel warp {self.kernel_config}, the "
-                f"template warps its kernels with {template.kernel_config}"
+                f"the tables were built with the warp {self.warp}, the reconstructor "
+                f"warps with {reconstructor.warp}"
             )
-        if tuple(template.template_shape) != self.template_shape:
+        if tuple(reconstructor.box_shape) != self.template_shape:
             raise ValueError(
-                f"the tables were built on a {self.template_shape} box, the template's "
-                f"is {tuple(template.template_shape)}"
+                f"the tables were built on a {self.template_shape} box, the "
+                f"decomposition's is {tuple(reconstructor.box_shape)}"
             )
-        if template.n_templates != self.n_templates:
+        n_templates = int(result.num_fourier_filters) * int(result.num_orientations)
+        if n_templates != self.n_templates:
             raise ValueError(
-                f"the tables hold {self.n_templates} template rows, the template "
-                f"{template.n_templates}"
+                f"the tables hold {self.n_templates} template rows, the decomposition "
+                f"{n_templates}"
             )
         for k0, m0, ke, me in self.rectangles:
-            if k0 + ke > template.k_max or m0 + me > template.eig_max:
+            if k0 + ke > result.k_max or m0 + me > result.eig_max:
                 raise ValueError(
-                    f"rectangle {(k0, m0, ke, me)} lies beyond the template's stored "
-                    f"(k_max={template.k_max}, eig_max={template.eig_max})"
+                    f"rectangle {(k0, m0, ke, me)} lies beyond the decomposition's "
+                    f"stored (k_max={result.k_max}, eig_max={result.eig_max})"
                 )
-        filters = template.result.fourier_filters
+        filters = result.fourier_filters
         if filters is None:
-            raise ValueError("the template's decomposition carries no Fourier filter")
+            raise ValueError("the decomposition carries no Fourier filter")
         grid = torch.as_tensor(np.asarray(filters))
         if grid.dim() == 3 and grid.shape[0] == 1:
             grid = grid[0]
@@ -214,7 +218,7 @@ class PerSpatialFrequencyErrorTable:
             grid.to(expected.dtype), expected, rtol=FILTER_RTOL, atol=FILTER_ATOL
         ):
             raise ValueError(
-                "the template's decomposition was built under another Fourier filter "
+                "the decomposition was built under another Fourier filter "
                 "than the tables' W_avg * band"
             )
 
@@ -260,7 +264,7 @@ class PerSpatialFrequencyErrorTable:
             f["support"] = self.support.numpy()
             f["template_filter"] = self.template_filter.numpy()
             f.attrs["rectangles"] = json.dumps(self.rectangles)
-            f.attrs["kernel_config"] = json.dumps(self.kernel_config.to_dict())
+            f.attrs["warp_config"] = json.dumps(self.warp.to_dict())
             f.attrs["pad"] = self.pad
 
     @classmethod
@@ -273,8 +277,9 @@ class PerSpatialFrequencyErrorTable:
                 support=torch.from_numpy(np.asarray(f["support"][()], dtype=bool)),
                 template_filter=torch.from_numpy(f["template_filter"][()]),
                 rectangles=as_rectangles(json.loads(f.attrs["rectangles"])),
-                kernel_config=WarpConfig.from_dict(
-                    json.loads(f.attrs["kernel_config"])
+                # tables saved before the rename recorded "kernel_config"
+                warp=WarpConfig.from_dict(
+                    json.loads(f.attrs.get("warp_config", f.attrs.get("kernel_config")))
                 ),
                 pad=int(f.attrs["pad"]),
             )
@@ -420,7 +425,7 @@ def error_profiles(
 @torch.no_grad()
 def compute_error_tables(
     volume: torch.Tensor | np.ndarray,
-    template: Template,
+    reconstructor: Reconstructor,
     rectangles: Sequence[Rectangle],
     whitening: WhiteningFilter,
     *,
@@ -434,10 +439,10 @@ def compute_error_tables(
     ----------
     volume : torch.Tensor or numpy.ndarray
         ``(d, d, d)`` reference volume; ``(d, d)`` is the template box.
-    template : Template
-        The SVD decomposition (built under ``whitening.template_filter``; checked)
-        and its kernel warp, which the reconstructions and the support use and the
-        table records.
+    reconstructor : Reconstructor
+        The decomposition (built under ``whitening.template_filter``; checked) and
+        its warp, which the reconstructions and the support use and the table
+        records.
     rectangles : sequence of Rectangle
         Kept ``(k_start, m_start, k_extent, m_extent)`` feature regions.
     whitening : WhiteningFilter
@@ -449,7 +454,7 @@ def compute_error_tables(
     dtype : torch.dtype
         Dtype of the padded spectra and the binning. Default float32.
     """
-    result = template.result.to_dense()
+    result = reconstructor.result.to_dense()
     if result.num_volumes != 1:
         raise NotImplementedError(
             f"the search supports one volume per decomposition, got "
@@ -462,9 +467,8 @@ def compute_error_tables(
         )
     whitening.check_template_filter(result.fourier_filters)
 
-    device = template.device
-    warp = template.warp
-    h, w = template.template_shape
+    device = reconstructor.device
+    h, w = reconstructor.box_shape
     n_rows = result.num_fourier_filters * result.num_orientations  # one filter
 
     vol = torch.as_tensor(np.asarray(volume), dtype=torch.float32)
@@ -494,7 +498,7 @@ def compute_error_tables(
     u = torch.as_tensor(np.asarray(result.U)).reshape(n_rows, *result.U.shape[3:])
     u = u[:, :k_stop, :e_stop]
 
-    support = warp.support.clone()
+    support = reconstructor.support.clone()
 
     # volume projections, the exact template's filter and the signal's
     dft, edge_value_scaled, pad_width = precompute_volume_dft(vol.to(device))
@@ -517,7 +521,7 @@ def compute_error_tables(
             weighted_vh,
             result.num_angular_components,
         )
-        reconstruction = warp.to_cartesian(polar)
+        reconstruction = reconstructor.to_cartesian(polar)
 
         psi = torch.zeros_like(phi[rows])
         projections = generate_projection_batch(
@@ -537,6 +541,6 @@ def compute_error_tables(
         support=support,
         template_filter=template_filter.cpu(),
         rectangles=rects,
-        kernel_config=template.kernel_config,
+        warp=reconstructor.warp,
         pad=int(pad),
     )

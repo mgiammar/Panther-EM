@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from panther_em.inference.search.correlation.loop import LoopPlan
     from panther_em.inference.search.correlation.moments import MomentForms
     from panther_em.inference.search.featurization.store import FeatureStore
-    from panther_em.inference.template import WeightSource
+    from panther_em.inference.search.weights import WeightSource
 
 TILE_CHOICES = (8, 16, 32, 64, 128)
 

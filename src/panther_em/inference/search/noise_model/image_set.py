@@ -19,10 +19,10 @@ import torch
 from panther_em.filters.curves import curve_to_grid
 
 if TYPE_CHECKING:
-    from panther_em.filters.whitening import WhiteningFilter
-    from panther_em.inference.search.noise_model.spatial_frequency_error import (
+    from panther_em.approximation.errors import (
         PerSpatialFrequencyErrorTable,
     )
+    from panther_em.filters.whitening import WhiteningFilter
 
 # Fraction of the in-band mean noise power the level map's flattening is floored at
 # (keeps near-empty rings from being amplified).

@@ -10,10 +10,10 @@ Two contractions compute the same features:
 ``AdjointContraction`` (default)
     Scatters each box onto the padded polar grid through the transposed kernel warp
     and contracts it with the rectangle's prefiltered polar vectors
-    (:mod:`~panther_em.inference.template.adjoint`).
+    (:mod:`~panther_em.approximation.adjoint`).
 ``PlanarContraction`` (fallback)
     Multiplies the boxes by the ``[Re K; -Im K]`` Cartesian kernels; used where the
-    warp has no adjoint (``TemplateWarp.adjoint`` is ``None``).
+    warp has no adjoint (``Reconstructor.adjoint`` is ``None``).
 """
 
 from __future__ import annotations
@@ -34,8 +34,8 @@ from panther_em.inference.search.featurization.base import (
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
+    from panther_em.approximation.reconstructor import Reconstructor
     from panther_em.decomposition.rectangles import Rectangle
-    from panther_em.inference.template import TemplateWarp
 
 ContractionName = Literal["adjoint", "planar"]
 
@@ -93,7 +93,7 @@ class BoxContraction(ABC):
 
     Parameters
     ----------
-    warp : TemplateWarp
+    reconstructor : Reconstructor
     rect : Rectangle
         ``(k_start, m_start, k_extent, m_extent)``.
     precision : Precision or str
@@ -102,11 +102,11 @@ class BoxContraction(ABC):
 
     def __init__(
         self,
-        warp: TemplateWarp,
+        reconstructor: Reconstructor,
         rect: Rectangle,
         precision: Precision | str = DEFAULT_PRECISION,
     ) -> None:
-        self.warp = warp
+        self.reconstructor = reconstructor
         self.rect: Rectangle = rect
         self.precision = Precision.coerce(precision)
 
@@ -118,7 +118,7 @@ class BoxContraction(ABC):
     @property
     def box_dtype(self) -> torch.dtype:
         """The dtype boxes are best gathered in (the planes are cast once to it)."""
-        return _operand_dtype(self.precision, self.warp.device)
+        return _operand_dtype(self.precision, self.reconstructor.device)
 
     @abstractmethod
     def features(self, boxes: torch.Tensor) -> torch.Tensor:
@@ -130,29 +130,29 @@ class AdjointContraction(BoxContraction):
 
     The rectangle's bases are built at construction and held by the contraction.
     Raises ``ValueError`` when the warp has no adjoint (see
-    :func:`~panther_em.inference.template.adjoint.unsupported_reason`).
+    :func:`~panther_em.approximation.adjoint.unsupported_reason`).
     """
 
     def __init__(
         self,
-        warp: TemplateWarp,
+        reconstructor: Reconstructor,
         rect: Rectangle,
         precision: Precision | str = DEFAULT_PRECISION,
     ) -> None:
-        super().__init__(warp, rect, precision)
-        adjoint = warp.adjoint
+        super().__init__(reconstructor, rect, precision)
+        adjoint = reconstructor.adjoint
         if adjoint is None:
             raise ValueError(
                 "the template's warp has no adjoint (use PlanarContraction)"
             )
         self.adjoint = adjoint
-        self.bases = warp.adjoint_bases(rect)
+        self.bases = reconstructor.adjoint_bases(rect)
 
     def features(self, boxes: torch.Tensor) -> torch.Tensor:
         """See :meth:`BoxContraction.features` (:data:`ADJOINT_CHUNK` boxes a time)."""
         n = int(boxes.shape[0])
         out = torch.empty(
-            (self.n_cells, n), dtype=torch.complex64, device=self.warp.device
+            (self.n_cells, n), dtype=torch.complex64, device=self.reconstructor.device
         )
         for start in range(0, n, ADJOINT_CHUNK):
             part = boxes[start : start + ADJOINT_CHUNK]
@@ -175,23 +175,23 @@ class PlanarContraction(BoxContraction):
     @cached_property
     def cell_bytes(self) -> int:
         """Bytes of one cell's ``[Re K; -Im K]`` rows."""
-        k_h, k_w = self.warp.box_shape
+        k_h, k_w = self.reconstructor.box_shape
         return 2 * k_h * k_w * torch.empty((), dtype=self.box_dtype).element_size()
 
     @cached_property
     def block(self) -> torch.Tensor | None:
         """``(2 n_cells, kH kW)`` planar block (``[Re K; -Im K]``), or ``None``."""
         needed = self.n_cells * self.cell_bytes
-        if needed > PLANAR_FRACTION * _free_device_bytes(self.warp.device):
+        if needed > PLANAR_FRACTION * _free_device_bytes(self.reconstructor.device):
             return None
         n = self.n_cells
-        k_h, k_w = self.warp.box_shape
+        k_h, k_w = self.reconstructor.box_shape
         block = torch.empty(
-            (2 * n, k_h * k_w), dtype=self.box_dtype, device=self.warp.device
+            (2 * n, k_h * k_w), dtype=self.box_dtype, device=self.reconstructor.device
         )
         for start in range(0, n, self.cell_chunk):
             stop = min(start + self.cell_chunk, n)
-            kernels = self.warp.spatial(self.cells[start:stop]).reshape(
+            kernels = self.reconstructor.kernels(self.cells[start:stop]).reshape(
                 stop - start, -1
             )
             block[start:stop] = kernels.real.to(self.box_dtype)
@@ -216,11 +216,11 @@ class PlanarContraction(BoxContraction):
         out = torch.empty(
             (self.n_cells, int(boxes.shape[0])),
             dtype=torch.complex64,
-            device=self.warp.device,
+            device=self.reconstructor.device,
         )
         for start in range(0, self.n_cells, self.cell_chunk):
             cells = self.cells[start : start + self.cell_chunk]
-            kernels = self.warp.spatial(cells).reshape(int(cells.shape[0]), -1)
+            kernels = self.reconstructor.kernels(cells).reshape(int(cells.shape[0]), -1)
             lhs = torch.cat([kernels.real, -kernels.imag]).to(self.box_dtype)
             out[start : start + int(cells.shape[0])] = self._complex(
                 _matmul(lhs, rhs, self.precision)
@@ -235,7 +235,7 @@ class PlanarContraction(BoxContraction):
 
 
 def box_contraction(
-    warp: TemplateWarp,
+    reconstructor: Reconstructor,
     rect: Rectangle,
     precision: Precision | str = DEFAULT_PRECISION,
     contraction: ContractionName = "adjoint",
@@ -243,9 +243,9 @@ def box_contraction(
     """The adjoint contraction, or the planar one if asked or the adjoint is missing."""
     if contraction not in ("adjoint", "planar"):
         raise ValueError(f"unknown contraction {contraction!r}")
-    if contraction == "adjoint" and warp.adjoint is not None:
-        return AdjointContraction(warp, rect, precision)
-    return PlanarContraction(warp, rect, precision)
+    if contraction == "adjoint" and reconstructor.adjoint is not None:
+        return AdjointContraction(reconstructor, rect, precision)
+    return PlanarContraction(reconstructor, rect, precision)
 
 
 # --------------------------------------------------------------------------- #
@@ -261,8 +261,8 @@ class DirectFeaturization(BaseImageFeaturization):
 
     Parameters
     ----------
-    warp : TemplateWarp
-        The template's kernel warp.
+    reconstructor : Reconstructor
+        The template's forward model (kernels and their adjoint).
     rect : Rectangle
         ``(k_start, m_start, k_extent, m_extent)``.
     batch : int, optional
@@ -275,18 +275,20 @@ class DirectFeaturization(BaseImageFeaturization):
 
     def __init__(
         self,
-        warp: TemplateWarp,
+        reconstructor: Reconstructor,
         rect: Sequence[int],
         *,
         batch: int = DEFAULT_BATCH,
         precision: Precision | str = DEFAULT_PRECISION,
         contraction: ContractionName = "adjoint",
     ) -> None:
-        super().__init__(warp, rect)
+        super().__init__(reconstructor, rect)
         if int(batch) < 1:
             raise ValueError("batch must be >= 1")
         self.batch = int(batch)
-        self.contraction = box_contraction(warp, self.rect, precision, contraction)
+        self.contraction = box_contraction(
+            reconstructor, self.rect, precision, contraction
+        )
 
     def chunks(
         self, planes: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor

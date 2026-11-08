@@ -15,11 +15,12 @@ import torch
 from scipy.ndimage import gaussian_filter
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
+from panther_em.approximation import compute_error_tables
 from panther_em.coordinates import OffsetPolarTransform
 from panther_em.decomposition import PolarProjectionDecomposer
 from panther_em.filters import WhiteningFilter
-from panther_em.inference.search.noise_model import ImageSet, compute_error_tables
-from panther_em.inference.template import Template
+from panther_em.inference.search.noise_model import ImageSet
+from panther_em.inference.search.template import Template
 
 SHAPE = (96, 96)
 BOX = 24
@@ -67,7 +68,7 @@ class NoiseCase(NamedTuple):
 
     def table(self, rects, **kwargs):
         return compute_error_tables(
-            self.volume, self.template, rects, self.whitening, **kwargs
+            self.volume, self.template.reconstructor, rects, self.whitening, **kwargs
         )
 
     def images(self, table, name="m2", device="cpu"):

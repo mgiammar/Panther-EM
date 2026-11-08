@@ -37,6 +37,7 @@ from scipy.ndimage import gaussian_filter
 from torch_ctf import calculate_ctf_2d
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
+from panther_em.approximation import PerSpatialFrequencyErrorTable, compute_error_tables
 from panther_em.coordinates import OffsetPolarTransform
 from panther_em.decomposition import PolarProjectionDecomposer
 from panther_em.decomposition.projections import (
@@ -49,16 +50,14 @@ from panther_em.inference.search import (
     Calibration,
     Decision,
     ImageSet,
-    PerSpatialFrequencyErrorTable,
     PixelLabel,
     Searcher,
     SearchResult,
     Stage,
     ThresholdTest,
-    compute_error_tables,
     zscore_threshold,
 )
-from panther_em.inference.template import Template
+from panther_em.inference.search.template import Template
 from panther_em.orientations import healpix_orientations
 
 if TYPE_CHECKING:
@@ -208,7 +207,7 @@ def run(out: Path, device: str = "cpu", noise_seed: int = NOISE_SEED) -> dict:
     # step 4: one table per feature selection
     tables = {}
     for tag, rect in (("coarse", COARSE), ("full", FULL)):
-        compute_error_tables(volume, template, [rect], whitening).save(
+        compute_error_tables(volume, template.reconstructor, [rect], whitening).save(
             out / f"tables_{tag}.h5"
         )
         tables[tag] = PerSpatialFrequencyErrorTable.load(out / f"tables_{tag}.h5")

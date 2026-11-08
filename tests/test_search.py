@@ -29,7 +29,7 @@ from panther_em.inference.search.results import (
 )
 from panther_em.inference.search.search import Searcher
 from panther_em.inference.search.stage import Stage
-from panther_em.inference.template import Template
+from panther_em.inference.search.template import Template
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",
@@ -114,7 +114,7 @@ def compute_feature_stack(image, kernels):
 
 def _dense_reference(template, image, rects, n_psi, planes=None, filters=None):
     """Per-pixel statistics from the dense correlogram (kernels, FFT, einsum, irfft)."""
-    recon = template.warp.reconstructor
+    recon = template.reconstructor
     u0 = torch.as_tensor(recon.result.U[0])  # drop the singleton volume axis
     us = u0 * torch.as_tensor(recon.result.S)[None, None]
     us = us.reshape(-1, *us.shape[2:]).to(torch.complex64)  # (N, K, E)
@@ -136,7 +136,7 @@ def _dense_reference(template, image, rects, n_psi, planes=None, filters=None):
                 ),
                 dim=-1,
             ).reshape(-1, 2)
-            kernels = template.warp.spatial(cells)
+            kernels = template.reconstructor.kernels(cells)
             feats = compute_feature_stack(img[None], kernels)[0]  # (cells, oh, ow)
             oh, ow = feats.shape[-2:]
             y = feats.reshape(ke, me, oh * ow).permute(2, 0, 1)  # (P, ke, me)

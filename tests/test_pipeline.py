@@ -13,14 +13,11 @@ from pathlib import Path
 
 import torch
 
+from panther_em.approximation import PerSpatialFrequencyErrorTable
 from panther_em.decomposition.result import DecompositionResult
 from panther_em.filters import WhiteningFilter
-from panther_em.inference.search import (
-    PerSpatialFrequencyErrorTable,
-    PixelLabel,
-    SearchResult,
-)
-from panther_em.inference.template import Template
+from panther_em.inference.search import PixelLabel, SearchResult
+from panther_em.inference.search.template import Template
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "threshold_test_pipeline.py"
 
@@ -52,7 +49,7 @@ def test_threshold_test_pipeline_runs_end_to_end(tmp_path):
     # stage 1 scores each pixel over a 1-ring neighbourhood, not all 12 orientations
     assert 1 < summary["local_orientations"][1] < 12
     for table in tables.values():
-        table.check_template(template)
+        table.check(template.reconstructor)
 
     for name in whitening.names:
         record = summary["micrographs"][name]

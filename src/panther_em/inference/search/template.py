@@ -1,4 +1,4 @@
-"""A decomposition plus everything derived from it that its consumers share."""
+"""The search's view of a decomposition: its forward model, weights and hypotheses."""
 
 from __future__ import annotations
 
@@ -7,9 +7,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from panther_em.approximation.reconstructor import Reconstructor
 from panther_em.decomposition.result import DecompositionBase
-from panther_em.inference.template.warp import TemplateWarp
-from panther_em.inference.template.weights import WeightSource
+from panther_em.inference.search.hypotheses import HypothesisSpace
+from panther_em.inference.search.weights import WeightSource
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -17,20 +18,20 @@ if TYPE_CHECKING:
 
     from panther_em.coordinates.warp_config import WarpConfig
     from panther_em.decomposition.rectangles import Rectangle
-    from panther_em.inference.search.hypotheses import HypothesisSpace
 
 
 class Template:
-    """A decomposition, its kernel warp and its weights.
+    """A decomposition, its forward model and its device-resident weights.
 
     Parameters
     ----------
     result : DecompositionBase
-        The (dense or sparse) decomposition, with its coordinate transform.
+        The (dense or sparse) decomposition of real-valued projections, with its
+        coordinate transform.
     device : torch.device or str
         Compute device for kernels and weights.
-    kernel : WarpConfig, optional
-        Polar-to-Cartesian warp settings (default ``WarpConfig()``).
+    warp : WarpConfig, optional
+        Polar-to-Cartesian warp settings (default: the decomposition's own).
     weights_cells : Rectangle or sequence of Rectangle, optional
         Bounding box of the feature space any stage will use; restricts the resident
         ``U * S`` (see :class:`~.weights.WeightSource`).
@@ -41,24 +42,28 @@ class Template:
         result: DecompositionBase,
         *,
         device: torch.device | str,
-        kernel: WarpConfig | None = None,
+        warp: WarpConfig | None = None,
         weights_cells: Rectangle | Sequence[Rectangle] | None = None,
     ) -> None:
+        if result.is_complex_projection:
+            raise NotImplementedError(
+                "the search supports decompositions of real-valued projections only"
+            )
         self.result = result
         self.device = torch.device(device)
-        self.warp = TemplateWarp(result, kernel, device=self.device)
+        self.reconstructor = Reconstructor(result, warp, device=self.device)
         self._weights_cells = weights_cells
         self._weights: WeightSource | None = None
 
     @property
-    def kernel_config(self) -> WarpConfig:
-        """The warp settings of every kernel, adjoint and error table."""
-        return self.warp.config
+    def warp(self) -> WarpConfig:
+        """The warp of every kernel, adjoint and error table of this template."""
+        return self.reconstructor.warp
 
     @property
     def template_shape(self) -> tuple[int, int]:
         """Kernel box ``(kH, kW)``."""
-        return self.warp.box_shape
+        return self.reconstructor.box_shape
 
     @property
     def k_max(self) -> int:
@@ -85,8 +90,6 @@ class Template:
     @cached_property
     def space(self) -> HypothesisSpace:
         """The decomposition's hypothesis space (one defocus plane)."""
-        from panther_em.inference.search.hypotheses import HypothesisSpace
-
         return HypothesisSpace.from_result(self.result)
 
     @classmethod
@@ -95,14 +98,14 @@ class Template:
         path: str | Path,
         device: torch.device | str,
         *,
-        kernel: WarpConfig | None = None,
+        warp: WarpConfig | None = None,
         weights_cells: Rectangle | Sequence[Rectangle] | None = None,
     ) -> Template:
         """Load a dense or sparse decomposition and wrap it."""
         result = DecompositionBase.load(path)
-        return cls(result, device=device, kernel=kernel, weights_cells=weights_cells)
+        return cls(result, device=device, warp=warp, weights_cells=weights_cells)
 
     def release(self) -> None:
-        """Drop the resident weights and the warp's adjoint."""
+        """Drop the resident weights and the reconstructor's adjoint."""
         self._weights = None
-        self.warp.release()
+        self.reconstructor.release()

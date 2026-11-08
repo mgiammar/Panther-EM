@@ -24,7 +24,7 @@ from panther_em.inference.search.planning import (
     plan_memory,
 )
 from panther_em.inference.search.stage import Stage
-from panther_em.inference.template import WeightSource
+from panther_em.inference.search.weights import WeightSource
 
 CUDA = torch.cuda.is_available()
 pytestmark = pytest.mark.filterwarnings("ignore:ComplexHalf support is experimental")

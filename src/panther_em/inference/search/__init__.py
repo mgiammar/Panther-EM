@@ -8,19 +8,18 @@ materialising the full correlogram.
 
 Objects, by lifetime
 --------------------
-* **Per template** (:mod:`panther_em.inference.template`):
-  :class:`~panther_em.inference.template.Template` bundles a
-  :class:`~panther_em.decomposition.result.DecompositionResult` with its kernel warp
-  (:class:`~panther_em.inference.template.TemplateWarp`: Cartesian kernels on demand,
+* **Per template** (:mod:`.template`): :class:`Template` bundles a
+  :class:`~panther_em.decomposition.DecompositionResult` with its forward model
+  (:class:`~panther_em.approximation.Reconstructor`: Cartesian kernels on demand,
   the transposed warp the direct engine uses) and device-resident ``U * S``.
 * **Per dataset** (:mod:`panther_em.filters`): the
   :class:`~panther_em.filters.WhiteningFilter` (``W_avg``, every micrograph's
   ``C_i``, the template band) the decomposition and every search image are built
   under.
-* **Per template and feature selection** (:mod:`.noise_model`):
-  :class:`~.noise_model.PerSpatialFrequencyErrorTable`, the ring profiles of the
-  reconstruction, residual and signal of every template row, which the coloured-noise
-  :class:`~.noise_model.ThresholdTest` reads.
+* **Per template and feature selection** (:mod:`panther_em.approximation`):
+  :class:`~panther_em.approximation.PerSpatialFrequencyErrorTable`, the ring
+  profiles of the reconstruction, residual and signal of every template row, which the
+  coloured-noise :class:`~.noise_model.ThresholdTest` reads.
 * **Per search** (:mod:`.stage`, :mod:`.decision`, :mod:`.search`): a list of
   :class:`Stage` s (feature rectangles, precision, ``n_psi``, orientation sampling,
   CTF planes) each ending in a :class:`Decision` (threshold, optional threshold test,
@@ -104,11 +103,11 @@ Panther-EM supplies the steps; an external application drives the loops.
    template band (saved once per dataset).
 3. Decompose the structure under ``W_avg * band`` (``PolarProjectionDecomposer`` with
    ``fourier_filters=whitening.template_filter(box)[None]``).
-4. Per feature selection: :func:`~.noise_model.compute_error_tables` ``(volume,
-   template, rectangles, whitening)`` (saved once per template). Per micrograph:
-   :meth:`~.noise_model.ImageSet.from_micrograph` whitens it by ``W_avg * C_i^2`` and
-   estimates its curves and level map; :meth:`Searcher.run`;
-   :meth:`SearchResult.save` (maps and ``score``).
+4. Per feature selection: :func:`~panther_em.approximation.compute_error_tables`
+   ``(volume, template.reconstructor, rectangles, whitening)`` (saved once per
+   template). Per micrograph: :meth:`~.noise_model.ImageSet.from_micrograph`
+   whitens it by ``W_avg * C_i^2`` and estimates its curves and level map;
+   :meth:`Searcher.run`; :meth:`SearchResult.save` (maps and ``score``).
 
 ``scripts/threshold_test_pipeline.py`` runs the chain on synthetic data.
 
@@ -152,9 +151,7 @@ from panther_em.inference.search.noise_model import (
     Calibration,
     ImageSet,
     NoiseScales,
-    PerSpatialFrequencyErrorTable,
     ThresholdTest,
-    compute_error_tables,
     zeta_quantile,
     zscore_threshold,
 )
@@ -168,6 +165,7 @@ from panther_em.inference.search.results import PixelLedger, SearchResult, Stage
 from panther_em.inference.search.runner import StageRunner
 from panther_em.inference.search.search import Searcher, SearchSession
 from panther_em.inference.search.stage import Stage
+from panther_em.inference.search.template import Template
 
 __all__ = [
     "BaseImageFeaturization",
@@ -187,7 +185,6 @@ __all__ = [
     "ImageSet",
     "MemoryPlan",
     "NoiseScales",
-    "PerSpatialFrequencyErrorTable",
     "PixelLabel",
     "PixelLedger",
     "PixelSelection",
@@ -201,10 +198,10 @@ __all__ = [
     "StagePlan",
     "StageResult",
     "StageRunner",
+    "Template",
     "ThresholdTest",
     "Tuning",
     "choose_mode",
-    "compute_error_tables",
     "make_featurization",
     "plan_stage",
     "zeta_quantile",

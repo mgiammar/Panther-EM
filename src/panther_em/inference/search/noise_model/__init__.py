@@ -1,11 +1,10 @@
-"""The coloured-noise model of a search: the prepared image, error tables, the test.
+"""The coloured-noise model of a search: the prepared image and the threshold test.
 
-The whitening it relies on lives in :mod:`panther_em.filters`.
+The whitening it relies on lives in :mod:`panther_em.filters`, the template's error
+tables in :mod:`panther_em.approximation`.
 
 - :class:`ImageSet`: one micrograph's search image, CTF planes, noise / signal curves
   and level map;
-- :class:`PerSpatialFrequencyErrorTable` (:func:`compute_error_tables`): the template's
-  ring profiles of reconstruction, residual and signal;
 - :class:`ThresholdTest` (:class:`Calibration`, :class:`NoiseScales`): the per-pixel
   rule that discards pixels whose exact correlation cannot reach the threshold.
 
@@ -14,11 +13,6 @@ search imports it).
 """
 
 from panther_em.inference.search.noise_model.image_set import ImageSet
-from panther_em.inference.search.noise_model.spatial_frequency_error import (
-    PerSpatialFrequencyErrorTable,
-    RadialBins,
-    compute_error_tables,
-)
 from panther_em.inference.search.noise_model.threshold_test import (
     Calibration,
     NoiseScales,
@@ -31,10 +25,7 @@ __all__ = [
     "Calibration",
     "ImageSet",
     "NoiseScales",
-    "PerSpatialFrequencyErrorTable",
-    "RadialBins",
     "ThresholdTest",
-    "compute_error_tables",
     "zeta_quantile",
     "zscore_threshold",
 ]

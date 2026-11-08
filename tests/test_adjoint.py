@@ -1,4 +1,4 @@
-"""The adjoint warp against the template warp's Cartesian kernels."""
+"""The adjoint warp against the reconstructor's Cartesian kernels."""
 
 from __future__ import annotations
 
@@ -7,11 +7,11 @@ import pytest
 import torch
 from conftest import make_synthetic_result, requires_cuda
 
+from panther_em.approximation.adjoint import bspline, build_bases
+from panther_em.approximation.reconstructor import Reconstructor
 from panther_em.coordinates import WarpConfig
 from panther_em.coordinates.spiral_polar import SpiralPolarTransform
 from panther_em.decomposition.result import DecompositionResult
-from panther_em.inference.template import TemplateWarp
-from panther_em.inference.template.adjoint import bspline, build_bases
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",
@@ -51,8 +51,8 @@ def _spiral_result(box=24, n_angular=32, n_radial=10, **kw):
 
 
 def _reference_features(warp, cells, boxes):
-    """``<box, conj K>`` for every cell from the warp's spatial kernels, in fp64."""
-    kernels = warp.spatial(cells).reshape(len(cells), -1).to(torch.complex128)
+    """``<box, conj K>`` for every cell from the reconstructor's kernels, in fp64."""
+    kernels = warp.kernels(cells).reshape(len(cells), -1).to(torch.complex128)
     return torch.conj(kernels) @ boxes.to(torch.complex128).T
 
 
@@ -78,7 +78,7 @@ def test_bspline_partition_of_unity_and_scipy_weights():
 @pytest.mark.parametrize("spiral", [False, True])
 def test_adjoint_matches_the_warps_kernels(order, spiral):
     result = _spiral_result() if spiral else make_synthetic_result(box=24, n_angular=32)
-    bank = TemplateWarp(result, WarpConfig(order=order), device="cpu")
+    bank = Reconstructor(result, WarpConfig(order=order), device="cpu")
     rect = (0, 0, 4, 3)
     cells = _cells(rect)
     gen = torch.Generator().manual_seed(1)
@@ -91,12 +91,12 @@ def test_adjoint_matches_the_warps_kernels(order, spiral):
 
 
 def test_adjoint_forward_model_reproduces_a_kernel():
-    """``S (filt(a) (x) filt(c))`` masked equals ``warp.spatial`` for a spiral cell."""
-    bank = TemplateWarp(_spiral_result(), device="cpu")
+    """``S (filt(a) (x) filt(c))`` masked equals the reconstructor's kernel (spiral)."""
+    bank = Reconstructor(_spiral_result(), device="cpu")
     adjoint = bank.adjoint
     assert adjoint is not None
     rect = (2, 1, 1, 1)
-    bases = build_bases(adjoint, bank.reconstructor, rect)
+    bases = build_bases(adjoint, bank, rect)
     k_count = bases.n_k
     a = torch.complex(bases.angular[:k_count], bases.angular[k_count:]).to(
         torch.complex128
@@ -104,7 +104,7 @@ def test_adjoint_forward_model_reproduces_a_kernel():
     c = torch.complex(bases.radial_re, bases.radial_im).to(torch.complex128)
     polar = (a[0][:, None] * c[0, 0][None, :]).reshape(-1)
     forward = adjoint.scatter.to_sparse_coo().t().to(torch.complex128) @ polar
-    kernel = bank.spatial([(2, 1)])[0].reshape(-1).to(torch.complex128)
+    kernel = bank.kernels([(2, 1)])[0].reshape(-1).to(torch.complex128)
     err = (forward - kernel).abs().max() / kernel.abs().max()
     assert err < 2e-5, err
 
@@ -113,7 +113,7 @@ def test_unsupported_configs_fall_back_to_none():
     result = make_synthetic_result()
 
     def warp(**config):
-        return TemplateWarp(result, WarpConfig(**config), device="cpu")
+        return Reconstructor(result, WarpConfig(**config), device="cpu")
 
     assert warp(mode="edge").adjoint is None
     assert warp(cval=1.0).adjoint is None
@@ -149,7 +149,7 @@ def test_spiral_radial_continuation_matches_pad_radial_axis():
 
 @requires_cuda
 def test_cuda_adjoint_matches_cpu_kernels_in_every_precision():
-    bank = TemplateWarp(_spiral_result(), device="cuda")
+    bank = Reconstructor(_spiral_result(), device="cuda")
     rect = (1, 0, 3, 4)
     cells = _cells(rect)
     gen = torch.Generator().manual_seed(2)
