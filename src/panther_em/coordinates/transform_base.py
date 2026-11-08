@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import warnings
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, cast, overload
 
 import numpy as np
 import torch
@@ -43,7 +43,7 @@ from panther_em.utils.warp_backends import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
     from typing import Literal
 
 # ---------------------------------------------------------------------------
@@ -192,6 +192,26 @@ def reconstruct_transform(
         )
     cls = get_transform_class(params["transform_name"])
     return cls.from_dict(params, device=device)
+
+
+def _map_images(warp: Callable[[Any], Any], image: Any) -> Any:
+    """Apply a real 2-D ``warp`` to 2-D image, a batch ``(B, H, W)`` or complex data."""
+    device = detect_device(image)
+
+    if image.ndim == 3:
+        batch = [_map_images(warp, im) for im in image]
+        return np.stack(batch) if device == "numpy" else torch.stack(batch)
+
+    if image.ndim != 2:
+        raise ValueError(f"Image must be 2-D or 3-D (batched), got {image.ndim}D.")
+
+    is_complex = np.iscomplexobj(image) if device == "numpy" else image.is_complex()
+
+    if is_complex:  # independent real and imaginary channels
+        real, imag = warp(image.real), warp(image.imag)
+        return real + 1j * imag if device == "numpy" else torch.complex(real, imag)
+
+    return warp(image)
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +456,28 @@ class CoordinateTransform(ABC):
     # Concrete warp methods
     # ------------------------------------------------------------------ #
 
+    @overload
+    def to_transform_space(
+        self,
+        image: np.ndarray,
+        preserve_energy: bool = ...,
+        order: int = ...,
+        mode: str = ...,
+        cval: float = ...,
+        **kwargs: Any,
+    ) -> np.ndarray: ...
+
+    @overload
+    def to_transform_space(
+        self,
+        image: torch.Tensor,
+        preserve_energy: bool = ...,
+        order: int = ...,
+        mode: str = ...,
+        cval: float = ...,
+        **kwargs: Any,
+    ) -> np.ndarray | torch.Tensor: ...  # CPU tensors are warped as numpy
+
     def to_transform_space(
         self,
         image: np.ndarray | torch.Tensor,
@@ -472,74 +514,54 @@ class CoordinateTransform(ABC):
         np.ndarray or torch.Tensor
             Warped image with shape :attr:`polar_shape` (or batched equivalent).
         """
-        device = detect_device(image)
 
-        # --- batched (3-D) routing ---
-        if image.ndim == 3:
-            results = [
-                self.to_transform_space(
-                    im,
-                    preserve_energy=preserve_energy,
-                    order=order,
-                    mode=mode,
-                    cval=cval,
-                    **kwargs,
-                )
-                for im in image
-            ]
-            if device == "numpy":
-                return np.stack(results)
-            return torch.stack(cast("list[torch.Tensor]", results))
-
-        if image.ndim != 2:
-            raise ValueError(f"Image must be 2-D or 3-D (batched), got {image.ndim}D.")
-
-        # --- complex routing (independent real/imag channels) ---
-        is_complex = (
-            np.iscomplexobj(image)
-            if device == "numpy"
-            else (isinstance(image, torch.Tensor) and image.is_complex())
-        )
-        if is_complex:
-            real_part = self.to_transform_space(
-                image.real,
-                preserve_energy=preserve_energy,
+        def warp(image: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+            device = detect_device(image)
+            dc = self.device_coords(device)
+            warp_fn = get_warp_function(device)
+            warped: np.ndarray | torch.Tensor = warp_fn(
+                image,
+                dc["transform"],
+                output_shape=self.polar_shape,
                 order=order,
                 mode=mode,
                 cval=cval,
                 **kwargs,
             )
-            imag_part = self.to_transform_space(
-                image.imag,
-                preserve_energy=preserve_energy,
-                order=order,
-                mode=mode,
-                cval=cval,
-                **kwargs,
-            )
-            if device == "numpy":
-                return real_part + 1j * imag_part
-            return torch.complex(
-                cast("torch.Tensor", real_part), cast("torch.Tensor", imag_part)
-            )
 
-        # --- base case: single real 2-D image ---
-        dc = self.device_coords(device)
-        warp_fn = get_warp_function(device)
-        warped: np.ndarray | torch.Tensor = warp_fn(
-            image,
-            dc["transform"],
-            output_shape=self.polar_shape,
-            order=order,
-            mode=mode,
-            cval=cval,
-            **kwargs,
-        )
+            if preserve_energy and dc["jacobian"] is not None:
+                warped = warped * dc["jacobian"]
 
-        if preserve_energy and dc["jacobian"] is not None:
-            warped = warped * dc["jacobian"]
+            return warped
 
-        return warped
+        mapped: np.ndarray | torch.Tensor = _map_images(warp, image)
+        return mapped
+
+    @overload
+    def to_cartesian(
+        self,
+        image: np.ndarray,
+        preserve_energy: bool = ...,
+        wrap_angular_axis: bool = ...,
+        pad_radial_axis: bool = ...,
+        order: int = ...,
+        mode: str = ...,
+        cval: float = ...,
+        **kwargs: Any,
+    ) -> np.ndarray: ...
+
+    @overload
+    def to_cartesian(
+        self,
+        image: torch.Tensor,
+        preserve_energy: bool = ...,
+        wrap_angular_axis: bool = ...,
+        pad_radial_axis: bool = ...,
+        order: int = ...,
+        mode: str = ...,
+        cval: float = ...,
+        **kwargs: Any,
+    ) -> np.ndarray | torch.Tensor: ...  # CPU tensors are warped as numpy
 
     def to_cartesian(
         self,
@@ -581,114 +603,62 @@ class CoordinateTransform(ABC):
         np.ndarray or torch.Tensor
             Warped image with shape :attr:`cartesian_shape` (or batched).
         """
-        device = detect_device(image)
 
-        # --- batched (3-D) routing ---
-        if image.ndim == 3:
-            results = [
-                self.to_cartesian(
-                    im,
-                    preserve_energy=preserve_energy,
-                    wrap_angular_axis=wrap_angular_axis,
-                    pad_radial_axis=pad_radial_axis,
-                    order=order,
-                    mode=mode,
-                    cval=cval,
-                    **kwargs,
-                )
-                for im in image
-            ]
-            if device == "numpy":
-                return np.stack(results)
-            return torch.stack(cast("list[torch.Tensor]", results))
+        def warp(image: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+            device = detect_device(image)
+            dc = self.device_coords(device)
 
-        if image.ndim != 2:
-            raise ValueError(f"Image must be 2-D or 3-D (batched), got {image.ndim}D.")
+            if preserve_energy and dc["jacobian"] is not None:
+                image = image / dc["jacobian"]
 
-        # --- complex routing ---
-        is_complex = (
-            np.iscomplexobj(image)
-            if device == "numpy"
-            else (isinstance(image, torch.Tensor) and image.is_complex())
-        )
-        if is_complex:
-            real_part = self.to_cartesian(
-                image.real,
-                preserve_energy=preserve_energy,
-                wrap_angular_axis=wrap_angular_axis,
-                pad_radial_axis=pad_radial_axis,
-                order=order,
-                mode=mode,
-                cval=cval,
-                **kwargs,
-            )
-            imag_part = self.to_cartesian(
-                image.imag,
-                preserve_energy=preserve_energy,
-                wrap_angular_axis=wrap_angular_axis,
-                pad_radial_axis=pad_radial_axis,
-                order=order,
-                mode=mode,
-                cval=cval,
-                **kwargs,
-            )
-            if device == "numpy":
-                return real_part + 1j * imag_part
-            return torch.complex(
-                cast("torch.Tensor", real_part), cast("torch.Tensor", imag_part)
-            )
+            coords = dc["cartesian"]
 
-        # --- base case: single real 2-D image ---
-        dc = self.device_coords(device)
+            # Continue the radial axis though origin for spline interpolation
+            if pad_radial_axis:
+                image, num_prepended = self.pad_radial_axis(image)
+                if num_prepended:
+                    coords = coords.copy() if device == "numpy" else coords.clone()
+                    coords[1, ...] += num_prepended
 
-        if preserve_energy and dc["jacobian"] is not None:
-            image = image / dc["jacobian"]
-
-        coords = dc["cartesian"]
-
-        # Continue the radial axis though origin for spline interpolation
-        if pad_radial_axis:
-            image, num_prepended = self.pad_radial_axis(image)
-            if num_prepended:
+            # Handle the periodic angular axis: wrap/circular padding around the
+            # boundary before interpolation prevents boundary artifacts
+            if wrap_angular_axis and self.has_periodic_axis:
+                if self.periodic_axis not in (None, 0):
+                    raise NotImplementedError(
+                        "Periodic padding is only implemented for periodic_axis=0."
+                    )
+                # The spline prefilter's boundary error decays like |pole|**rows (~0.43
+                # for order 5), so `order` rows left ~4e-3 at the 0/360 seam
+                pad_size = 4 * order
+                if device == "numpy":
+                    image = np.pad(image, ((pad_size, pad_size), (0, 0)), mode="wrap")
+                else:
+                    image = cast("torch.Tensor", image).unsqueeze(0)
+                    image = F.pad(image, (0, 0, pad_size, pad_size), mode="circular")
+                    image = image.squeeze(0)
+                # Offset the angular coordinate to account for the padding rows
                 coords = coords.copy() if device == "numpy" else coords.clone()
-                coords[1, ...] += num_prepended
+                coords[0, ...] += pad_size
 
-        # Handle periodic angular axis to prevent boundary artifacts by wrap/circular
-        # padding around the boundary before interpolation
-        if wrap_angular_axis and self.has_periodic_axis:
-            if self.periodic_axis not in (None, 0):
-                raise NotImplementedError(
-                    "Periodic padding is only implemented for periodic_axis=0."
-                )
-            # The spline prefilter's boundary error decays like |pole|**rows (~0.43
-            # for order 5), so `order` rows left ~4e-3 at the 0/360 seam
-            pad_size = 4 * order
-            if device == "numpy":
-                image = np.pad(image, ((pad_size, pad_size), (0, 0)), mode="wrap")
-            else:
-                image = cast("torch.Tensor", image).unsqueeze(0)
-                image = F.pad(image, (0, 0, pad_size, pad_size), mode="circular")
-                image = image.squeeze(0)
-            # Offset the angular coordinate to account for the padding rows
-            coords = coords.copy() if device == "numpy" else coords.clone()
-            coords[0, ...] += pad_size
+            warp_fn = get_warp_function(device)
+            warped: np.ndarray | torch.Tensor = warp_fn(
+                image,
+                coords,
+                output_shape=self.cartesian_shape,
+                order=order,
+                mode=mode,
+                cval=cval,
+                **kwargs,
+            )
 
-        warp_fn = get_warp_function(device)
-        warped: np.ndarray | torch.Tensor = warp_fn(
-            image,
-            coords,
-            output_shape=self.cartesian_shape,
-            order=order,
-            mode=mode,
-            cval=cval,
-            **kwargs,
-        )
+            # Zero pixels outside the support, which padded rows could otherwise reach
+            outer_index = self.outer_radius_index() if pad_radial_axis else None
+            if outer_index is not None:
+                warped = warped * (dc["cartesian"][1] <= outer_index)
+            return warped
 
-        # Zero the pixels outside the support, which padded rows could otherwise reach
-        outer_index = self.outer_radius_index() if pad_radial_axis else None
-        if outer_index is not None:
-            warped = warped * (dc["cartesian"][1] <= outer_index)
-        return warped
+        mapped: np.ndarray | torch.Tensor = _map_images(warp, image)
+        return mapped
 
 
 # ---------------------------------------------------------------------------
