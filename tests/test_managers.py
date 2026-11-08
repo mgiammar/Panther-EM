@@ -240,11 +240,19 @@ def test_result_is_a_leopard_match_template_result(pipeline):
     result = SearchResult.load(path)  # still a Panther-EM result
     searched = result.last_stage[0] >= 0
     assert bool(searched.all())
+    # correlations in units of the median standard deviation (Leopard-EM's scale);
+    # the z-score is scale-free
+    scale = leopard.correlation_scale(result)
+    with h5py.File(path, "r") as f:
+        assert f.attrs["panther_em_correlation_scale"] == pytest.approx(scale)
+    std = result.variance[0].float().sqrt()
     torch.testing.assert_close(leo.scaled_mip, result.zscore[0].float())
-    torch.testing.assert_close(leo.correlation_average, result.mean[0].float())
-    torch.testing.assert_close(
-        leo.correlation_variance, result.variance[0].float().sqrt()
-    )
+    torch.testing.assert_close(leo.mip, result.mip[0].float() / scale)
+    torch.testing.assert_close(leo.correlation_average, result.mean[0].float() / scale)
+    torch.testing.assert_close(leo.correlation_variance, std / scale)
+    assert float(leo.correlation_variance.median()) == pytest.approx(1.0, abs=1e-3)
+    z = (leo.mip - leo.correlation_average) / leo.correlation_variance
+    torch.testing.assert_close(z, leo.scaled_mip, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(leo.orientation_psi, result.psi_degrees()[0])
     assert leo.total_defocus == 2 and leo.total_projections == 2 * 12 * 64
 

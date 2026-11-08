@@ -13,12 +13,16 @@ here.
 * :func:`particle_table` and :func:`write_particle_stack` build the
   ``ParticleStackHDF5`` that Leopard-EM's refinement reads.
 
-Scales: ``scaled_mip`` is Panther-EM's z-score and ``correlation_average`` /
-``correlation_variance`` its per-pixel mean and standard deviation over the
-hypotheses, in Panther-EM's correlation units (the whitened, unit-variance search
-image against the normalized low-rank template). They are stored as if on Leopard-EM's
-scale, which they are not calibrated to; Leopard-EM's refinement computes its
-``refined_scaled_mip`` from these mean and standard deviation maps.
+Scales: Leopard-EM normalizes its correlations to a unit noise standard deviation;
+Panther-EM's are on the scale of the template's norm (hundreds). ``mip``,
+``correlation_average`` and ``correlation_variance`` (a standard deviation) are
+therefore divided by the micrograph's :func:`correlation_scale`, the median standard
+deviation of its correlations, which puts its background near Leopard-EM's (mean 0,
+standard deviation 1; on xenon_216 the 2DTM run's maps are 0.0054 times ours with
+correlation 0.99). ``scaled_mip`` is Panther-EM's z-score, which no scale changes.
+Leopard-EM's refinement chooses each particle's pose by the maximum of
+``(cc - correlation_average) / correlation_variance``, so these maps must be on its
+scale: unscaled they pull refined positions to the edge of the shift window.
 """
 
 from __future__ import annotations
@@ -71,23 +75,39 @@ def _hypotheses(result: SearchResult, n_psi: int) -> int:
     return space.n_defocus * space.n_filters * space.n_orientations * n_psi
 
 
+def correlation_scale(result: SearchResult) -> float:
+    """Median standard deviation of ``result``'s correlations over searched pixels.
+
+    Estimated factor from approximated correlation units in Panther-EM and the
+    normalized cross-correlation values in Leopard-EM.
+    """
+    searched = (result.last_stage[0] >= 0).cpu()
+    std = result.variance[0].detach().cpu().double().clamp_min(0.0).sqrt()[searched]
+    std = std[torch.isfinite(std)]
+    scale = float(std.median()) if std.numel() else float("nan")
+    if not scale > 0.0:
+        raise ValueError("the result has no searched pixel with a positive variance")
+    return scale
+
+
 def match_template_maps(result: SearchResult) -> dict[str, torch.Tensor]:
     """Leopard-EM's eight ``(H - h + 1, W - w + 1)`` float32 CPU maps of ``result``."""
     if result.geometry.n_images != 1:
         raise ValueError("a Leopard-EM result holds one micrograph")
     decoded = result.decode()
     searched = (result.last_stage[0] >= 0).cpu()
+    scale = correlation_scale(result)
 
     def plane(values: torch.Tensor | None) -> torch.Tensor:
         if values is None:
             return torch.zeros(searched.shape, dtype=torch.float32)
         return values[0].detach().to("cpu", torch.float32)
 
-    maps = {
-        "mip": plane(result.mip),
+    maps = {  # correlations in units of the scale, Leopard-EM's
+        "mip": plane(result.mip) / scale,
         "scaled_mip": plane(result.zscore),
-        "correlation_average": plane(result.mean),
-        "correlation_variance": plane(result.variance).clamp_min(0.0).sqrt(),
+        "correlation_average": plane(result.mean) / scale,
+        "correlation_variance": plane(result.variance).clamp_min(0.0).sqrt() / scale,
         "orientation_psi": plane(decoded["psi"]),
         "orientation_theta": plane(decoded["theta"]),
         "orientation_phi": plane(decoded["phi"]),
@@ -111,6 +131,7 @@ def write_match_template_maps(path: str | Path, result: SearchResult) -> None:
         f.attrs["total_projections"] = _hypotheses(result, n_psi)
         f.attrs["total_orientations"] = space.n_orientations * space.n_filters * n_psi
         f.attrs["total_defocus"] = space.n_defocus
+        f.attrs["panther_em_correlation_scale"] = correlation_scale(result)
         if HDF5_TENSORS_GROUP in f:
             del f[HDF5_TENSORS_GROUP]
         group = f.create_group(HDF5_TENSORS_GROUP)

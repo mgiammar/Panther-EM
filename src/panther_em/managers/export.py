@@ -9,11 +9,12 @@ the search result file (which the ``search`` program made a Leopard-EM
 match-template result too).
 
 The optics, the micrograph and the template volume come from the configs the result
-files record. ``scaled_mip`` is Panther-EM's z-score and the correlation mean and
-standard deviation are Panther-EM's, stored as if on Leopard-EM's scale (see
-:mod:`~.leopard`): Leopard-EM's ``refined_scaled_mip`` computed from them is not
-calibrated. The ``panther_*`` columns are kept in the stack but not in Leopard-EM's
-refinement output.
+files record. ``scaled_mip`` is Panther-EM's z-score; ``mip`` and the correlation mean
+and standard deviation are Panther-EM's divided by each micrograph's median correlation
+standard deviation, which brings them near Leopard-EM's unit-noise scale (see
+:mod:`~.leopard`), as its refinement's pose selection and ``refined_scaled_mip`` need.
+The ``panther_*`` columns are kept in the stack but not in Leopard-EM's refinement
+output.
 """
 
 from __future__ import annotations
