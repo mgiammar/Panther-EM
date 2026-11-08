@@ -793,8 +793,9 @@ class DecompositionResult(DecompositionBase):
 
             # Legacy files (pre multi-volume support) stored U without the
             # leading volume axis; insert it so num_volumes=1 is self-consistent.
+            # A disk-backed dataset cannot gain an axis, so mmap reads these eagerly.
             if U.ndim == 4:
-                U = U[np.newaxis, ...]
+                U = np.asarray(U)[np.newaxis, ...]
 
             result = cls(U=U, S=S, Vh=Vh, **metadata)
         except Exception:
@@ -1342,8 +1343,9 @@ class SparseDecompositionResult(DecompositionBase):
 
             # Legacy files (pre multi-volume support) stored U_data without the
             # leading volume axis; insert it so num_volumes=1 is self-consistent.
+            # A disk-backed dataset cannot gain an axis, so mmap reads these eagerly.
             if U_data.ndim == 3:
-                U_data = U_data[np.newaxis, ...]
+                U_data = np.asarray(U_data)[np.newaxis, ...]
 
             result = cls.from_sparse_arrays(
                 U_data=U_data,

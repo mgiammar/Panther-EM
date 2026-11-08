@@ -688,10 +688,25 @@ class TestDecompositionResultIO:
             del f["U"]
             f.create_dataset("U", data=legacy_U)
 
-        loaded = DecompositionResult.load(path)
-        assert loaded.num_volumes == 1
-        assert loaded.U.shape == (1, NUM_FF, NUM_OR, K_MAX, EIG_MAX)
-        np.testing.assert_array_equal(loaded.U[0], result.U[0])
+        for mmap in (False, True):
+            with DecompositionResult.load(path, mmap=mmap) as loaded:
+                assert loaded.num_volumes == 1
+                assert loaded.U.shape == (1, NUM_FF, NUM_OR, K_MAX, EIG_MAX)
+                np.testing.assert_array_equal(loaded.U[0], result.U[0])
+
+        # the sparse layout's legacy U_data is 3D
+        sparse_path = tmp_path / "legacy_sparse.h5"
+        result.to_sparse(5).save(sparse_path)
+        with h5py.File(sparse_path, "r+") as f:
+            legacy_U = f["U"][()][0]
+            del f["U"]
+            f.create_dataset("U", data=legacy_U)
+        for mmap in (False, True):
+            with SparseDecompositionResult.load(sparse_path, mmap=mmap) as loaded:
+                assert loaded.num_volumes == 1
+                np.testing.assert_array_equal(
+                    loaded.to_dense().U, result.to_sparse(5).to_dense().U
+                )
 
     def test_warp_config_round_trips_dense_and_sparse(self, tmp_path: Path):
         warp = WarpConfig(order=3, mode="nearest", preserve_energy=False)
@@ -870,3 +885,24 @@ def test_decomposer_warps_with_and_records_its_warp_config():
     assert cubic.warp_config == WarpConfig(order=3)
     # the warp is applied, not only recorded
     assert not np.allclose(default.S, cubic.S)
+
+
+@pytest.mark.parametrize("svd_method", ["dense", "low_rank"])
+def test_decomposer_eig_max_is_bounded_by_the_block_rank(svd_method):
+    """Fewer rows than radii: eig_max defaults to, and may not exceed, the rows."""
+    from panther_em.decomposition import PolarProjectionDecomposer
+
+    rng = np.random.default_rng(0)
+    volume = rng.standard_normal((16, 16, 16)).astype(np.float32)
+    phi = np.array([0.0, 40.0, 80.0], dtype=np.float32)
+    theta = np.array([10.0, 30.0, 50.0], dtype=np.float32)
+    transform = OffsetPolarTransform.from_image(
+        image_shape=(16, 16), num_angle=16, num_radius=6
+    )
+    decomposer = PolarProjectionDecomposer(
+        volume, phi, theta, coordinate_transform=transform
+    )
+    result = decomposer.do_decomposition(svd_method=svd_method)
+    assert result.eig_max == 3 and result.U.shape[-1] == 3
+    with pytest.raises(ValueError, match=r"eig_max must be in the range \[1, 3\]"):
+        decomposer.do_decomposition(eig_max=4, svd_method=svd_method)

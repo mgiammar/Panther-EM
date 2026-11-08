@@ -38,7 +38,7 @@ def _dense_svd_block(
 
 
 def _lowrank_svd_block(
-    freq_blocks: torch.Tensor, eig_max: int, num_radius: int
+    freq_blocks: torch.Tensor, eig_max: int, max_rank: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute a randomized low-rank SVD truncated to the top ``eig_max`` components.
 
@@ -48,15 +48,16 @@ def _lowrank_svd_block(
         Batched matrices of shape ``(num_k_batch, rows, num_radius)``.
     eig_max : int
         Number of leading singular components to keep.
-    num_radius : int
-        Number of columns in ``freq_blocks`` (upper bound for the oversampled rank).
+    max_rank : int
+        ``min(rows, num_radius)`` of ``freq_blocks`` (upper bound for the over-sampled
+        rank).
 
     Returns
     -------
     tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         Truncated ``(u, s, vh)`` each with ``eig_max`` leading components.
     """
-    q = min(eig_max + _LOW_RANK_OVERSAMPLE, num_radius)
+    q = min(eig_max + _LOW_RANK_OVERSAMPLE, max_rank)
     u, s, v = torch.svd_lowrank(freq_blocks, q=q, niter=_LOW_RANK_NITER)
     return u[..., :eig_max], s[..., :eig_max], v[..., :eig_max].mH
 
@@ -222,8 +223,9 @@ class PolarProjectionDecomposer:
             components (maximum is `num_angle // 2`). For example, if `num_angle=360`,
             the valid range is `[1, 180]`. Default is None.
         eig_max : int | None, optional
-            Maximum radial eigenvalue index to compute. If None, sets eig_max to the
-            number of radial components. Default is None.
+            Maximum radial eigenvalue index to compute, at most the rank
+            ``min(rows, num_radius)`` of a block (``rows`` the volumes x filters x
+            orientations). If None, sets eig_max to that rank. Default is None.
         projection_batch_size : int, optional
             Number of projections to process at a time for memory efficiency.
             Default is 128.
@@ -303,12 +305,14 @@ class PolarProjectionDecomposer:
         # Stored tensor is already cropped to k_max by the pipeline; iterate all blocks.
         num_freq_block = num_angular_mode
 
+        # each block's SVD has at most min(rows, num_radius) components
+        max_rank = min(batch_size, num_radius)
         if eig_max is None:
-            eig_max = num_radius
-        if eig_max < 1 or eig_max > num_radius:
+            eig_max = max_rank
+        if eig_max < 1 or eig_max > max_rank:
             raise ValueError(
-                f"eig_max must be in the range [1, {num_radius}] "
-                f"for num_radius={num_radius}, got eig_max={eig_max}"
+                f"eig_max must be in the range [1, {max_rank}] for {batch_size} "
+                f"rows and num_radius={num_radius}, got eig_max={eig_max}"
             )
 
         # Allocate tensors for the SVD results on CPU
@@ -338,7 +342,7 @@ class PolarProjectionDecomposer:
             if svd_method == "dense":
                 u, s, vh = _dense_svd_block(freq_blocks, eig_max)
             else:
-                u, s, vh = _lowrank_svd_block(freq_blocks, eig_max, num_radius)
+                u, s, vh = _lowrank_svd_block(freq_blocks, eig_max, max_rank)
 
             # Reshape outer indices for storage
             u_reshaped = u.permute(1, 0, 2)
