@@ -4,8 +4,10 @@ The template, the tables and the stages are built once; per micrograph the MRC i
 read, its CTF planes built, the :class:`~panther_em.search.Micrograph` prepared (or
 loaded from the cache) and searched, and the
 :class:`~panther_em.search.SearchResult` written to
-``output_dir/<name>_result.h5``. A micrograph whose result exists is skipped, so an
-interrupted run resumes where it stopped. ``search_summary.json`` collects each
+``output_dir/<name>_result.h5``, which also holds Leopard-EM's match-template maps
+(:func:`~.leopard.write_match_template_maps`: the file is a Leopard-EM result too). A
+micrograph whose result exists is skipped, so an interrupted run resumes where it
+stopped. ``search_summary.json`` collects each
 micrograph's label counts.
 """
 
@@ -21,6 +23,7 @@ from pydantic import Field, model_validator
 
 from panther_em.approximation import PerSpatialFrequencyErrorTable
 from panther_em.filters import WhiteningFilter, ctf_planes
+from panther_em.managers import leopard
 from panther_em.managers._common import (
     Model,
     ProgramConfig,
@@ -369,7 +372,12 @@ def run(config: SearchConfig) -> dict[str, Path]:
             micrograph = state.micrograph(entry)
             shape = (int(micrograph.image.shape[-2]), int(micrograph.image.shape[-1]))
             result = state.searcher(shape).run(micrograph)
-            done[name] = save_output(result.save, path, config, micrograph=name)
+
+            def save(file: Path, result: SearchResult = result) -> None:
+                result.save(file)
+                leopard.write_match_template_maps(file, result)
+
+            done[name] = save_output(save, path, config, micrograph=name)
             summary[name] = _summary(result, time.perf_counter() - t0)
             summary_path.write_text(json.dumps(summary, indent=1))
             del micrograph, result

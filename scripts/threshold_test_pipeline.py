@@ -20,7 +20,8 @@ through the five programs of :mod:`panther_em.managers`, as YAML-driven runs wou
      planes, with the mean and variance of the whole set from the closed-form
      moments; it rejects, abstains or accepts;
 
-6. ``export``: the accepted particles as a Leopard-EM table (``particles.csv``).
+6. ``export``: the accepted particles as a Leopard-EM particle stack
+   (``particles.h5``), ready for Leopard-EM's template refinement.
 
 Every file is written to ``--out`` and read back. CPU, well under a minute.
 """
@@ -36,6 +37,9 @@ from typing import TYPE_CHECKING
 import mrcfile
 import numpy as np
 import torch
+from leopard_em.pydantic_models.data_structures.particle_stack import (
+    ParticleStackHDF5,
+)
 from scipy.ndimage import gaussian_filter
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
@@ -236,7 +240,7 @@ def configs(out: Path, device: str, noise_seed: int) -> dict:
         ),
         "export": export.ExportConfig(
             results=[out / f"{name}_result.h5" for name in NAMES],
-            output=out / "particles.csv",
+            output=out / "particles.h5",
         ),
     }
 
@@ -269,7 +273,9 @@ def run(out: Path, device: str = "cpu", noise_seed: int = NOISE_SEED) -> dict:
         "threshold": searched[NAMES[0]]["thresholds"][0],
         "z_alpha": calibration.z_alpha,
         "local_orientations": [min(neighborhoods), max(neighborhoods)],
-        "particles_exported": len((out / "particles.csv").read_text().splitlines()) - 1,
+        "particles_exported": ParticleStackHDF5(
+            hdf5_path=str(out / "particles.h5")
+        ).num_particles,
         "micrographs": {},
     }
     test = ThresholdTest(tables["coarse"], calibration)

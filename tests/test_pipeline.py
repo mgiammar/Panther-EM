@@ -34,7 +34,7 @@ def test_threshold_test_pipeline_runs_end_to_end(tmp_path):
     assert proc.returncode == 0, proc.stderr[-3000:]
     summary = json.loads((tmp_path / "summary.json").read_text())
     assert summary["threshold"] > 4.0 and summary["z_alpha"] > 2.0
-    assert summary["particles_exported"] >= 1  # particles.csv: the accepted pixels
+    assert summary["particles_exported"] >= 1  # particles.h5: one row per particle
 
     whitening = WhiteningFilter.load(tmp_path / "whitening.h5")
     assert whitening.names == ("m0", "m1", "m2")

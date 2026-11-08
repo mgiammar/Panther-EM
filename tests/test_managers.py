@@ -1,4 +1,4 @@
-"""managers and cli: configs, provenance, resuming, export and the command line.
+"""managers and cli: configs, provenance, resuming, the Leopard-EM export, the CLI.
 
 A module fixture runs the synthetic pipeline (``scripts/threshold_test_pipeline.py``)
 in process; the tests reuse its files and configs.
@@ -6,7 +6,6 @@ in process; the tests reuse its files and configs.
 
 from __future__ import annotations
 
-import csv
 import importlib.util
 import shutil
 from pathlib import Path
@@ -15,8 +14,20 @@ import h5py
 import mrcfile
 import numpy as np
 import pytest
+import torch
 import yaml
 from click.testing import CliRunner
+from leopard_em.pydantic_models.data_structures.particle_stack import (
+    ParticleStackHDF5,
+)
+from leopard_em.pydantic_models.formats import (
+    LARGE_STD_PADDING,
+    MATCH_TEMPLATE_DF_COLUMN_ORDER,
+    STATISTIC_MAP_PATH_TO_HDF5_DATASET,
+)
+from leopard_em.pydantic_models.results.match_template_result import (
+    MatchTemplateResultHDF5,
+)
 from pydantic import ValidationError
 
 from panther_em.cli import main
@@ -27,7 +38,7 @@ from panther_em.managers import (
     SearchConfig,
     WhiteningConfig,
     calibrate,
-    export,
+    leopard,
     search,
 )
 from panther_em.managers._common import (
@@ -36,7 +47,13 @@ from panther_em.managers._common import (
     read_volume,
     save_output,
 )
-from panther_em.search import ExecutionConfig, Micrograph, Searcher
+from panther_em.search import (
+    ExecutionConfig,
+    Micrograph,
+    PixelLabel,
+    Searcher,
+    SearchResult,
+)
 from panther_em.search.correlation.contraction import BatchShape
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "threshold_test_pipeline.py"
@@ -178,21 +195,68 @@ def test_search_resumes(pipeline, tmp_path, monkeypatch):
         np.testing.assert_array_equal(original["label"][()], again["label"][()])
 
 
-def test_export_rows(pipeline):
+def test_export_stack(pipeline):
+    """The particle stack Leopard-EM reads: one row per particle, maps by path."""
     module, out = pipeline
-    with (out / "particles.csv").open() as f:
-        rows = list(csv.DictReader(f))
-    assert tuple(rows[0]) == export.COLUMNS
-    assert all(r["panther_label"] == "ACCEPTED" for r in rows)
-    assert [int(r["particle_index"]) for r in rows] == list(range(len(rows)))
+    stack = ParticleStackHDF5(hdf5_path=str(out / "particles.h5"))
+    df = stack.get_dataframe_copy()
+    assert set(MATCH_TEMPLATE_DF_COLUMN_ORDER) <= set(df.columns)
+    assert set(leopard.EXTRA_COLUMNS) <= set(df.columns)
+    assert stack.extracted_box_size == (module.BOX + 16, module.BOX + 16)
+    assert stack.original_template_size == (module.BOX, module.BOX)
+    assert list(df["particle_index"]) == list(range(len(df)))
+    assert df["particle_id"].is_unique
+
+    # the planted particle, at its pose, from m0 only
     r, c = module.PARTICLE["top_left"]
-    (particle,) = [x for x in rows if (int(x["pos_y"]), int(x["pos_x"])) == (r, c)]
-    assert particle["micrograph_path"].endswith("m0.mrc")
-    assert particle["template_path"].endswith("volume.mrc")
-    assert float(particle["relative_defocus"]) == pytest.approx(5000.0)
-    assert int(particle["pos_x_img"]) == c + module.BOX // 2
-    assert int(particle["total_correlations"]) == 2 * 12 * module.N_PSI
-    assert float(particle["scaled_mip"]) > 5.0
+    first = df.iloc[0]
+    assert (first["pos_y"], first["pos_x"]) == (r, c)
+    assert first["pos_x_img"] == c + module.BOX // 2
+    assert first["relative_defocus"] == pytest.approx(5000.0)
+    assert first["panther_label"] == "ACCEPTED"
+    assert first["total_correlations"] == 2 * 12 * module.N_PSI
+    assert first["micrograph_path"].endswith("m0.mrc")
+    assert first["template_path"].endswith("volume.mrc")
+    assert set(df["micrograph_path"].map(lambda p: Path(p).stem)) == {"m0"}
+    for column in STATISTIC_MAP_PATH_TO_HDF5_DATASET:
+        assert set(df[column]) == {str(out / "m0_result.h5")}
+
+    # one particle per accepted region: every accepted pixel lies near a particle
+    result = SearchResult.load(out / "m0_result.h5")
+    accepted = torch.nonzero(result.label[0] == int(PixelLabel.ACCEPTED)).float()
+    picks = torch.tensor(df[["pos_y", "pos_x"]].to_numpy().copy(), dtype=torch.float32)
+    assert float(torch.cdist(accepted, picks).min(1).values.max()) <= 10.0
+    assert len(df) < len(accepted)
+
+    # Leopard-EM reads the statistic maps through the path columns
+    maps = stack.get_local_stat_maps(use_stored=False)
+    assert all(v.shape == (len(df), 17, 17) for v in maps.values())
+
+
+def test_result_is_a_leopard_match_template_result(pipeline):
+    _, out = pipeline
+    path = out / "m0_result.h5"
+    leo = MatchTemplateResultHDF5.from_hdf5(path)
+    result = SearchResult.load(path)  # still a Panther-EM result
+    searched = result.last_stage[0] >= 0
+    assert bool(searched.all())
+    torch.testing.assert_close(leo.scaled_mip, result.zscore[0].float())
+    torch.testing.assert_close(leo.correlation_average, result.mean[0].float())
+    torch.testing.assert_close(
+        leo.correlation_variance, result.variance[0].float().sqrt()
+    )
+    torch.testing.assert_close(leo.orientation_psi, result.psi_degrees()[0])
+    assert leo.total_defocus == 2 and leo.total_projections == 2 * 12 * 64
+
+
+def test_unsearched_pixels_are_padded(pipeline):
+    _, out = pipeline
+    result = SearchResult.load(out / "m1_result.h5")
+    result.last_stage[0, :3] = -1  # pretend the first rows were masked
+    maps = leopard.match_template_maps(result)
+    assert bool((maps["scaled_mip"][:3] == 0).all())
+    assert bool((maps["correlation_variance"][:3] == LARGE_STD_PADDING).all())
+    assert bool(torch.isfinite(maps["orientation_phi"]).all())
 
 
 def test_cli(pipeline, tmp_path):
@@ -208,11 +272,13 @@ def test_cli(pipeline, tmp_path):
     assert yaml.safe_load(example.output)["decomposition"] == "<required>"
 
     config = yaml.safe_load((out / "export.yaml").read_text())
-    config["output"] = str(tmp_path / "again.csv")
+    config["output"] = str(tmp_path / "again.h5")
     (tmp_path / "export.yaml").write_text(yaml.safe_dump(config))
     ran = runner.invoke(main, ["export", str(tmp_path / "export.yaml")])
     assert ran.exit_code == 0, ran.output
-    assert (tmp_path / "again.csv").read_text() == (out / "particles.csv").read_text()
+    again = ParticleStackHDF5(hdf5_path=str(tmp_path / "again.h5"))
+    before = ParticleStackHDF5(hdf5_path=str(out / "particles.h5"))
+    assert again.get_dataframe_copy().equals(before.get_dataframe_copy())
 
     config["typo"] = 1
     (tmp_path / "bad.yaml").write_text(yaml.safe_dump(config))

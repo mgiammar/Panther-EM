@@ -7,7 +7,8 @@ In pipeline order:
 3. :mod:`.calibrate` -- decomposition + volume -> error tables per feature selection
    (and the cheap errors and rank suggestions);
 4. :mod:`.search` -- micrographs -> one search result each (resumable);
-5. :mod:`.export` -- search results -> a Leopard-EM particle table.
+5. :mod:`.export` -- search results -> a Leopard-EM particle stack (HDF5) for its
+   template refinement (the Leopard-EM interface: :mod:`.leopard`).
 
 Each program's ``run(config)`` builds the domain objects and calls them; the domain
 constructors validate the values. Every file a program writes records its config
