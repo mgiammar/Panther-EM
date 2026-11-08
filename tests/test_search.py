@@ -10,26 +10,22 @@ import pytest
 import torch
 from noise_case import BOX, noise_case
 
-from panther_em.inference.search import runner as runner_module
-from panther_em.inference.search.config import ExecutionConfig, Tuning
-from panther_em.inference.search.correlation.contraction import BatchShape
-from panther_em.inference.search.decision import Decision, PixelLabel
-from panther_em.inference.search.featurization import (
+from panther_em.search import runner as runner_module
+from panther_em.search.config import ExecutionConfig, Tuning
+from panther_em.search.correlation.contraction import BatchShape
+from panther_em.search.decision import Decision, PixelLabel
+from panther_em.search.featurization import (
     BaseImageFeaturization,
     FeatureChunk,
 )
-from panther_em.inference.search.hypotheses import HypothesisSet
-from panther_em.inference.search.images import SearchImages
-from panther_em.inference.search.noise_model import Calibration, ThresholdTest
-from panther_em.inference.search.results import (
-    MAP_NAMES,
-    PixelLedger,
-    SearchResult,
-    StageResult,
-)
-from panther_em.inference.search.search import Searcher
-from panther_em.inference.search.stage import Stage
-from panther_em.inference.search.template import Template
+from panther_em.search.hypotheses import HypothesisSet
+from panther_em.search.images import SearchImages
+from panther_em.search.ledger import PixelLedger
+from panther_em.search.results import MAP_NAMES, SearchResult, StageResult
+from panther_em.search.searcher import Searcher
+from panther_em.search.stage import Stage
+from panther_em.search.template import Template
+from panther_em.search.threshold import Calibration, ThresholdTest
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",
@@ -559,6 +555,7 @@ def test_search_result_round_trip_and_masked_pixels(template, tmp_path):
         assert torch.equal(got.pixel_index, want.pixel_index)
         torch.testing.assert_close(got.maps.zscore, want.maps.zscore)
         assert torch.equal(got.best_index, want.best_index)
+        assert torch.equal(got.maps.best_virtual, want.maps.best_virtual.cpu())
         assert (
             got.n_ambiguous_after == want.n_ambiguous_after
             and got.elapsed_s == want.elapsed_s

@@ -16,8 +16,8 @@ import torch
 from panther_em.approximation import PerSpatialFrequencyErrorTable
 from panther_em.decomposition.result import DecompositionResult
 from panther_em.filters import WhiteningFilter
-from panther_em.inference.search import PixelLabel, SearchResult
-from panther_em.inference.search.template import Template
+from panther_em.search import PixelLabel, SearchResult
+from panther_em.search.template import Template
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "threshold_test_pipeline.py"
 

@@ -4,7 +4,7 @@ Panther-EM's SVD-2DTM search always works out of the box: the reduction of each
 hypothesis batch (inverse real FFT over the in-plane angle, moments, running maximum)
 has a pure-PyTorch reference. On a CUDA device the search uses the faster
 register-resident **fused kernel** instead (sources in
-`src/panther_em/inference/search/correlation/kernels/csrc/`, loader in
+`src/panther_em/search/correlation/kernels/csrc/`, loader in
 `.../correlation/kernels/fused_kernel_loader.py`), for ``n_psi`` in
 ``{128, 256, 512}``; other ``n_psi`` reduce through the reference.
 
@@ -36,7 +36,7 @@ The first call triggers the build (about a minute); it is cached afterwards.
 
 ```bash
 python -c "
-from panther_em.inference.search.correlation.kernels import fused_kernel_loader
+from panther_em.search.correlation.kernels import fused_kernel_loader
 print('fused kernel OK' if fused_kernel_loader._try_compile() else 'fused kernel unavailable')
 "
 ```

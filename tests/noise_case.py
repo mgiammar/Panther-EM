@@ -19,8 +19,8 @@ from panther_em.approximation import compute_error_tables
 from panther_em.coordinates import OffsetPolarTransform
 from panther_em.decomposition import PolarProjectionDecomposer
 from panther_em.filters import WhiteningFilter
-from panther_em.inference.search.noise_model import ImageSet
-from panther_em.inference.search.template import Template
+from panther_em.search.micrograph import Micrograph
+from panther_em.search.template import Template
 
 SHAPE = (96, 96)
 BOX = 24
@@ -77,7 +77,7 @@ class NoiseCase(NamedTuple):
 
 def prepare(whitening, table, name="m2", device="cpu"):
     """The micrograph ``name`` prepared against ``table``."""
-    return ImageSet.from_micrograph(
+    return Micrograph.prepare(
         dict(micrographs())[name].to(device),
         name,
         whitening,

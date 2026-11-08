@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from panther_em.inference.search.correlation.contraction import BatchShape, Precision
-from panther_em.inference.search.images import (
+from panther_em.search.correlation.contraction import BatchShape, Precision
+from panther_em.search.images import (
     PixelSelection,
     SearchGeometry,
     SearchImages,

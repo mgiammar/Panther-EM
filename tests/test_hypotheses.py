@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from panther_em.inference.search.hypotheses import (
+from panther_em.search.hypotheses import (
     HypothesisSet,
     HypothesisSpace,
     template_rows_for,

@@ -8,7 +8,7 @@ volume and three synthetic micrographs (one carries a particle):
    micrograph's correction ``C_i`` and the template band;
 3. decompose the volume under ``whitening.template_filter`` (``W_avg * band``);
 4. per feature selection ``compute_error_tables``;
-5. per micrograph ``ImageSet.from_micrograph`` (search image ``W_avg C_i^2``, noise and
+5. per micrograph ``Micrograph.prepare`` (search image ``W_avg C_i^2``, noise and
    signal curves, level map), the two-stage search and ``SearchResult.save``:
 
    * stage 0, the coarse features over every orientation on one CTF plane, rejects
@@ -46,10 +46,11 @@ from panther_em.decomposition.projections import (
 )
 from panther_em.decomposition.result import DecompositionResult
 from panther_em.filters import WhiteningFilter
-from panther_em.inference.search import (
+from panther_em.orientations import healpix_orientations
+from panther_em.search import (
     Calibration,
     Decision,
-    ImageSet,
+    Micrograph,
     PixelLabel,
     Searcher,
     SearchResult,
@@ -57,8 +58,7 @@ from panther_em.inference.search import (
     ThresholdTest,
     zscore_threshold,
 )
-from panther_em.inference.search.template import Template
-from panther_em.orientations import healpix_orientations
+from panther_em.search.template import Template
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -251,7 +251,7 @@ def run(out: Path, device: str = "cpu", noise_seed: int = NOISE_SEED) -> dict:
             int(counts.max()),
         ]
     for name, raw in raw_micrographs(volume, noise_seed):
-        images = ImageSet.from_micrograph(
+        images = Micrograph.prepare(
             raw.to(device),
             name,
             whitening,

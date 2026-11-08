@@ -6,10 +6,10 @@ import pytest
 import torch
 from noise_case import noise_case
 
-from panther_em.inference.search.correlation.contraction import Precision
-from panther_em.inference.search.decision import Decision
-from panther_em.inference.search.noise_model import Calibration, ThresholdTest
-from panther_em.inference.search.stage import Stage, stage_from_json, stage_to_json
+from panther_em.search.correlation.contraction import Precision
+from panther_em.search.decision import Decision
+from panther_em.search.stage import Stage, stage_from_json, stage_to_json
+from panther_em.search.threshold import Calibration, ThresholdTest
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",

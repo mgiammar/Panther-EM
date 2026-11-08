@@ -152,7 +152,7 @@ pretty = true
 
 # module specific overrides
 [[tool.mypy.overrides]]
-module = "panther_em.inference.search.*"
+module = "panther_em.search.*"
 disallow_untyped_decorators = false
 
 # third-party packages without type information

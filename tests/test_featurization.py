@@ -7,7 +7,7 @@ import torch
 from conftest import count_kernel_builds, requires_cuda
 
 from panther_em.approximation.reconstructor import Reconstructor
-from panther_em.inference.search.featurization import (
+from panther_em.search.featurization import (
     AdjointContraction,
     DirectFeaturization,
     FeatureChunk,
@@ -15,7 +15,7 @@ from panther_em.inference.search.featurization import (
     PlanarContraction,
     rectangle_cells,
 )
-from panther_em.inference.search.featurization import (
+from panther_em.search.featurization import (
     direct_featurization as direct_module,
 )
 

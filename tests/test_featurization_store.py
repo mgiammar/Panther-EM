@@ -6,7 +6,7 @@ import pytest
 import torch
 from conftest import read_group, requires_cuda
 
-from panther_em.inference.search.featurization import FeatureChunk, FeatureStore
+from panther_em.search.featurization import FeatureChunk, FeatureStore
 
 RECT = (0, 0, 2, 3)  # 6 cells
 

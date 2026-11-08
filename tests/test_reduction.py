@@ -19,14 +19,14 @@ import numpy as np
 import pytest
 import torch
 
-from panther_em.inference.search.correlation import Spectrum
-from panther_em.inference.search.correlation.kernels import fused_kernel_loader
-from panther_em.inference.search.correlation.kernels.packed import (
+from panther_em.search.correlation import Spectrum
+from panther_em.search.correlation.kernels import fused_kernel_loader
+from panther_em.search.correlation.kernels.packed import (
     decode_argmax_packed,
     encode_argmax_packed,
 )
-from panther_em.inference.search.correlation.loop import cuda_graph_capture_supported
-from panther_em.inference.search.correlation.reduction import (
+from panther_em.search.correlation.loop import cuda_graph_capture_supported
+from panther_em.search.correlation.reduction import (
     LeanBlockStats,
     SpectrumSpec,
     TorchBlockStats,
@@ -34,7 +34,7 @@ from panther_em.inference.search.correlation.reduction import (
     make_block_stats,
     reduce_spectrum,
 )
-from panther_em.inference.search.hypotheses import HypBatch
+from panther_em.search.hypotheses import HypBatch
 
 CUDA = torch.cuda.is_available()
 pytestmark = pytest.mark.filterwarnings("ignore:ComplexHalf support is experimental")

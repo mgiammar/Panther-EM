@@ -7,20 +7,20 @@ from dataclasses import replace
 import pytest
 import torch
 
-from panther_em.inference.search.config import ExecutionConfig, Tuning
-from panther_em.inference.search.correlation.contraction import BatchShape
-from panther_em.inference.search.hypotheses import HypothesisSpace
-from panther_em.inference.search.images import (
+from panther_em.search.config import ExecutionConfig, Tuning
+from panther_em.search.correlation.contraction import BatchShape
+from panther_em.search.hypotheses import HypothesisSpace
+from panther_em.search.images import (
     PixelSelection,
     SearchGeometry,
     SearchImages,
 )
-from panther_em.inference.search.planning import (
+from panther_em.search.planning import (
     DeviceInfo,
     feature_bytes_per_pixel,
     plan_stage,
 )
-from panther_em.inference.search.stage import Stage
+from panther_em.search.stage import Stage
 
 CPU = DeviceInfo(torch.device("cpu"))
 RECT = (0, 0, 4, 5)

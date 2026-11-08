@@ -62,7 +62,7 @@ def _min_blocks_per_sm(fmax: int, r: int) -> int:
 
 _BUILD_SNIPPET = """
 import sys
-from panther_em.inference.search.correlation.kernels import (
+from panther_em.search.correlation.kernels import (
     fused_kernel_loader as loader,
 )
 module = getattr(loader, sys.argv[1])()

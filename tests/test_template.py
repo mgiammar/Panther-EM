@@ -1,4 +1,4 @@
-"""WeightSource / Template (panther_em.inference.search)."""
+"""WeightSource / Template (panther_em.search)."""
 
 from __future__ import annotations
 
@@ -6,9 +6,9 @@ import pytest
 import torch
 
 from panther_em.coordinates import WarpConfig
-from panther_em.inference.search.correlation import FeatureLayout
-from panther_em.inference.search.template import Template
-from panther_em.inference.search.weights import WeightSource
+from panther_em.search.correlation import FeatureLayout
+from panther_em.search.template import Template
+from panther_em.search.weights import WeightSource
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",

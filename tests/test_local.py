@@ -11,30 +11,30 @@ import torch
 from conftest import read_group, requires_cuda
 from test_search import EXEC, EXEC_JOINT, StubFeaturizer
 
-from panther_em.inference.search.config import Tuning
-from panther_em.inference.search.correlation import (
+from panther_em.search.config import Tuning
+from panther_em.search.correlation import (
     Correlator,
     LocalWork,
     LoopPlan,
     MomentForms,
 )
-from panther_em.inference.search.correlation.contraction import BatchShape
-from panther_em.inference.search.correlation.local import (
+from panther_em.search.correlation.contraction import BatchShape
+from panther_em.search.correlation.local import (
     choose_tile,
     correlate_local,
     make_tiles,
 )
-from panther_em.inference.search.correlation.moments import (
+from panther_em.search.correlation.moments import (
     block_moments,
     moments_to_stats,
 )
-from panther_em.inference.search.featurization import FeatureChunk, FeatureStore
-from panther_em.inference.search.hypotheses import HypothesisSpace, LocalHypotheses
-from panther_em.inference.search.images import PixelSelection, SearchImages
-from panther_em.inference.search.planning import DeviceInfo, plan_memory
-from panther_em.inference.search.search import Searcher
-from panther_em.inference.search.stage import Stage, stage_from_json, stage_to_json
-from panther_em.inference.search.template import Template
+from panther_em.search.featurization import FeatureChunk, FeatureStore
+from panther_em.search.hypotheses import HypothesisSpace, LocalHypotheses
+from panther_em.search.images import PixelSelection, SearchImages
+from panther_em.search.planning import DeviceInfo, plan_memory
+from panther_em.search.searcher import Searcher
+from panther_em.search.stage import Stage, stage_from_json, stage_to_json
+from panther_em.search.template import Template
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",

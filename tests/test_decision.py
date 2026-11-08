@@ -9,16 +9,16 @@ import torch
 from noise_case import BOX, noise_case
 from skimage.morphology import isotropic_dilation
 
-from panther_em.inference.search.correlation import StageMaps
-from panther_em.inference.search.decision import Decision, PixelLabel
-from panther_em.inference.search.hypotheses import HypothesisSet, HypothesisSpace
-from panther_em.inference.search.images import (
+from panther_em.search.correlation import StageMaps
+from panther_em.search.decision import Decision, PixelLabel
+from panther_em.search.hypotheses import HypothesisSet, HypothesisSpace
+from panther_em.search.images import (
     PixelSelection,
     SearchGeometry,
     SearchImages,
 )
-from panther_em.inference.search.noise_model import Calibration, ThresholdTest
-from panther_em.inference.search.results import PixelLedger
+from panther_em.search.ledger import PixelLedger
+from panther_em.search.threshold import Calibration, ThresholdTest
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",
