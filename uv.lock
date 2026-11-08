@@ -2066,14 +2066,18 @@ wheels = [
 name = "panther-em"
 source = { editable = "." }
 dependencies = [
+    { name = "click" },
     { name = "h5py" },
     { name = "healpy", marker = "sys_platform != 'win32'" },
     { name = "mrcfile" },
     { name = "numpy" },
+    { name = "pydantic" },
+    { name = "pyyaml" },
     { name = "roma" },
     { name = "scikit-image" },
     { name = "scipy" },
     { name = "torch" },
+    { name = "torch-ctf" },
     { name = "torch-fourier-filter" },
     { name = "torch-fourier-slice" },
     { name = "torch-grid-utils" },
@@ -2106,17 +2110,16 @@ dev = [
     { name = "pytest-cov" },
     { name = "rich" },
     { name = "ruff" },
-    { name = "torch-ctf" },
     { name = "ttsim3d" },
 ]
 test = [
     { name = "pytest" },
     { name = "pytest-cov" },
-    { name = "torch-ctf" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "click" },
     { name = "cucim-cu12", marker = "extra == 'cuda12'" },
     { name = "cucim-cu13", marker = "extra == 'cuda13'" },
     { name = "cupy-cuda12x", marker = "extra == 'cuda12'" },
@@ -2126,10 +2129,13 @@ requires-dist = [
     { name = "mrcfile" },
     { name = "ninja", marker = "extra == 'fused-kernels'" },
     { name = "numpy" },
+    { name = "pydantic", specifier = ">=2" },
+    { name = "pyyaml" },
     { name = "roma" },
     { name = "scikit-image" },
     { name = "scipy" },
     { name = "torch" },
+    { name = "torch-ctf" },
     { name = "torch-fourier-filter" },
     { name = "torch-fourier-slice", specifier = ">=0.6.0" },
     { name = "torch-grid-utils" },
@@ -2150,13 +2156,11 @@ dev = [
     { name = "pytest-cov" },
     { name = "rich" },
     { name = "ruff" },
-    { name = "torch-ctf" },
     { name = "ttsim3d" },
 ]
 test = [
     { name = "pytest" },
     { name = "pytest-cov" },
-    { name = "torch-ctf" },
 ]
 
 [[package]]

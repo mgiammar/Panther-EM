@@ -1,7 +1,8 @@
 """The synthetic end-to-end pipeline runs and every file it writes reloads.
 
-Whitening, decomposition, error tables, image sets and the two-stage search (a full
-stage 0, a local stage 1) with the threshold test.
+The five programs (whitening, decomposition, error tables, the two-stage search -- a
+full stage 0, a local stage 1 -- with the threshold test, and the export) on MRC
+inputs, as ``panther-em`` runs them from YAML.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ def test_threshold_test_pipeline_runs_end_to_end(tmp_path):
     assert proc.returncode == 0, proc.stderr[-3000:]
     summary = json.loads((tmp_path / "summary.json").read_text())
     assert summary["threshold"] > 4.0 and summary["z_alpha"] > 2.0
+    assert summary["particles_exported"] >= 1  # particles.csv: the accepted pixels
 
     whitening = WhiteningFilter.load(tmp_path / "whitening.h5")
     assert whitening.names == ("m0", "m1", "m2")

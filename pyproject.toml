@@ -50,6 +50,10 @@ dependencies = [
     "torch-so3>=0.6.0",  # HierarchicalS2Grid: HEALPix orientation grids
     "healpy; platform_system != 'Windows'",
     "roma",
+    "torch-ctf",  # CTF planes of the searched micrographs
+    "pydantic>=2",  # program configs
+    "pyyaml",
+    "click",  # the panther-em command
 ]
 
 # https://peps.python.org/pep-0621/#dependencies-optional-dependencies
@@ -66,8 +70,8 @@ repository = "https://github.com/mgiammar/panther-em"
 # Entry points
 # https://peps.python.org/pep-0621/#entry-points
 # same as console_scripts entry point
-# [project.scripts]
-# panther-em-cli = "panther_em:main_cli"
+[project.scripts]
+panther-em = "panther_em.cli:main"
 
 # [project.entry-points."some.group"]
 # tomatoes = "panther_em:main_tomatoes"
@@ -78,7 +82,6 @@ repository = "https://github.com/mgiammar/panther-em"
 test = [
     "pytest",
     "pytest-cov",
-    "torch-ctf",  # CTF planes of the synthetic pipeline script (tests/test_pipeline.py)
 ]
 dev = [
     { include-group = "test" },
@@ -125,6 +128,14 @@ ignore = [
     "D401", # First line should be in imperative mood (remove to opt in)
 ]
 
+# pydantic resolves the configs' annotations at runtime: keep their imports
+[tool.ruff.lint.flake8-type-checking]
+runtime-evaluated-base-classes = [
+    "pydantic.BaseModel",
+    "panther_em.managers._common.Model",
+    "panther_em.managers._common.ProgramConfig",
+]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/*.py" = ["D", "S"]
 
@@ -167,6 +178,8 @@ module = [
     "cupyx.*",
     "h5py",
     "healpy",
+    "mrcfile",
+    "mrcfile.*",
     "roma",
     "scipy",
     "scipy.*",

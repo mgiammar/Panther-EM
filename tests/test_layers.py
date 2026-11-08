@@ -1,8 +1,8 @@
 """The package's layering: every module imports only from its own layer or below.
 
 Bottom to top: ``_hdf5`` -> ``coordinates`` -> ``orientations`` -> ``filters`` ->
-``decomposition`` -> ``approximation`` -> ``search``. Imports under
-``TYPE_CHECKING`` and inside functions count too.
+``decomposition`` -> ``approximation`` -> ``search`` -> ``managers`` -> ``cli``.
+Imports under ``TYPE_CHECKING`` and inside functions count too.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ LAYERS = (
     "decomposition",
     "approximation",
     "search",
+    "managers",
+    "cli",
 )
 ROOT = Path(panther_em.__file__).parent
 

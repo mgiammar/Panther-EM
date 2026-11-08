@@ -1,24 +1,26 @@
-"""The coloured-noise threshold test end to end on synthetic data.
+"""The coloured-noise threshold test end to end on synthetic data, via the programs.
 
-The steps an application drives around a Panther-EM search, on a random smooth
-volume and three synthetic micrographs (one carries a particle):
+A random smooth volume and three synthetic micrographs (one carries a particle) go
+through the five programs of :mod:`panther_em.managers`, as YAML-driven runs would
+(each config is also written next to its outputs as ``<program>.yaml``):
 
-1. select the micrographs: ``(name, image)`` pairs of pre-processed real-space images;
-2. ``WhiteningFilter.from_images``: the averaged whitening ``W_avg``, every
-   micrograph's correction ``C_i`` and the template band;
-3. decompose the volume under ``whitening.template_filter`` (``W_avg * band``);
-4. per feature selection ``compute_error_tables``;
-5. per micrograph ``Micrograph.prepare`` (search image ``W_avg C_i^2``, noise and
-   signal curves, level map), the two-stage search and ``SearchResult.save``:
+1. the volume and the pre-processed micrographs are written as MRC files;
+2. ``whitening``: the averaged whitening ``W_avg``, every micrograph's correction
+   ``C_i`` and the template band;
+3. ``decompose``: the volume under ``W_avg * band`` on the nside-1 HEALPix grid (12
+   orientations);
+4. ``calibrate``: one error table per feature selection (and a rank suggestion);
+5. ``search``: per micrograph its CTF planes, the prepared ``Micrograph`` and the
+   two-stage search:
 
    * stage 0, the coarse features over every orientation on one CTF plane, rejects
      or abstains;
    * stage 1, the full features, is *local*: each pixel is scored over the
      orientations within one HEALPix ring of its stage-0 orientation, on both
      planes, with the mean and variance of the whole set from the closed-form
-     moments; it rejects, abstains or accepts.
+     moments; it rejects, abstains or accepts;
 
-The template's orientations are the nside-1 HEALPix pixel centers (12).
+6. ``export``: the accepted particles as a Leopard-EM table (``particles.csv``).
 
 Every file is written to ``--out`` and read back. CPU, well under a minute.
 """
@@ -31,34 +33,27 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import mrcfile
 import numpy as np
 import torch
 from scipy.ndimage import gaussian_filter
-from torch_ctf import calculate_ctf_2d
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
-from panther_em.approximation import PerSpatialFrequencyErrorTable, compute_error_tables
-from panther_em.coordinates import OffsetPolarTransform
-from panther_em.decomposition import PolarProjectionDecomposer
+from panther_em.approximation import PerSpatialFrequencyErrorTable
 from panther_em.decomposition.projections import (
     generate_projection_batch,
     precompute_volume_dft,
 )
-from panther_em.decomposition.result import DecompositionResult
-from panther_em.filters import WhiteningFilter
-from panther_em.orientations import healpix_orientations
+from panther_em.filters import ctf_planes as build_ctf_planes
+from panther_em.managers import calibrate, decompose, export, search, whitening
+from panther_em.orientations import healpix_orientations, ring_neighborhoods
 from panther_em.search import (
     Calibration,
-    Decision,
     Micrograph,
     PixelLabel,
-    Searcher,
     SearchResult,
-    Stage,
     ThresholdTest,
-    zscore_threshold,
 )
-from panther_em.search.template import Template
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -75,7 +70,7 @@ COARSE = (0, 0, 6, 4)
 FULL = (0, 0, N_ANGLE // 2 + 1, EIG_MAX)
 BAND = (0.35, 0.05)  # cycles / px: the template band's cutoff and falloff
 PIXEL_SIZE = 1.5  # A
-DEFOCUS_UM = (1.0, 2.0)  # the two CTF planes
+DEFOCUS_UM = (1.0, 2.0)  # the two CTF planes: 1.5 um fitted, -/+ 0.5 um offsets
 PARTICLE = {"micrograph": "m0", "orientation": 3, "plane": 1, "top_left": (20, 44)}
 NAMES = ("m0", "m1", "m2")
 
@@ -115,19 +110,7 @@ def orientations() -> tuple[np.ndarray, np.ndarray]:
 
 def ctf_planes(shape: tuple[int, int]) -> torch.Tensor:
     """``(2, H, W // 2 + 1)`` CTF filters of the two defocus planes."""
-    return calculate_ctf_2d(
-        defocus=torch.tensor(DEFOCUS_UM),
-        astigmatism=0.0,
-        astigmatism_angle=0.0,
-        voltage=300.0,
-        spherical_aberration=2.7,
-        amplitude_contrast=0.07,
-        phase_shift=0.0,
-        pixel_size=PIXEL_SIZE,
-        image_shape=shape,
-        rfft=True,
-        fftshift=False,
-    ).to(torch.float32)
+    return build_ctf_planes(shape, [1e4 * d for d in DEFOCUS_UM], pixel_size=PIXEL_SIZE)
 
 
 def coloured_noise(shape: tuple[int, int], scale: float, seed: int) -> torch.Tensor:
@@ -168,111 +151,135 @@ def raw_micrographs(
         yield name, image
 
 
-def decompose(volume: np.ndarray, whitening: WhiteningFilter) -> DecompositionResult:
-    """Step 3: the decomposition under ``W_avg * band``."""
-    phi, theta = orientations()
-    transform = OffsetPolarTransform.from_image(
-        image_shape=(BOX, BOX), num_angle=N_ANGLE, num_radius=N_RADIUS
-    )
-    filters = whitening.template_filter((BOX, BOX))[None]
-    return PolarProjectionDecomposer(
-        volume, phi, theta, coordinate_transform=transform, fourier_filters=filters
-    ).do_decomposition(eig_max=EIG_MAX, normalize_projections=True, svd_method="dense")
-
-
 def label_counts(labels: torch.Tensor) -> dict[str, int]:
     """Pixels per label name."""
     return {lab.name: int((labels == int(lab)).sum()) for lab in PixelLabel}
+
+
+def write_inputs(out: Path, noise_seed: int) -> tuple[Path, list[Path]]:
+    """Step 1: the volume and the pre-processed micrographs as MRC files."""
+    volume = synthetic_volume()
+    volume_path = out / "volume.mrc"
+    mrcfile.write(str(volume_path), volume, voxel_size=PIXEL_SIZE, overwrite=True)
+    paths = []
+    for name, image in raw_micrographs(volume, noise_seed):
+        path = out / "micrographs" / f"{name}.mrc"
+        path.parent.mkdir(exist_ok=True)
+        mrcfile.write(str(path), image.numpy(), voxel_size=PIXEL_SIZE, overwrite=True)
+        paths.append(path)
+    return volume_path, paths
+
+
+def configs(out: Path, device: str, noise_seed: int) -> dict:
+    """Steps 2-6 as the programs' configs (what YAML files would hold)."""
+    volume, micrographs = write_inputs(out, noise_seed)
+    calibration = {"alpha": 5e-3, "zeta": 0.9, "eps_rho": 0.1, "b_factor": 20.0}
+    fitted = 1e4 * sum(DEFOCUS_UM) / 2  # Angstrom
+    return {
+        "whitening": whitening.WhiteningConfig(
+            micrographs=micrographs,
+            output=out / "whitening.h5",
+            band_cutoff=BAND[0],
+            band_falloff=BAND[1],
+            device=device,
+        ),
+        "decompose": decompose.DecomposeConfig(
+            volume=volume,
+            whitening=out / "whitening.h5",
+            output=out / "decomposition.h5",
+            polar_grid=decompose.PolarGrid(num_angle=N_ANGLE, num_radius=N_RADIUS),
+            healpix_nside=NSIDE,
+            eig_max=EIG_MAX,
+            device=device,
+        ),
+        "calibrate": calibrate.CalibrateConfig(
+            volume=volume,
+            decomposition=out / "decomposition.h5",
+            whitening=out / "whitening.h5",
+            output_dir=out,
+            tables={"coarse": [COARSE], "full": [FULL]},
+            suggest=[calibrate.SuggestTarget(max_error=0.2)],
+            device=device,
+        ),
+        "search": search.SearchConfig(
+            decomposition=out / "decomposition.h5",
+            whitening=out / "whitening.h5",
+            tables={tag: out / f"tables_{tag}.h5" for tag in ("coarse", "full")},
+            micrographs=[
+                search.MicrographEntry(path=p, defocus_u=fitted, defocus_v=fitted)
+                for p in micrographs
+            ],
+            optics=search.Optics(pixel_size=PIXEL_SIZE),
+            defocus_offsets=[1e4 * d - fitted for d in DEFOCUS_UM],
+            stages=[
+                search.StageSpec(
+                    rectangles=[COARSE],
+                    table="coarse",
+                    n_psi=N_PSI,
+                    planes=[1],
+                    decision=search.DecisionSpec(calibration=calibration, accept=False),
+                    name="coarse",
+                ),
+                search.StageSpec(
+                    rectangles=[FULL],
+                    table="full",
+                    n_psi=N_PSI,
+                    local_rings=LOCAL_RINGS,
+                    decision=search.DecisionSpec(
+                        calibration=calibration, absorb_radius=2
+                    ),
+                    name="local",
+                ),
+            ],
+            output_dir=out,
+            device=device,
+        ),
+        "export": export.ExportConfig(
+            results=[out / f"{name}_result.h5" for name in NAMES],
+            output=out / "particles.csv",
+        ),
+    }
 
 
 def run(out: Path, device: str = "cpu", noise_seed: int = NOISE_SEED) -> dict:
     """Run the pipeline into ``out``; returns a summary (also written as JSON)."""
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
-    volume = synthetic_volume()
+    programs = configs(out, device, noise_seed)
+    for name, module in (
+        ("whitening", whitening),
+        ("decompose", decompose),
+        ("calibrate", calibrate),
+        ("search", search),
+        ("export", export),
+    ):
+        programs[name].to_yaml(out / f"{name}.yaml")
+        module.run(programs[name])  # type: ignore[attr-defined]
 
-    # steps 1 + 2: the whitening filter streams the micrographs
-    whitening = WhiteningFilter.from_images(
-        raw_micrographs(volume, noise_seed), band_cutoff=BAND[0], band_falloff=BAND[1]
-    )
-    whitening.save(out / "whitening.h5")
-    whitening = WhiteningFilter.load(out / "whitening.h5")
-
-    # step 3
-    decompose(volume, whitening).save(out / "decomposition.h5")
-    template = Template(
-        DecompositionResult.load(out / "decomposition.h5"), device=device
-    )
-
-    # step 4: one table per feature selection
-    tables = {}
-    for tag, rect in (("coarse", COARSE), ("full", FULL)):
-        compute_error_tables(volume, template.reconstructor, [rect], whitening).save(
-            out / f"tables_{tag}.h5"
-        )
-        tables[tag] = PerSpatialFrequencyErrorTable.load(out / f"tables_{tag}.h5")
-
-    calibration = Calibration(alpha=5e-3, zeta=0.9, eps_rho=0.1, b_factor=20.0)
-    n_hypotheses = len(DEFOCUS_UM) * N_ORIENTATIONS * N_PSI
-    grid = MICROGRAPH - BOX + 1
-    threshold = zscore_threshold(grid * grid, n_hypotheses)
-    tests = {tag: ThresholdTest(table, calibration) for tag, table in tables.items()}
-    stages = [
-        Stage.create(
-            [COARSE],
-            n_psi=N_PSI,
-            planes=(1,),
-            decision=Decision(threshold, tests["coarse"], accept=False),
-            name="coarse",
-        ),
-        Stage.create(
-            [FULL],
-            n_psi=N_PSI,
-            local_rings=LOCAL_RINGS,
-            decision=Decision(threshold, tests["full"], absorb_radius=2),
-            name="local",
-        ),
-    ]
-    searcher = Searcher(
-        template, stages, n_defocus=len(DEFOCUS_UM), keep_stage_results=True
-    )
-    ctf = ctf_planes((MICROGRAPH, MICROGRAPH))
-
-    # step 5, per micrograph
+    # the summary, from the files the programs wrote
+    tables = {
+        tag: PerSpatialFrequencyErrorTable.load(out / f"tables_{tag}.h5")
+        for tag in ("coarse", "full")
+    }
+    spec = programs["search"].stages[0].decision.calibration
+    calibration = Calibration(**spec.model_dump())
+    searched = json.loads((out / "search_summary.json").read_text())
+    neighborhoods = [len(set(row)) for row in ring_neighborhoods(NSIDE, LOCAL_RINGS)]
     summary: dict = {
-        "threshold": threshold,
+        "threshold": searched[NAMES[0]]["thresholds"][0],
         "z_alpha": calibration.z_alpha,
+        "local_orientations": [min(neighborhoods), max(neighborhoods)],
+        "particles_exported": len((out / "particles.csv").read_text().splitlines()) - 1,
         "micrographs": {},
     }
-    if 1 in searcher.local:  # orientations per neighbourhood, of N_ORIENTATIONS
-        counts = searcher.local[1].counts
-        summary["local_orientations"] = [
-            int(counts[counts > 0].min()),
-            int(counts.max()),
-        ]
-    for name, raw in raw_micrographs(volume, noise_seed):
-        images = Micrograph.prepare(
-            raw.to(device),
-            name,
-            whitening,
-            ctf,
-            tables["coarse"],
-            pixel_size=PIXEL_SIZE,
-        )
-        scales = tests["coarse"].scales(images)
-        search_result = searcher.run(images)
-        search_result.save(out / f"{name}_result.h5")
+    test = ThresholdTest(tables["coarse"], calibration)
+    for name in NAMES:
+        images = Micrograph.load(out / f"{name}_micrograph.h5")
+        scales = test.scales(images)
         loaded = SearchResult.load(out / f"{name}_result.h5")
         tested = loaded.last_stage >= 0
         record = {
-            "stages": [
-                {
-                    "name": s.stage.name,
-                    "n_pixels": s.n_pixels,
-                    **label_counts(s.labels_after),
-                }
-                for s in loaded.stage_results
-            ],
+            "stages": searched[name]["stages"],
             "final": label_counts(loaded.label),
             "score_range": [
                 float(loaded.score[tested].min()),

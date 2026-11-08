@@ -15,6 +15,9 @@ The subpackages form layers; each imports only from the ones above it in this li
 * :mod:`panther_em.approximation` -- the decomposition's forward model
   (:class:`~panther_em.approximation.Reconstructor`) and its error tables.
 * :mod:`panther_em.search` -- the multi-stage template search over micrographs.
+* :mod:`panther_em.managers` -- the pipeline's programs (whitening, decompose,
+  calibrate, search, export), each a YAML-loadable config and a ``run``.
+* :mod:`panther_em.cli` -- the ``panther-em`` command running those programs.
 """
 
 from importlib.metadata import PackageNotFoundError, version

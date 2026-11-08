@@ -4,10 +4,12 @@
   correction ``C_i`` and the band: the one source of the decomposition's Fourier
   filter, the search image's filter and the noise model's signal weight, with guards
   on the links between them.
+* :func:`ctf_planes` -- a micrograph's CTF filters, one per searched defocus.
 * :mod:`~panther_em.filters.curves` -- 1-D spectra on ``torch_fourier_filter``'s
   frequency axis and their DFT grids.
 """
 
+from panther_em.filters.ctf import ctf_planes
 from panther_em.filters.curves import (
     amplitude_spectrum_1d,
     curve_to_grid,
@@ -19,6 +21,7 @@ from panther_em.filters.whitening import WhiteningFilter
 __all__ = [
     "WhiteningFilter",
     "amplitude_spectrum_1d",
+    "ctf_planes",
     "curve_to_grid",
     "frequency_axis",
     "whitening_curve",

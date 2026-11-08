@@ -100,7 +100,8 @@ The two search types
 
 The pipeline around a search
 ----------------------------
-Panther-EM supplies the steps; an external application drives the loops.
+The programs of :mod:`panther_em.managers` (and the ``panther-em`` command) run these
+steps from YAML configs; an application can also drive them directly:
 
 1. Select the micrographs (names and a generator of pre-processed real-space images).
 2. :class:`~panther_em.filters.WhiteningFilter` ``.from_images(generator)``: the
@@ -114,11 +115,15 @@ Panther-EM supplies the steps; an external application drives the loops.
    proposes ranks for an error target or a budget):
    :func:`~panther_em.approximation.compute_error_tables`
    ``(volume, template.reconstructor, rectangles, whitening)`` (saved once per
-   template). Per micrograph: :meth:`Micrograph.prepare` whitens it by
-   ``W_avg * C_i^2`` and estimates its curves and level map; :meth:`Searcher.run`;
+   template).
+5. Per micrograph: :func:`~panther_em.filters.ctf_planes` at its fitted defocus plus
+   the searched offsets; :meth:`Micrograph.prepare` whitens it by ``W_avg * C_i^2``
+   and estimates its curves and level map; :meth:`Searcher.run`;
    :meth:`SearchResult.save` (maps and ``score``).
+6. Export the accepted pixels as a particle table.
 
-``scripts/threshold_test_pipeline.py`` runs the chain on synthetic data.
+``scripts/threshold_test_pipeline.py`` runs the chain on synthetic data through the
+programs.
 
 Example
 -------
