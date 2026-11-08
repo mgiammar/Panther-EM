@@ -34,7 +34,7 @@ def test_kernel_config_kwargs_match_construct_cartesian_feature_signature():
     params = inspect.signature(
         ProjectionReconstructor.construct_cartesian_feature
     ).parameters
-    for key in WarpConfig().as_kwargs():
+    for key in WarpConfig().cartesian_kwargs():
         assert key in params
 
 

@@ -8,10 +8,9 @@ import torch
 import tqdm
 
 from panther_em.coordinates.transform_base import CoordinateTransform, GridTransform
+from panther_em.coordinates.warp_config import WarpConfig
+from panther_em.decomposition.projections import do_pipelined_projection_and_transforms
 from panther_em.decomposition.result import DecompositionResult
-from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-
-from .pipeline_projections import do_pipelined_projection_and_transforms
 
 _LOW_RANK_OVERSAMPLE = 20  # roughly 10 percent margin
 _LOW_RANK_NITER = 2  # PyTorch default
@@ -88,6 +87,10 @@ class PolarProjectionDecomposer:
     volume_labels : np.ndarray | torch.Tensor | None, optional
         Optional per-volume labels/coordinates (e.g. a conformation/state coordinate
         value), shape `(num_volumes,)`. Default is None.
+    warp : WarpConfig | None, optional
+        Interpolation settings of the warp onto the polar grid, recorded in the result
+        so every consumer warps polar images back the same way. Default is
+        ``WarpConfig()``.
     device : str | torch.device, optional
         Compute device ('cpu', 'cuda', 'cuda:0', etc.). Default is 'cpu'.
 
@@ -95,9 +98,6 @@ class PolarProjectionDecomposer:
     ----------
     result : DecompositionResult
         The decomposition result after calling :meth:`do_decomposition`.
-    reconstructor : ProjectionReconstructor
-        An object to perform reconstruction of decomposed features back into the input
-        projections.
     """
 
     def __init__(
@@ -108,6 +108,7 @@ class PolarProjectionDecomposer:
         coordinate_transform: CoordinateTransform,
         fourier_filters: np.ndarray | torch.Tensor | None = None,
         volume_labels: np.ndarray | torch.Tensor | None = None,
+        warp: WarpConfig | None = None,
         device: str | torch.device = "cpu",
     ) -> None:
         """Initialize the polar projection decomposer."""
@@ -118,6 +119,7 @@ class PolarProjectionDecomposer:
             )
 
         self.device = torch.device(device)
+        self.warp = warp or WarpConfig()
 
         # Convert inputs to tensors on the correct device
         if isinstance(volume, np.ndarray):
@@ -188,26 +190,6 @@ class PolarProjectionDecomposer:
                 "Decomposition not yet performed. Call do_decomposition() first."
             )
         return self._result
-
-    @property
-    def reconstructor(self) -> ProjectionReconstructor:
-        """Get a ProjectionReconstructor from the decomposition result.
-
-        Returns
-        -------
-        ProjectionReconstructor
-            A reconstructor initialized with the current decomposition result
-            and volume image shape.
-
-        Raises
-        ------
-        ValueError
-            If decomposition has not been performed yet.
-        """
-        return ProjectionReconstructor(
-            result=self.result,
-            device=self.device,
-        )
 
     @property
     def is_decomposed(self) -> bool:
@@ -296,7 +278,7 @@ class PolarProjectionDecomposer:
                 psi=torch.zeros_like(self.phi_values),
                 fourier_filters=self.fourier_filters,
                 transformer=transformer,
-                warp_polar_kwargs={"preserve_energy": True},
+                warp=self.warp,
                 projection_batch_size=projection_batch_size,
                 normalize_projections=normalize_projections,
                 k_max=k_max,
@@ -396,6 +378,7 @@ class PolarProjectionDecomposer:
             fourier_filters=fourier_filters_np,
             volume_labels=volume_labels_np,
             coordinate_transform=result_transform,
+            warp_config=self.warp,
         )
 
         return self._result

@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Self, cast
+from typing import Any, Self, cast
 
 import h5py
 import numpy as np
@@ -18,6 +18,7 @@ from panther_em.coordinates.transform_base import (
     GridTransform,
     reconstruct_transform,
 )
+from panther_em.coordinates.warp_config import WarpConfig
 
 
 def _read_paired_last_two_axes(
@@ -64,6 +65,7 @@ class DecompositionBase(ABC):
     fourier_filters: np.ndarray | None
     volume_labels: np.ndarray | None
     coordinate_transform: CoordinateTransform | None
+    warp_config: WarpConfig
 
     # Private state, initialised by the subclasses.
     _top_n_cache: dict[tuple[int, bool], np.ndarray]
@@ -194,6 +196,74 @@ class DecompositionBase(ABC):
                 "instance to result.coordinate_transform."
             )
         f.attrs["transform_config"] = json.dumps(self.coordinate_transform.to_dict())
+        f.attrs["warp_config"] = json.dumps(self.warp_config.to_dict())
+
+    @staticmethod
+    def _read_hdf5_metadata(f: h5py.File, path: Path) -> dict[str, Any]:
+        """Constructor keywords shared by both layouts, read from an open file."""
+        # h5py >= 3 returns str; older versions may return bytes
+        created_at = f.attrs["created_at"]
+        if isinstance(created_at, bytes):
+            created_at = created_at.decode("utf-8")
+
+        if "transform_config" not in f.attrs:
+            raise KeyError(f"The file '{path}' has no 'transform_config' attribute.")
+        transform_json = f.attrs["transform_config"]
+        if isinstance(transform_json, bytes):
+            transform_json = transform_json.decode("utf-8")
+        transform_params = json.loads(transform_json)
+
+        coordinate_transform: CoordinateTransform
+        if transform_params.get("transform_name") == "grid":
+            coordinate_transform = GridTransform.from_arrays(
+                transform_coords=f["transform/transform_coords"][()],
+                cartesian_coords=f["transform/cartesian_coords"][()],
+                jacobian=(
+                    f["transform/jacobian"][()] if "transform/jacobian" in f else None
+                ),
+                polar_shape=(
+                    int(transform_params["polar_shape"][0]),
+                    int(transform_params["polar_shape"][1]),
+                ),
+                cartesian_shape=(
+                    int(transform_params["cartesian_shape"][0]),
+                    int(transform_params["cartesian_shape"][1]),
+                ),
+                source_params=transform_params.get("source_params"),
+                has_periodic_axis=bool(transform_params.get("has_periodic_axis", True)),
+                periodic_axis=int(transform_params.get("periodic_axis", 0)),
+            )
+        else:
+            coordinate_transform = reconstruct_transform(transform_params)
+
+        warp_config = WarpConfig()
+        if "warp_config" in f.attrs:
+            warp_json = f.attrs["warp_config"]
+            if isinstance(warp_json, bytes):
+                warp_json = warp_json.decode("utf-8")
+            warp_config = WarpConfig.from_dict(json.loads(warp_json))
+
+        def optional(name: str) -> np.ndarray | None:
+            return f[name][()] if name in f else None
+
+        return {
+            "k_max": int(f.attrs["k_max"]),
+            "eig_max": int(f.attrs["eig_max"]),
+            "is_complex_projection": bool(f.attrs["is_complex_projection"]),
+            # default 1 for files saved before the multi-volume axis was introduced
+            "num_volumes": int(f.attrs.get("num_volumes", 1)),
+            "num_fourier_filters": int(f.attrs["num_fourier_filters"]),
+            "num_orientations": int(f.attrs["num_orientations"]),
+            "num_angular_components": int(f.attrs["num_angular_components"]),
+            "num_radial_components": int(f.attrs["num_radial_components"]),
+            "created_at": created_at,
+            "phi_values": optional("phi_values"),
+            "theta_values": optional("theta_values"),
+            "fourier_filters": optional("fourier_filters"),
+            "volume_labels": optional("volume_labels"),
+            "coordinate_transform": coordinate_transform,
+            "warp_config": warp_config,
+        }
 
     def _write_hdf5_optional_arrays(self, f: h5py.File) -> None:
         """Write optional orientation angles and Fourier filters if present."""
@@ -428,6 +498,12 @@ class DecompositionResult(DecompositionBase):
     volume_labels : np.ndarray | None
         Optional per-volume labels/coordinates (e.g. a conformation/state
         coordinate value), shape ``(num_volumes,)``. ``None`` if not recorded.
+    coordinate_transform : CoordinateTransform | None
+        The polar transform the projections were decomposed on.
+    warp_config : WarpConfig
+        Interpolation settings of the polar <-> Cartesian warp: the decomposer warped
+        projections onto the polar grid with them, and every consumer warps polar
+        images back with them.
     """
 
     # Core SVD components
@@ -464,6 +540,9 @@ class DecompositionResult(DecompositionBase):
     # When present, DecompositionResult.save() embeds the transform's geometric
     # parameters so the file is self-contained for inference.
     coordinate_transform: CoordinateTransform | None = field(default=None, repr=False)
+
+    # Interpolation settings of the polar <-> Cartesian warp (decomposer and consumers)
+    warp_config: WarpConfig = field(default_factory=WarpConfig)
 
     def __post_init__(self) -> None:
         """Validate shapes after initialization."""
@@ -619,6 +698,7 @@ class DecompositionResult(DecompositionBase):
             num_angular_components=self.num_angular_components,
             num_radial_components=self.num_radial_components,
             coordinate_transform=self.coordinate_transform,
+            warp_config=self.warp_config,
             created_at=self.created_at,
             phi_values=self.phi_values,
             theta_values=self.theta_values,
@@ -641,70 +721,7 @@ class DecompositionResult(DecompositionBase):
         """
         f = h5py.File(path, "r")
         try:
-            k_max = int(f.attrs["k_max"])
-            eig_max = int(f.attrs["eig_max"])
-            is_complex = bool(f.attrs["is_complex_projection"])
-            # .get() with a default of 1 for backward compatibility with files
-            # saved before the multi-volume axis was introduced.
-            num_vol = int(f.attrs.get("num_volumes", 1))
-            num_ff = int(f.attrs["num_fourier_filters"])
-            num_or = int(f.attrs["num_orientations"])
-            num_ang = int(f.attrs["num_angular_components"])
-            num_r = int(f.attrs["num_radial_components"])
-
-            # h5py >= 3 returns str; older versions may return bytes
-            created_at = f.attrs["created_at"]
-            if isinstance(created_at, bytes):
-                created_at = created_at.decode("utf-8")
-
-            phi_values = f["phi_values"][()] if "phi_values" in f else None
-            theta_values = f["theta_values"][()] if "theta_values" in f else None
-            fourier_filters = (
-                f["fourier_filters"][()] if "fourier_filters" in f else None
-            )
-            volume_labels = f["volume_labels"][()] if "volume_labels" in f else None
-
-            # Load coordinate transform — required; raise if absent or unreadable.
-            if "transform_config" not in f.attrs:
-                raise KeyError(
-                    f"The file '{path}' has no 'transform_config' attribute. "
-                )
-
-            transform_json = f.attrs["transform_config"]
-            if isinstance(transform_json, bytes):
-                transform_json = transform_json.decode("utf-8")
-            transform_params = json.loads(transform_json)
-            coordinate_transform: CoordinateTransform
-
-            if transform_params.get("transform_name") == "grid":
-                transform_coords = f["transform/transform_coords"][()]
-                cartesian_coords = f["transform/cartesian_coords"][()]
-                jacobian = (
-                    f["transform/jacobian"][()] if "transform/jacobian" in f else None
-                )
-                polar_shape = (
-                    int(transform_params["polar_shape"][0]),
-                    int(transform_params["polar_shape"][1]),
-                )
-                cartesian_shape = (
-                    int(transform_params["cartesian_shape"][0]),
-                    int(transform_params["cartesian_shape"][1]),
-                )
-                coordinate_transform = GridTransform.from_arrays(
-                    transform_coords=transform_coords,
-                    cartesian_coords=cartesian_coords,
-                    jacobian=jacobian,
-                    polar_shape=polar_shape,
-                    cartesian_shape=cartesian_shape,
-                    source_params=transform_params.get("source_params"),
-                    has_periodic_axis=bool(
-                        transform_params.get("has_periodic_axis", True)
-                    ),
-                    periodic_axis=int(transform_params.get("periodic_axis", 0)),
-                )
-            else:
-                coordinate_transform = reconstruct_transform(transform_params)
-
+            metadata = cls._read_hdf5_metadata(f, path)
             U: np.ndarray | h5py.Dataset = f["U"] if mmap else f["U"][()]
             S = f["S"][()]
             Vh = f["Vh"][()]
@@ -714,25 +731,7 @@ class DecompositionResult(DecompositionBase):
             if U.ndim == 4:
                 U = U[np.newaxis, ...]
 
-            result = cls(
-                U=U,
-                S=S,
-                Vh=Vh,
-                k_max=k_max,
-                eig_max=eig_max,
-                is_complex_projection=is_complex,
-                num_volumes=num_vol,
-                num_fourier_filters=num_ff,
-                num_orientations=num_or,
-                num_angular_components=num_ang,
-                num_radial_components=num_r,
-                created_at=created_at,
-                phi_values=phi_values,
-                theta_values=theta_values,
-                fourier_filters=fourier_filters,
-                volume_labels=volume_labels,
-                coordinate_transform=coordinate_transform,
-            )
+            result = cls(U=U, S=S, Vh=Vh, **metadata)
         except Exception:
             f.close()
             raise
@@ -905,6 +904,7 @@ class SparseDecompositionResult(DecompositionBase):
         num_radial_components: int,
         num_volumes: int = 1,
         coordinate_transform: CoordinateTransform | None = None,
+        warp_config: WarpConfig | None = None,
         created_at: str | None = None,
         phi_values: np.ndarray | None = None,
         theta_values: np.ndarray | None = None,
@@ -943,6 +943,8 @@ class SparseDecompositionResult(DecompositionBase):
             Number of volumes used in decomposition. Default is 1.
         coordinate_transform : CoordinateTransform | None, optional
             Coordinate transform embedded at decomposition time.
+        warp_config : WarpConfig | None, optional
+            Interpolation settings of the warp; defaults to ``WarpConfig()``.
         created_at : str | None, optional
             ISO timestamp; defaults to now if None.
         phi_values : np.ndarray | None, optional
@@ -983,6 +985,7 @@ class SparseDecompositionResult(DecompositionBase):
         obj.num_angular_components = num_angular_components
         obj.num_radial_components = num_radial_components
         obj.coordinate_transform = coordinate_transform
+        obj.warp_config = warp_config or WarpConfig()
         obj.created_at = created_at or datetime.now().isoformat()
         obj.phi_values = phi_values
         obj.theta_values = theta_values
@@ -1057,6 +1060,7 @@ class SparseDecompositionResult(DecompositionBase):
             fourier_filters=self.fourier_filters,
             volume_labels=self.volume_labels,
             coordinate_transform=self.coordinate_transform,
+            warp_config=self.warp_config,
         )
 
     def to_sparse(self, n: int) -> "SparseDecompositionResult":
@@ -1109,6 +1113,7 @@ class SparseDecompositionResult(DecompositionBase):
             num_angular_components=self.num_angular_components,
             num_radial_components=self.num_radial_components,
             coordinate_transform=self.coordinate_transform,
+            warp_config=self.warp_config,
             created_at=self.created_at,
             phi_values=self.phi_values,
             theta_values=self.theta_values,
@@ -1283,67 +1288,7 @@ class SparseDecompositionResult(DecompositionBase):
         """Load a sparse result written by :meth:`save` (called by :meth:`load`)."""
         f = h5py.File(path, "r")
         try:
-            k_max = int(f.attrs["k_max"])
-            eig_max = int(f.attrs["eig_max"])
-            is_complex = bool(f.attrs["is_complex_projection"])
-            # .get() with a default of 1 for backward compatibility with files
-            # saved before the multi-volume axis was introduced.
-            num_vol = int(f.attrs.get("num_volumes", 1))
-            num_ff = int(f.attrs["num_fourier_filters"])
-            num_or = int(f.attrs["num_orientations"])
-            num_ang = int(f.attrs["num_angular_components"])
-            num_r = int(f.attrs["num_radial_components"])
-
-            created_at = f.attrs["created_at"]
-            if isinstance(created_at, bytes):
-                created_at = created_at.decode("utf-8")
-
-            phi_values = f["phi_values"][()] if "phi_values" in f else None
-            theta_values = f["theta_values"][()] if "theta_values" in f else None
-            fourier_filters = (
-                f["fourier_filters"][()] if "fourier_filters" in f else None
-            )
-            volume_labels = f["volume_labels"][()] if "volume_labels" in f else None
-
-            if "transform_config" not in f.attrs:
-                raise KeyError(
-                    f"The file '{path}' has no 'transform_config' attribute."
-                )
-
-            transform_json = f.attrs["transform_config"]
-            if isinstance(transform_json, bytes):
-                transform_json = transform_json.decode("utf-8")
-            transform_params = json.loads(transform_json)
-
-            if transform_params.get("transform_name") == "grid":
-                transform_coords = f["transform/transform_coords"][()]
-                cartesian_coords = f["transform/cartesian_coords"][()]
-                jacobian = (
-                    f["transform/jacobian"][()] if "transform/jacobian" in f else None
-                )
-                polar_shape = (
-                    int(transform_params["polar_shape"][0]),
-                    int(transform_params["polar_shape"][1]),
-                )
-                cartesian_shape = (
-                    int(transform_params["cartesian_shape"][0]),
-                    int(transform_params["cartesian_shape"][1]),
-                )
-                coordinate_transform: CoordinateTransform = GridTransform.from_arrays(
-                    transform_coords=transform_coords,
-                    cartesian_coords=cartesian_coords,
-                    jacobian=jacobian,
-                    polar_shape=polar_shape,
-                    cartesian_shape=cartesian_shape,
-                    source_params=transform_params.get("source_params"),
-                    has_periodic_axis=bool(
-                        transform_params.get("has_periodic_axis", True)
-                    ),
-                    periodic_axis=int(transform_params.get("periodic_axis", 0)),
-                )
-            else:
-                coordinate_transform = reconstruct_transform(transform_params)
-
+            metadata = cls._read_hdf5_metadata(f, path)
             selected_indices = f["selected_indices"][()]
             U_data: np.ndarray | h5py.Dataset = f["U"] if mmap else f["U"][()]
             S_data = f["S"][()]
@@ -1359,20 +1304,7 @@ class SparseDecompositionResult(DecompositionBase):
                 S_data=S_data,
                 Vh_data=Vh_data,
                 selected_indices=selected_indices,
-                k_max=k_max,
-                eig_max=eig_max,
-                is_complex_projection=is_complex,
-                num_fourier_filters=num_ff,
-                num_orientations=num_or,
-                num_angular_components=num_ang,
-                num_radial_components=num_r,
-                num_volumes=num_vol,
-                coordinate_transform=coordinate_transform,
-                created_at=created_at,
-                phi_values=phi_values,
-                theta_values=theta_values,
-                fourier_filters=fourier_filters,
-                volume_labels=volume_labels,
+                **metadata,
                 _h5_file=f if mmap else None,
             )
         except Exception as e:

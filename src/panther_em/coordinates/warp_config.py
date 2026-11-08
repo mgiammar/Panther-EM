@@ -32,9 +32,15 @@ class WarpConfig:
     preserve_energy: bool = True
     wrap_angular_axis: bool = True
 
-    def as_kwargs(self) -> dict[str, int | str | float | bool]:
+    def cartesian_kwargs(self) -> dict[str, Any]:
         """Keyword arguments of ``CoordinateTransform.to_cartesian``."""
         return self.to_dict()
+
+    def polar_kwargs(self) -> dict[str, Any]:
+        """Keyword arguments of ``CoordinateTransform.to_transform_space``."""
+        values = self.to_dict()
+        del values["wrap_angular_axis"]
+        return values
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-serializable fields."""

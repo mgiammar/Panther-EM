@@ -39,7 +39,7 @@ from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
 from panther_em.coordinates import OffsetPolarTransform
 from panther_em.decomposition import PolarProjectionDecomposer
-from panther_em.decomposition.pipeline_projections import (
+from panther_em.decomposition.projections import (
     generate_projection_batch,
     precompute_volume_dft,
 )

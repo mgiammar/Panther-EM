@@ -36,6 +36,7 @@ from torch_fourier_slice.volume_utils import (
 )
 
 from panther_em.coordinates.transform_base import CoordinateTransform
+from panther_em.coordinates.warp_config import WarpConfig
 
 
 def precompute_volume_dft(
@@ -191,7 +192,7 @@ def process_batch(
     psi: torch.Tensor,
     fourier_filters: torch.Tensor,
     transformer: CoordinateTransform,
-    warp_polar_kwargs: dict,
+    warp: WarpConfig,
     fftfreq_max: float = 0.5,
     normalize_projections: bool = False,
 ) -> tuple[torch.Tensor, bool, int]:
@@ -213,8 +214,8 @@ def process_batch(
         shape is (f, h, w).
     transformer : CoordinateTransform
         Pre-initialized transformer for warping to polar coordinates.
-    warp_polar_kwargs : dict
-        Additional kwargs forwarded to ``transformer.to_transform_space``.
+    warp : WarpConfig
+        Interpolation settings of the warp onto the polar grid.
     fftfreq_max : float
         Maximum frequency in cycles per pixel for Fourier slicing. Default is 0.5.
     normalize_projections : bool
@@ -260,7 +261,7 @@ def process_batch(
 
     projections_polar = transformer.to_transform_space(
         projections_filtered_view,
-        **warp_polar_kwargs,
+        **warp.polar_kwargs(),
     )
 
     # NOTE: Pathing here for handling both real- and complex-valued projections
@@ -441,7 +442,7 @@ def do_pipelined_projection_and_transforms(
     psi: torch.Tensor,
     fourier_filters: torch.Tensor | None,
     transformer: CoordinateTransform,
-    warp_polar_kwargs: dict,
+    warp: WarpConfig,
     projection_batch_size: int = 128,
     pad_factor: float = 2.0,
     fftfreq_max: float = 0.5,
@@ -466,8 +467,8 @@ def do_pipelined_projection_and_transforms(
         Pre-initialised coordinate transform on the same device as ``volume``.
         Provides the polar-space geometry (``polar_shape``) and the
         ``to_transform_space`` warp method.
-    warp_polar_kwargs : dict
-        Additional kwargs forwarded to ``transformer.to_transform_space``.
+    warp : WarpConfig
+        Interpolation settings of the warp onto the polar grid.
     projection_batch_size : int
         Orientations per GPU batch. Default is 128.
     pad_factor : float
@@ -554,7 +555,7 @@ def do_pipelined_projection_and_transforms(
         psi=psi[:2],
         fourier_filters=fourier_filters,
         transformer=transformer,
-        warp_polar_kwargs=warp_polar_kwargs,
+        warp=warp,
         fftfreq_max=fftfreq_max,
         normalize_projections=normalize_projections,
     )
@@ -620,7 +621,7 @@ def do_pipelined_projection_and_transforms(
                 psi=psi[slice_],
                 fourier_filters=fourier_filters,
                 transformer=transformer,
-                warp_polar_kwargs=warp_polar_kwargs,
+                warp=warp,
                 fftfreq_max=fftfreq_max,
                 normalize_projections=normalize_projections,
             )

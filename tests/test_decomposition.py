@@ -15,7 +15,8 @@ import pytest
 import torch
 
 from panther_em.coordinates.offset_polar import OffsetPolarTransform
-from panther_em.decomposition.pipeline_projections import (
+from panther_em.coordinates.warp_config import WarpConfig
+from panther_em.decomposition.projections import (
     _compute_freq_crop,
     apply_fourier_filters,
     precompute_volume_dft,
@@ -615,6 +616,31 @@ class TestDecompositionResultIO:
         assert loaded.U.shape == (1, NUM_FF, NUM_OR, K_MAX, EIG_MAX)
         np.testing.assert_array_equal(loaded.U[0], result.U[0])
 
+    def test_warp_config_round_trips_dense_and_sparse(self, tmp_path: Path):
+        warp = WarpConfig(order=3, mode="nearest", preserve_energy=False)
+        result = _make_result(is_complex=False)
+        assert result.warp_config == WarpConfig()
+        result.warp_config = warp
+        result.save(tmp_path / "dense.h5")
+        assert DecompositionResult.load(tmp_path / "dense.h5").warp_config == warp
+
+        sparse = result.to_sparse(5)
+        assert sparse.warp_config == warp
+        assert sparse.to_dense().warp_config == warp
+        sparse.save(tmp_path / "sparse.h5")
+        assert DecompositionBase.load(tmp_path / "sparse.h5").warp_config == warp
+
+    def test_legacy_file_without_warp_config_loads_the_default(self, tmp_path: Path):
+        import h5py
+
+        result = _make_result(is_complex=False)
+        result.warp_config = WarpConfig(order=1)
+        path = tmp_path / "no_warp.h5"
+        result.save(path)
+        with h5py.File(path, "r+") as f:
+            del f.attrs["warp_config"]
+        assert DecompositionResult.load(path).warp_config == WarpConfig()
+
 
 # ===========================================================================
 # DecompositionResult — multi-volume shapes
@@ -738,3 +764,32 @@ class TestDenseAndSparseAreSiblings:
                 num_radial_components=sparse.num_radial_components,
                 num_volumes=sparse.num_volumes,
             )
+
+
+# ===========================================================================
+# PolarProjectionDecomposer — the recorded warp
+# ===========================================================================
+
+
+def test_decomposer_warps_with_and_records_its_warp_config():
+    from panther_em.decomposition import PolarProjectionDecomposer
+
+    rng = np.random.default_rng(0)
+    volume = rng.standard_normal((16, 16, 16)).astype(np.float32)
+    phi = np.array([0.0, 40.0, 80.0], dtype=np.float32)
+    theta = np.array([10.0, 30.0, 50.0], dtype=np.float32)
+    transform = OffsetPolarTransform.from_image(
+        image_shape=(16, 16), num_angle=16, num_radius=6
+    )
+
+    def run(warp):
+        return PolarProjectionDecomposer(
+            volume, phi, theta, coordinate_transform=transform, warp=warp
+        ).do_decomposition(eig_max=3)
+
+    default = run(None)
+    cubic = run(WarpConfig(order=3))
+    assert default.warp_config == WarpConfig()
+    assert cubic.warp_config == WarpConfig(order=3)
+    # the warp is applied, not only recorded
+    assert not np.allclose(default.S, cubic.S)

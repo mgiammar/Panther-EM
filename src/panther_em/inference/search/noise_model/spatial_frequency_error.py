@@ -21,7 +21,7 @@ from torch_fourier_filter.whitening import calculate_num_freq_bins
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
 from panther_em.coordinates.warp_config import WarpConfig
-from panther_em.decomposition.pipeline_projections import (
+from panther_em.decomposition.projections import (
     generate_projection_batch,
     precompute_volume_dft,
 )
