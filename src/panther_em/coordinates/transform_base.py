@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import warnings
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, cast, overload
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
 import torch
@@ -45,6 +45,9 @@ from panther_em.utils.warp_backends import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
     from typing import Literal
+
+ArrayT = TypeVar("ArrayT", np.ndarray, torch.Tensor)
+
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -196,22 +199,26 @@ def reconstruct_transform(
 
 def _map_images(warp: Callable[[Any], Any], image: Any) -> Any:
     """Apply a real 2-D ``warp`` to 2-D image, a batch ``(B, H, W)`` or complex data."""
-    device = detect_device(image)
+    is_tensor = isinstance(image, torch.Tensor)
 
     if image.ndim == 3:
         batch = [_map_images(warp, im) for im in image]
-        return np.stack(batch) if device == "numpy" else torch.stack(batch)
+        return torch.stack(batch) if is_tensor else np.stack(batch)
 
     if image.ndim != 2:
         raise ValueError(f"Image must be 2-D or 3-D (batched), got {image.ndim}D.")
 
-    is_complex = np.iscomplexobj(image) if device == "numpy" else image.is_complex()
+    if torch.is_complex(image) if is_tensor else np.iscomplexobj(image):
+        # independent real and imaginary channels
+        real, imag = _map_images(warp, image.real), _map_images(warp, image.imag)
+        return torch.complex(real, imag) if is_tensor else real + 1j * imag
 
-    if is_complex:  # independent real and imaginary channels
-        real, imag = warp(image.real), warp(image.imag)
-        return real + 1j * imag if device == "numpy" else torch.complex(real, imag)
+    if not is_tensor:
+        return warp(image)
 
-    return warp(image)
+    warped = warp(image if image.is_cuda else image.numpy())
+
+    return torch.as_tensor(warped, device=image.device)
 
 
 # ---------------------------------------------------------------------------
@@ -456,37 +463,15 @@ class CoordinateTransform(ABC):
     # Concrete warp methods
     # ------------------------------------------------------------------ #
 
-    @overload
     def to_transform_space(
         self,
-        image: np.ndarray,
-        preserve_energy: bool = ...,
-        order: int = ...,
-        mode: str = ...,
-        cval: float = ...,
-        **kwargs: Any,
-    ) -> np.ndarray: ...
-
-    @overload
-    def to_transform_space(
-        self,
-        image: torch.Tensor,
-        preserve_energy: bool = ...,
-        order: int = ...,
-        mode: str = ...,
-        cval: float = ...,
-        **kwargs: Any,
-    ) -> np.ndarray | torch.Tensor: ...  # CPU tensors are warped as numpy
-
-    def to_transform_space(
-        self,
-        image: np.ndarray | torch.Tensor,
+        image: ArrayT,
         preserve_energy: bool = True,
         order: int = 5,
         mode: str = "constant",
         cval: float = 0.0,
         **kwargs: Any,
-    ) -> np.ndarray | torch.Tensor:
+    ) -> ArrayT:
         """Warp a Cartesian image to this transform's coordinate space.
 
         Note
@@ -534,38 +519,12 @@ class CoordinateTransform(ABC):
 
             return warped
 
-        mapped: np.ndarray | torch.Tensor = _map_images(warp, image)
+        mapped: ArrayT = _map_images(warp, image)
         return mapped
 
-    @overload
     def to_cartesian(
         self,
-        image: np.ndarray,
-        preserve_energy: bool = ...,
-        wrap_angular_axis: bool = ...,
-        pad_radial_axis: bool = ...,
-        order: int = ...,
-        mode: str = ...,
-        cval: float = ...,
-        **kwargs: Any,
-    ) -> np.ndarray: ...
-
-    @overload
-    def to_cartesian(
-        self,
-        image: torch.Tensor,
-        preserve_energy: bool = ...,
-        wrap_angular_axis: bool = ...,
-        pad_radial_axis: bool = ...,
-        order: int = ...,
-        mode: str = ...,
-        cval: float = ...,
-        **kwargs: Any,
-    ) -> np.ndarray | torch.Tensor: ...  # CPU tensors are warped as numpy
-
-    def to_cartesian(
-        self,
-        image: np.ndarray | torch.Tensor,
+        image: ArrayT,
         preserve_energy: bool = True,
         wrap_angular_axis: bool = True,
         pad_radial_axis: bool = True,
@@ -573,7 +532,7 @@ class CoordinateTransform(ABC):
         mode: str = "constant",
         cval: float = 0.0,
         **kwargs: Any,
-    ) -> np.ndarray | torch.Tensor:
+    ) -> ArrayT:
         """Warp an image from this transform's space back to Cartesian.
 
         Parameters
@@ -633,7 +592,7 @@ class CoordinateTransform(ABC):
                 if device == "numpy":
                     image = np.pad(image, ((pad_size, pad_size), (0, 0)), mode="wrap")
                 else:
-                    image = cast("torch.Tensor", image).unsqueeze(0)
+                    image = torch.as_tensor(image).unsqueeze(0)
                     image = F.pad(image, (0, 0, pad_size, pad_size), mode="circular")
                     image = image.squeeze(0)
                 # Offset the angular coordinate to account for the padding rows
@@ -657,7 +616,7 @@ class CoordinateTransform(ABC):
                 warped = warped * (dc["cartesian"][1] <= outer_index)
             return warped
 
-        mapped: np.ndarray | torch.Tensor = _map_images(warp, image)
+        mapped: ArrayT = _map_images(warp, image)
         return mapped
 
 

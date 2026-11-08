@@ -118,7 +118,7 @@ class TemplateWarp:
         """The decomposition's polar coordinate transform."""
         return self.reconstructor.coordinate_transform
 
-    def _warp(self, polar: torch.Tensor) -> Any:
+    def _warp(self, polar: torch.Tensor) -> torch.Tensor:
         """``transform.to_cartesian`` of ``polar`` under :attr:`config`."""
         cfg = self.config
         return self.transform.to_cartesian(
@@ -169,8 +169,7 @@ class TemplateWarp:
         _, _, vh = recon.result.get_svd_tensors(indices, recon.device)  # (M, R)
         angular = recon.angular_phase_component(k, 0.0)  # (A,)
         polar = angular[None, :, None] * vh[:, None, :]  # (M, A, R) complex64
-        cart = self._warp(polar)
-        return torch.as_tensor(cart, device=self.device).to(torch.complex64)
+        return self._warp(polar).to(torch.complex64)
 
     # A polar kernel is the outer product of an angular phase vector a_k (A,) and a
     # radial SVD vector b_km (R,), the Jacobian correction depends on the radius only,
@@ -333,8 +332,7 @@ class TemplateWarp:
 
     def to_cartesian(self, polar: torch.Tensor) -> torch.Tensor:
         """``(B, n_angle, R)`` polar images -> ``(B, kH, kW)`` float32 Cartesian."""
-        cart = self._warp(polar)
-        return torch.as_tensor(cart, device=polar.device).to(torch.float32)
+        return self._warp(polar).to(torch.float32)
 
     @cached_property
     def support(self) -> torch.Tensor:
@@ -347,8 +345,7 @@ class TemplateWarp:
             mode=self.config.mode,
             cval=self.config.cval,
         )
-        support: torch.Tensor = torch.as_tensor(np.asarray(warped)) > 0.5
-        return support
+        return warped > 0.5
 
     def release(self) -> None:
         """Drop the adjoint and the separable build's device state."""

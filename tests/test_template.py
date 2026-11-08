@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 from conftest import count_kernel_builds, requires_cuda
@@ -84,6 +85,15 @@ def test_spatial_respects_the_kernel_config(synthetic_result):
         linear_warp.reconstructor, cells, order=1, preserve_energy=False
     )
     torch.testing.assert_close(linear, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_construct_cartesian_feature_follows_return_torch_on_cpu(warp):
+    recon = warp.reconstructor
+    as_tensor = recon.construct_cartesian_feature(1, 2, return_torch=True)
+    as_array = recon.construct_cartesian_feature(1, 2, return_torch=False)
+    assert isinstance(as_tensor, torch.Tensor)
+    assert isinstance(as_array, np.ndarray)
+    np.testing.assert_array_equal(as_tensor.numpy(), as_array)
 
 
 def test_generic_warp_and_support(warp):

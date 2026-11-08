@@ -205,6 +205,7 @@ class ProjectionReconstructor:
         polar_feature = self.construct_polar_feature(
             k_idx, eig_idx, in_plane_rotation, return_torch=True
         )
+        assert isinstance(polar_feature, torch.Tensor)  # return_torch=True
 
         cartesian_feature = self._coordinate_transform.to_cartesian(
             polar_feature,
@@ -347,11 +348,7 @@ class ProjectionReconstructor:
 
         if return_torch:
             return cartesian_projection
-        return (
-            cartesian_projection.cpu().numpy()
-            if isinstance(cartesian_projection, torch.Tensor)
-            else cartesian_projection
-        )
+        return cartesian_projection.cpu().numpy()
 
     def reconstruct_projection_batch(
         self,
@@ -482,8 +479,4 @@ class ProjectionReconstructor:
 
         if return_torch:
             return cartesian_projections
-        return (
-            cartesian_projections.cpu().numpy()
-            if isinstance(cartesian_projections, torch.Tensor)
-            else cartesian_projections
-        )
+        return cartesian_projections.cpu().numpy()
