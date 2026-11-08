@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
-from scipy.special import ndtri  # type: ignore[import-untyped]
+from scipy.special import ndtri
 
 from panther_em.inference.search.noise_model.spatial_frequency_error import (
     TABLE_NAMES,

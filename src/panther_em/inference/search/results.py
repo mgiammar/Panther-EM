@@ -14,7 +14,7 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-import h5py  # type: ignore[import-untyped]
+import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F

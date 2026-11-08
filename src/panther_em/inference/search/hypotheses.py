@@ -376,7 +376,7 @@ def healpix_orientations(nside: int) -> tuple[np.ndarray, np.ndarray]:
     Float32, in the argument order of ``PolarProjectionDecomposer``; orientation
     index == NESTED pixel id, which is what :func:`healpix_level_ids` relies on.
     """
-    from torch_so3.hierarchical_s2_grid import (  # type: ignore[import-untyped]
+    from torch_so3.hierarchical_s2_grid import (
         HierarchicalS2Grid,
     )
 

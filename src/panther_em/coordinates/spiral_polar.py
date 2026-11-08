@@ -127,7 +127,7 @@ def _spiral_geometry(
     return dt, twist_rate
 
 
-def _radius_from_t(t: np.ndarray, max_radius: float, c: float) -> np.ndarray:
+def _radius_from_t(t: np.ndarray | float, max_radius: float, c: float) -> np.ndarray:
     """Physical radius ``r(t) = max_radius * (sqrt(c**2 + 2t) - c)``."""
     return max_radius * (np.sqrt(c**2 + 2 * t) - c)
 
@@ -425,7 +425,7 @@ def jacobian_correction_spiral_polar(
 RADIAL_PAD = 10
 
 
-def _lagrange_weights(nodes: np.ndarray, x: float) -> np.ndarray:
+def _lagrange_weights(nodes: np.ndarray, x: np.ndarray | float) -> np.ndarray:
     """Weights of the Lagrange polynomial through ``nodes``, evaluated at ``x``."""
     weights = np.ones(len(nodes))
     for j, node in enumerate(nodes):
@@ -820,7 +820,7 @@ class SpiralPolarTransform(CoordinateTransform):
             The padded image and the number of rows prepended.
         """
         is_numpy = isinstance(image, np.ndarray)
-        f = torch.from_numpy(image) if is_numpy else image
+        f = torch.from_numpy(image) if isinstance(image, np.ndarray) else image
         untwist, nodes, weights, phases = self._continuation_tensors(f.device)
 
         rings = torch.fft.rfft(f[:, : untwist.shape[1]].double(), dim=0) * untwist

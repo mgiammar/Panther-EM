@@ -192,8 +192,8 @@ class TemplateWarp:
         if self.device.type != "cuda" or self.config.mode != "constant":
             return None
         try:
-            import cupy  # type: ignore[import-untyped]
-            import cupyx.scipy.ndimage as ndi  # type: ignore[import-untyped]
+            import cupy
+            import cupyx.scipy.ndimage as ndi
         except ImportError:
             return None
         dc = tf.device_coords(self.device)

@@ -8,7 +8,7 @@ from torch_fourier_filter.whitening import (
     calculate_num_freq_bins,
     power_spectral_density,
 )
-from torch_grid_utils.fftfreq_grid import fftfreq_grid  # type: ignore[import-untyped]
+from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
 CORNER_FREQ = 2**0.5 / 2  # the 2-D Fourier corner, the end of the frequency axis
 

@@ -117,7 +117,7 @@ def project_from_precomputed_dft(
     projections : torch.Tensor
         `(..., d, d)` real-space projections.
     """
-    projections = extract_central_slices_rfft_3d(
+    projections: torch.Tensor = extract_central_slices_rfft_3d(
         volume_rfft=dft,
         rotation_matrices=rotation_matrices,
         fftfreq_max=fftfreq_max,
@@ -174,11 +174,12 @@ def apply_fourier_filters(
     if _is_complex:
         projections_fft = torch.fft.fft2(projections)
         projections_fft = projections_fft[None, ...] * fourier_filters[:, None, :, :]
-        return torch.fft.ifft2(projections_fft)
+        filtered: torch.Tensor = torch.fft.ifft2(projections_fft)
     else:
         projections_fft = torch.fft.rfft2(projections)
         projections_fft = projections_fft[None, ...] * fourier_filters[:, None, :, :]
-        return torch.fft.irfft2(projections_fft)
+        filtered = torch.fft.irfft2(projections_fft)
+    return filtered
 
 
 def process_batch(
@@ -584,6 +585,7 @@ def do_pipelined_projection_and_transforms(
         output_tensor = torch.empty(buffer_shape, dtype=torch.complex64, device="cpu")
         buffer = _HostStagingBuffer(output_tensor, block_index_min, block_index_max)
     else:  # "mmap"
+        assert mmap_path is not None  # validated at the top of the function
         _mm = np.memmap(mmap_path, dtype=np.complex64, mode="w+", shape=buffer_shape)
         output_tensor = torch.from_numpy(_mm)
         buffer = _HostStagingBuffer(output_tensor, block_index_min, block_index_max)

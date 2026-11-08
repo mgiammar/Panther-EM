@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
-import h5py  # type: ignore[import-untyped]
+import h5py
 import numpy as np
 import torch
 from torch_fourier_filter.bandpass import low_pass_filter

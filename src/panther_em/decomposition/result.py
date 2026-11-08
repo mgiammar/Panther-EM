@@ -11,6 +11,8 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 
 import panther_em.coordinates  # noqa: F401  # registers built-in transforms
 from panther_em.coordinates.transform_base import (
@@ -41,7 +43,7 @@ def _read_fancy_last_axis(
     if isinstance(source, h5py.Dataset):
         idx = np.asarray(idx)
         unique_idx, inverse = np.unique(idx, return_inverse=True)
-        data = source[..., unique_idx]
+        data: np.ndarray = source[..., unique_idx]
         return data[..., inverse]
     return source[..., idx]
 
@@ -248,9 +250,11 @@ class DecompositionResult:
             self._h5_file = None
 
     def __enter__(self) -> "DecompositionResult":
+        """Enter the context manager and return this result."""
         return self
 
     def __exit__(self, *exc_info: object) -> None:
+        """Exit the context manager, closing any open HDF5 file handle."""
         self.close()
 
     def __repr__(self) -> str:
@@ -781,8 +785,8 @@ class DecompositionResult:
     # ------------------------------------------------------------------
 
     def scree_plot(
-        self, k_idx: int | None = None, **kwargs: dict[str, Any]
-    ) -> tuple[plt.Figure, plt.Axes]:
+        self, k_idx: int | None = None, **kwargs: Any
+    ) -> tuple[Figure, Axes]:
         """Helper function for plotting sorted singular values vs index.
 
         Parameters
@@ -823,8 +827,8 @@ class DecompositionResult:
         self,
         k_idx: int | None = None,
         inverted: bool = True,
-        **kwargs: dict[str, Any],
-    ) -> tuple[plt.Figure, plt.Axes]:
+        **kwargs: Any,
+    ) -> tuple[Figure, Axes]:
         """Helper function for plotting cumulative variance explained.
 
         Parameters

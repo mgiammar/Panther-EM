@@ -15,11 +15,11 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
-import h5py  # type: ignore[import-untyped]
+import h5py
 import numpy as np
 import torch
 from torch_fourier_filter.whitening import calculate_num_freq_bins
-from torch_grid_utils.fftfreq_grid import fftfreq_grid  # type: ignore[import-untyped]
+from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
 from panther_em.decomposition.pipeline_projections import (
     generate_projection_batch,

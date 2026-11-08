@@ -15,6 +15,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 from skimage.transform import warp as skimage_warp
+from torch.utils.dlpack import from_dlpack
 
 # Check for CUDA availability
 CUDA_AVAILABLE = torch.cuda.is_available()
@@ -28,7 +29,7 @@ try:
 except ImportError:
     CUCIM_AVAILABLE = False
     cp = None
-    cucim_warp = None
+    cucim_warp = None  # type: ignore[assignment]
 
 # GPU support requires both CUDA and cuCIM
 GPU_TRANSFORM_AVAILABLE = CUDA_AVAILABLE and CUCIM_AVAILABLE
@@ -76,7 +77,7 @@ def warp_numpy(
     np.ndarray
         Warped image.
     """
-    return skimage_warp(
+    warped: np.ndarray = skimage_warp(  # type: ignore[no-untyped-call]
         image,
         coords,
         output_shape=output_shape,
@@ -86,6 +87,7 @@ def warp_numpy(
         clip=clip,
         **kwargs,
     )
+    return warped
 
 
 # ============================================================================
@@ -188,7 +190,7 @@ def warp_torch_cuda(
         coords_cp = cp.from_dlpack(coords.detach())
 
         # Perform warp on GPU using cuCIM
-        warped_cp = cucim_warp(
+        warped_cp = cucim_warp(  # type: ignore[no-untyped-call]
             image_cp,
             coords_cp,
             output_shape=output_shape,
@@ -200,7 +202,7 @@ def warp_torch_cuda(
         )
 
     # Convert back to PyTorch tensor (zero-copy via DLPack)
-    warped_torch = torch.from_dlpack(warped_cp)
+    warped_torch = from_dlpack(warped_cp)
     if out_dtype is not None:
         warped_torch = warped_torch.to(out_dtype)
 

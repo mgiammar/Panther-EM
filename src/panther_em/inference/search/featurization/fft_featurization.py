@@ -11,7 +11,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING
 
 import torch
-from scipy.fft import next_fast_len  # type: ignore[import-untyped]
+from scipy.fft import next_fast_len
 
 from panther_em.inference.search.featurization.base import (
     BaseImageFeaturization,

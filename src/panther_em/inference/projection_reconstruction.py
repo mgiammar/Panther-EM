@@ -88,7 +88,8 @@ class ProjectionReconstructor:
         base_angles = 2.0 * np.pi * k_idx * n / N
         angles = base_angles + k_idx * phase_shift_rad
 
-        return torch.exp(1j * angles) / np.sqrt(N)
+        component: torch.Tensor = torch.exp(1j * angles) / np.sqrt(N)
+        return component
 
     def _get_angular_phase_components_batch(
         self, k_idx: int, phase_shifts: torch.Tensor
@@ -115,7 +116,8 @@ class ProjectionReconstructor:
         base_angles = 2.0 * np.pi * k_idx * n / N
         angles = base_angles[None, :] + k_idx * phase_shifts_rad[:, None]
 
-        return torch.exp(1j * angles) / np.sqrt(N)
+        components: torch.Tensor = torch.exp(1j * angles) / np.sqrt(N)
+        return components
 
     def construct_polar_feature(
         self,

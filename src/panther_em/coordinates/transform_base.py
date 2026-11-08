@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import warnings
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -44,6 +44,7 @@ from panther_em.utils.warp_backends import (
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from typing import Literal
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -355,12 +356,12 @@ class CoordinateTransform(ABC):
     # Device-dispatch coord cache
     # ------------------------------------------------------------------ #
 
-    def device_coords(self, device: str | torch.device) -> dict[str, Any]:
+    def device_coords(self, device: Literal["numpy"] | torch.device) -> dict[str, Any]:
         """Return device-appropriate coord arrays, caching CUDA copies.
 
         Parameters
         ----------
-        device : str | torch.device
+        device : {"numpy"} or torch.device
             ``"numpy"`` for CPU or a ``torch.device("cuda:N")`` for GPU.
 
         Returns
@@ -380,7 +381,9 @@ class CoordinateTransform(ABC):
             }
         return self._device_cache[key]
 
-    def _get_device_coords(self, device: str | torch.device) -> dict[str, Any]:
+    def _get_device_coords(
+        self, device: Literal["numpy"] | torch.device
+    ) -> dict[str, Any]:
         """Backwards-compatible alias of :meth:`device_coords`."""
         return self.device_coords(device)
 
@@ -484,7 +487,9 @@ class CoordinateTransform(ABC):
                 )
                 for im in image
             ]
-            return np.stack(results) if device == "numpy" else torch.stack(results)
+            if device == "numpy":
+                return np.stack(results)
+            return torch.stack(cast("list[torch.Tensor]", results))
 
         if image.ndim != 2:
             raise ValueError(f"Image must be 2-D or 3-D (batched), got {image.ndim}D.")
@@ -514,12 +519,14 @@ class CoordinateTransform(ABC):
             )
             if device == "numpy":
                 return real_part + 1j * imag_part
-            return torch.complex(real_part, imag_part)
+            return torch.complex(
+                cast("torch.Tensor", real_part), cast("torch.Tensor", imag_part)
+            )
 
         # --- base case: single real 2-D image ---
         dc = self.device_coords(device)
         warp_fn = get_warp_function(device)
-        warped = warp_fn(
+        warped: np.ndarray | torch.Tensor = warp_fn(
             image,
             dc["transform"],
             output_shape=self.polar_shape,
@@ -591,7 +598,9 @@ class CoordinateTransform(ABC):
                 )
                 for im in image
             ]
-            return np.stack(results) if device == "numpy" else torch.stack(results)
+            if device == "numpy":
+                return np.stack(results)
+            return torch.stack(cast("list[torch.Tensor]", results))
 
         if image.ndim != 2:
             raise ValueError(f"Image must be 2-D or 3-D (batched), got {image.ndim}D.")
@@ -625,7 +634,9 @@ class CoordinateTransform(ABC):
             )
             if device == "numpy":
                 return real_part + 1j * imag_part
-            return torch.complex(real_part, imag_part)
+            return torch.complex(
+                cast("torch.Tensor", real_part), cast("torch.Tensor", imag_part)
+            )
 
         # --- base case: single real 2-D image ---
         dc = self.device_coords(device)
@@ -655,7 +666,7 @@ class CoordinateTransform(ABC):
             if device == "numpy":
                 image = np.pad(image, ((pad_size, pad_size), (0, 0)), mode="wrap")
             else:
-                image = image.unsqueeze(0)
+                image = cast("torch.Tensor", image).unsqueeze(0)
                 image = F.pad(image, (0, 0, pad_size, pad_size), mode="circular")
                 image = image.squeeze(0)
             # Offset the angular coordinate to account for the padding rows
@@ -663,7 +674,7 @@ class CoordinateTransform(ABC):
             coords[0, ...] += pad_size
 
         warp_fn = get_warp_function(device)
-        warped = warp_fn(
+        warped: np.ndarray | torch.Tensor = warp_fn(
             image,
             coords,
             output_shape=self.cartesian_shape,
