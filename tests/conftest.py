@@ -31,7 +31,7 @@ def make_synthetic_result(
     rng = np.random.default_rng(seed)
     if s2_nside is not None:
         n_orientations = 12 * s2_nside * s2_nside
-    shape_u = (n_filters, n_orientations, k_max, eig_max)
+    shape_u = (1, n_filters, n_orientations, k_max, eig_max)  # leading volume axis
     U = (rng.standard_normal(shape_u) + 1j * rng.standard_normal(shape_u)).astype(
         np.complex64
     )

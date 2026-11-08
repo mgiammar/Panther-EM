@@ -120,12 +120,12 @@ def coloured_noise(shape: tuple[int, int], scale: float, seed: int) -> torch.Ten
 
 def particle_image(volume: np.ndarray, shape: tuple[int, int]) -> torch.Tensor:
     """The particle's projection, CTF-filtered on its plane, placed in a blank image."""
-    dft, mean_scaled, pad = precompute_volume_dft(torch.as_tensor(volume))
+    dft, edge_value_scaled, pad = precompute_volume_dft(torch.as_tensor(volume))
     phi, theta = orientations()
     o = PARTICLE["orientation"]
     angle = lambda a: torch.tensor([float(a[o])])  # noqa: E731
     proj = generate_projection_batch(
-        dft, mean_scaled, pad, angle(phi), angle(theta), torch.zeros(1)
+        dft, edge_value_scaled, pad, angle(phi), angle(theta), torch.zeros(1)
     )[0].to(torch.float32)
     proj = (proj - proj.mean()) / proj.std()
     canvas = torch.zeros(shape)

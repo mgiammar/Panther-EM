@@ -460,6 +460,11 @@ def compute_error_tables(
         Dtype of the padded spectra and the binning. Default float32.
     """
     result = template.result.to_dense()
+    if result.num_volumes != 1:
+        raise NotImplementedError(
+            f"the search supports one volume per decomposition, got "
+            f"{result.num_volumes}"
+        )
     if result.fourier_filters is None:
         raise ValueError(
             "the decomposition carries no Fourier filter; build it under "
@@ -495,13 +500,14 @@ def compute_error_tables(
     s = torch.as_tensor(np.asarray(result.S)[:k_stop, :e_stop]) * mask
     vh = torch.as_tensor(np.asarray(result.Vh)[:k_stop, :e_stop])
     weighted_vh = (s[..., None] * vh).to(device, torch.complex64)
-    u = torch.as_tensor(np.asarray(result.U)).reshape(n_rows, *result.U.shape[2:])
+    # U is (num_volumes = 1, FF, O, K, E): drop the volume axis, flatten (FF, O)
+    u = torch.as_tensor(np.asarray(result.U)).reshape(n_rows, *result.U.shape[3:])
     u = u[:, :k_stop, :e_stop]
 
     support = warp.support.clone()
 
     # volume projections, the exact template's filter and the signal's
-    dft, mean_scaled, pad_width = precompute_volume_dft(vol.to(device))
+    dft, edge_value_scaled, pad_width = precompute_volume_dft(vol.to(device))
     phi = torch.as_tensor(result.phi_values, dtype=torch.float32, device=device)
     theta = torch.as_tensor(result.theta_values, dtype=torch.float32, device=device)
     template_filter = whitening.template_filter((h, w))
@@ -525,7 +531,7 @@ def compute_error_tables(
 
         psi = torch.zeros_like(phi[rows])
         projections = generate_projection_batch(
-            dft, mean_scaled, pad_width, phi[rows], theta[rows], psi
+            dft, edge_value_scaled, pad_width, phi[rows], theta[rows], psi
         )
         exact, signal = exact_and_signal(
             projections, exact_filter, signal_filter, support.to(device)

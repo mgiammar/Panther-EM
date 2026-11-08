@@ -115,7 +115,8 @@ def compute_feature_stack(image, kernels):
 def _dense_reference(template, image, rects, n_psi, planes=None, filters=None):
     """Per-pixel statistics from the dense correlogram (kernels, FFT, einsum, irfft)."""
     recon = template.warp.reconstructor
-    us = torch.as_tensor(recon.result.U) * torch.as_tensor(recon.result.S)[None, None]
+    u0 = torch.as_tensor(recon.result.U[0])  # drop the singleton volume axis
+    us = u0 * torch.as_tensor(recon.result.S)[None, None]
     us = us.reshape(-1, *us.shape[2:]).to(torch.complex64)  # (N, K, E)
     k_stop = max(k0 + ke for k0, _, ke, _ in rects)
     images = (

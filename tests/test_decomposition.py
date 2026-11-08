@@ -2,7 +2,7 @@
 
 Covers:
 - _compute_freq_crop: index math for k_max cropping (real and complex modes)
-- precompute_volume_dft: shape, padding, DC zeroing
+- precompute_volume_dft: shape, padding, edge-value handling
 - apply_fourier_filters: output shape and identity behaviour
 - DecompositionResult: shape validation, index helpers, get_component, get_top_n
 - DecompositionResult save/load round-trip
@@ -20,12 +20,16 @@ from panther_em.decomposition.pipeline_projections import (
     apply_fourier_filters,
     precompute_volume_dft,
 )
-from panther_em.decomposition.result import DecompositionResult
+from panther_em.decomposition.result import (
+    DecompositionResult,
+    SparseDecompositionResult,
+)
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
 
+NUM_VOL = 3  # volumes
 NUM_FF = 2  # fourier filters
 NUM_OR = 8  # orientations
 K_MAX = 5
@@ -34,20 +38,21 @@ NUM_R = 10  # radial components
 NUM_ANG = 32  # angular components in polar space
 
 
-def _make_result(is_complex: bool) -> DecompositionResult:
+def _make_result(is_complex: bool, num_volumes: int = NUM_VOL) -> DecompositionResult:
     """Minimal DecompositionResult with deterministic random arrays."""
     rng = np.random.default_rng(0)
     num_freq_blocks = K_MAX * 2 if is_complex else K_MAX
 
-    # Complex arrays even for real-valued decompositions: conjugation paths are tested.
+    # Use complex arrays even for real-valued decompositions so conjugation paths are
+    # tested.
     U = (
-        rng.standard_normal((NUM_FF, NUM_OR, num_freq_blocks, EIG_MAX)).astype(
-            np.float32
-        )
+        rng.standard_normal(
+            (num_volumes, NUM_FF, NUM_OR, num_freq_blocks, EIG_MAX)
+        ).astype(np.float32)
         + 1j
-        * rng.standard_normal((NUM_FF, NUM_OR, num_freq_blocks, EIG_MAX)).astype(
-            np.float32
-        )
+        * rng.standard_normal(
+            (num_volumes, NUM_FF, NUM_OR, num_freq_blocks, EIG_MAX)
+        ).astype(np.float32)
     ).astype(np.complex64)
     S = rng.random((num_freq_blocks, EIG_MAX)).astype(np.float32)
     Vh = (
@@ -66,6 +71,7 @@ def _make_result(is_complex: bool) -> DecompositionResult:
         k_max=K_MAX,
         eig_max=EIG_MAX,
         is_complex_projection=is_complex,
+        num_volumes=num_volumes,
         num_fourier_filters=NUM_FF,
         num_orientations=NUM_OR,
         num_angular_components=NUM_ANG,
@@ -163,7 +169,7 @@ class TestComputeFreqCrop:
 
 
 class TestPrecomputeVolumeDft:
-    """precompute_volume_dft: shape, padding, DC zeroing."""
+    """precompute_volume_dft: shape, padding, edge-value handling."""
 
     # compute_cube_face_averages requires n=4 < d//2, so d >= 10; use 16.
 
@@ -182,27 +188,20 @@ class TestPrecomputeVolumeDft:
         assert dft.shape == (d_padded, d_padded, d_padded // 2 + 1)
         assert pad_width > 0
 
-    def test_dc_is_zeroed(self):
-        vol = torch.ones(16, 16, 16)
+    def test_dc_is_not_zeroed(self):
+        vol = torch.zeros(16, 16, 16)
+        vol[6:10, 6:10, 6:10] = 5.0
         dft, _, _ = precompute_volume_dft(vol, pad_factor=1.0)
         dc_row = dft.shape[0] // 2
         dc_col = dft.shape[1] // 2
-        assert dft[dc_row, dc_col, 0].abs().item() == pytest.approx(0.0, abs=1e-6)
+        assert dft[dc_row, dc_col, 0].abs().item() > 1e-3
 
-    def test_volume_mean_scaled_zero_after_background_subtraction(self):
+    def test_edge_value_scaled_matches_edge_average_times_d(self):
         d = 16
         vol = torch.ones(d, d, d) * 3.0
-        _, volume_mean_scaled, _ = precompute_volume_dft(vol, pad_factor=1.0)
-        # Constant volume: after edge subtraction the mean → 0
-        assert abs(volume_mean_scaled) < 1e-4
-
-    def test_zero_background_false_preserves_mean(self):
-        d = 16
-        vol = torch.ones(d, d, d) * 2.0
-        _, volume_mean_scaled, _ = precompute_volume_dft(
-            vol, pad_factor=1.0, zero_background=False
-        )
-        assert volume_mean_scaled == pytest.approx(2.0 * d, rel=1e-4)
+        _, edge_value_scaled, _ = precompute_volume_dft(vol, pad_factor=1.0)
+        # Constant volume: cube-face average equals the constant value.
+        assert edge_value_scaled == pytest.approx(3.0 * d, rel=1e-4)
 
     def test_output_is_complex(self):
         vol = torch.zeros(16, 16, 16)
@@ -292,7 +291,7 @@ class TestDecompositionResultConstruction:
         rng = np.random.default_rng(0)
         with pytest.raises(ValueError, match="S shape"):
             DecompositionResult(
-                U=rng.standard_normal((NUM_FF, NUM_OR, K_MAX, EIG_MAX)).astype(
+                U=rng.standard_normal((NUM_VOL, NUM_FF, NUM_OR, K_MAX, EIG_MAX)).astype(
                     np.float32
                 ),
                 S=rng.random((K_MAX + 1, EIG_MAX)).astype(np.float32),  # wrong
@@ -300,6 +299,7 @@ class TestDecompositionResultConstruction:
                 k_max=K_MAX,
                 eig_max=EIG_MAX,
                 is_complex_projection=False,
+                num_volumes=NUM_VOL,
                 num_fourier_filters=NUM_FF,
                 num_orientations=NUM_OR,
                 num_angular_components=NUM_ANG,
@@ -311,14 +311,15 @@ class TestDecompositionResultConstruction:
         rng = np.random.default_rng(0)
         with pytest.raises(ValueError, match="U shape"):
             DecompositionResult(
-                U=rng.standard_normal((NUM_FF, NUM_OR, K_MAX + 1, EIG_MAX)).astype(
-                    np.float32
-                ),  # wrong k dim
+                U=rng.standard_normal(
+                    (NUM_VOL, NUM_FF, NUM_OR, K_MAX + 1, EIG_MAX)
+                ).astype(np.float32),  # wrong k dim
                 S=rng.random((K_MAX, EIG_MAX)).astype(np.float32),
                 Vh=rng.standard_normal((K_MAX, EIG_MAX, NUM_R)).astype(np.float32),
                 k_max=K_MAX,
                 eig_max=EIG_MAX,
                 is_complex_projection=False,
+                num_volumes=NUM_VOL,
                 num_fourier_filters=NUM_FF,
                 num_orientations=NUM_OR,
                 num_angular_components=NUM_ANG,
@@ -330,7 +331,7 @@ class TestDecompositionResultConstruction:
         rng = np.random.default_rng(0)
         with pytest.raises(ValueError, match="Vh shape"):
             DecompositionResult(
-                U=rng.standard_normal((NUM_FF, NUM_OR, K_MAX, EIG_MAX)).astype(
+                U=rng.standard_normal((NUM_VOL, NUM_FF, NUM_OR, K_MAX, EIG_MAX)).astype(
                     np.float32
                 ),
                 S=rng.random((K_MAX, EIG_MAX)).astype(np.float32),
@@ -340,6 +341,7 @@ class TestDecompositionResultConstruction:
                 k_max=K_MAX,
                 eig_max=EIG_MAX,
                 is_complex_projection=False,
+                num_volumes=NUM_VOL,
                 num_fourier_filters=NUM_FF,
                 num_orientations=NUM_OR,
                 num_angular_components=NUM_ANG,
@@ -357,6 +359,7 @@ class TestDecompositionResultConstruction:
                 k_max=K_MAX,
                 eig_max=EIG_MAX,
                 is_complex_projection=False,
+                num_volumes=NUM_VOL,
                 num_fourier_filters=NUM_FF,
                 num_orientations=NUM_OR,
                 num_angular_components=NUM_ANG,
@@ -444,14 +447,14 @@ class TestGetComponent:
     def test_scalar_indices_real(self):
         result = _make_result(is_complex=False)
         u, s, vh = result.get_component(k_idx=1, eig_idx=0)
-        assert u.shape == (NUM_FF, NUM_OR, 1)
+        assert u.shape == (NUM_VOL, NUM_FF, NUM_OR, 1)
         assert s.shape == (1,)
         assert vh.shape == (1, NUM_R)
 
     def test_scalar_indices_complex(self):
         result = _make_result(is_complex=True)
         u, s, vh = result.get_component(k_idx=2, eig_idx=1)
-        assert u.shape == (NUM_FF, NUM_OR, 1)
+        assert u.shape == (NUM_VOL, NUM_FF, NUM_OR, 1)
         assert s.shape == (1,)
         assert vh.shape == (1, NUM_R)
 
@@ -585,3 +588,97 @@ class TestDecompositionResultIO:
         result.coordinate_transform = None
         with pytest.raises(ValueError, match="coordinate_transform is None"):
             result.save(tmp_path / "no_transform.h5")
+
+    def test_legacy_file_without_num_volumes_loads_as_single_volume(
+        self, tmp_path: Path
+    ):
+        """Files saved before the multi-volume axis existed lack the
+        ``num_volumes`` attr and store a 4D ``U`` array; loading must default
+        to ``num_volumes=1`` and reinsert the leading axis."""
+        import h5py
+
+        result = _make_result(is_complex=False, num_volumes=1)
+        path = tmp_path / "legacy_result.h5"
+        result.save(path)
+
+        # Rewrite the file to mimic the pre-multi-volume on-disk layout: drop
+        # the num_volumes attr and squeeze U back down to 4D.
+        with h5py.File(path, "r+") as f:
+            del f.attrs["num_volumes"]
+            legacy_U = f["U"][()][0]
+            del f["U"]
+            f.create_dataset("U", data=legacy_U)
+
+        loaded = DecompositionResult.load(path)
+        assert loaded.num_volumes == 1
+        assert loaded.U.shape == (1, NUM_FF, NUM_OR, K_MAX, EIG_MAX)
+        np.testing.assert_array_equal(loaded.U[0], result.U[0])
+
+
+# ===========================================================================
+# DecompositionResult — multi-volume shapes
+# ===========================================================================
+
+
+class TestMultiVolumeShapes:
+    """Shape validation and index helpers with num_volumes > 1."""
+
+    def test_construction_valid(self):
+        result = _make_result(is_complex=False, num_volumes=NUM_VOL)
+        assert result.num_volumes == NUM_VOL
+        assert result.U.shape[0] == NUM_VOL
+
+    def test_wrong_volume_dim_raises(self):
+        rng = np.random.default_rng(0)
+        with pytest.raises(ValueError, match="U shape"):
+            DecompositionResult(
+                U=rng.standard_normal(
+                    (NUM_VOL + 1, NUM_FF, NUM_OR, K_MAX, EIG_MAX)
+                ).astype(np.float32),
+                S=rng.random((K_MAX, EIG_MAX)).astype(np.float32),
+                Vh=rng.standard_normal((K_MAX, EIG_MAX, NUM_R)).astype(np.float32),
+                k_max=K_MAX,
+                eig_max=EIG_MAX,
+                is_complex_projection=False,
+                num_volumes=NUM_VOL,
+                num_fourier_filters=NUM_FF,
+                num_orientations=NUM_OR,
+                num_angular_components=NUM_ANG,
+                num_radial_components=NUM_R,
+                coordinate_transform=None,
+            )
+
+    def test_get_component_includes_volume_axis(self):
+        result = _make_result(is_complex=False, num_volumes=NUM_VOL)
+        u, _s, _vh = result.get_component(k_idx=1, eig_idx=0)
+        assert u.shape == (NUM_VOL, NUM_FF, NUM_OR, 1)
+
+    def test_volumes_have_independent_left_singular_vectors(self):
+        result = _make_result(is_complex=False, num_volumes=NUM_VOL)
+        u, _s, _vh = result.get_component(k_idx=1, eig_idx=0)
+        # Different volumes were filled with independent random data, so their
+        # left-singular-vector slices should differ.
+        assert not np.allclose(u[0], u[1])
+
+    def test_save_load_round_trip_multi_volume(self, tmp_path: Path):
+        result = _make_result(is_complex=False, num_volumes=NUM_VOL)
+        path = tmp_path / "multi_volume.h5"
+        result.save(path)
+        loaded = DecompositionResult.load(path)
+
+        assert loaded.num_volumes == NUM_VOL
+        np.testing.assert_array_equal(loaded.U, result.U)
+
+    def test_sparse_round_trip_multi_volume(self, tmp_path: Path):
+        result = _make_result(is_complex=False, num_volumes=NUM_VOL)
+        sparse = result.to_sparse(n=5)
+        assert sparse.num_volumes == NUM_VOL
+
+        path = tmp_path / "sparse_multi_volume.h5"
+        sparse.save(path)
+
+        loaded = SparseDecompositionResult.load(path)
+        assert loaded.num_volumes == NUM_VOL
+
+        dense = loaded.to_dense()
+        assert dense.U.shape[0] == NUM_VOL

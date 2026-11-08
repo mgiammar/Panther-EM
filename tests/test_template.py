@@ -36,7 +36,7 @@ def build_block_kernels(recon, cells, **kwargs):
 
 def reference_layout_weights(result, layout):
     """Reference ``U * S`` in a layout's slot order, straight from the result arrays."""
-    us = torch.as_tensor(result.U) * torch.as_tensor(result.S)[None, None]
+    us = torch.as_tensor(result.U[0]) * torch.as_tensor(result.S)[None, None]
     ff, o = us.shape[:2]
     blocks = [
         us[:, :, k0 : k0 + ke, m0 : m0 + me].reshape(ff * o, ke * me)

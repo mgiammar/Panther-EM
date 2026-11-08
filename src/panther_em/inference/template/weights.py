@@ -22,8 +22,8 @@ class WeightSource:
     Parameters
     ----------
     result : DecompositionResult
-        Dense or sparse decomposition (sparse pairs absent from the stored set are
-        zeros, as in :meth:`~DecompositionResult.get_component`).
+        Dense or sparse single-volume decomposition (sparse pairs absent from the
+        stored set are zeros, as in :meth:`~DecompositionResult.get_component`).
     device : torch.device or str
         Where the weights live.
     cells_union : Rectangle or sequence of Rectangle, optional
@@ -39,6 +39,11 @@ class WeightSource:
     ) -> None:
         if result.is_complex_projection:
             raise NotImplementedError("Complex-valued projections not yet supported")
+        if result.num_volumes != 1:
+            raise NotImplementedError(
+                f"the search supports one volume per decomposition, got "
+                f"{result.num_volumes}"
+            )
         self.result = result
         self.device = torch.device(device)
         self.n_filters = int(result.num_fourier_filters)

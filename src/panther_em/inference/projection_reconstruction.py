@@ -219,6 +219,7 @@ class ProjectionReconstructor:
         self,
         orientation_idx: int,
         fourier_filter_idx: int = 0,
+        volume_idx: int = 0,
         in_plane_rotation: float = 0.0,
         num_components: int | None = None,
         return_polar: bool = False,
@@ -237,6 +238,8 @@ class ProjectionReconstructor:
             Index of the orientation (in-plane rotation) to reconstruct.
         fourier_filter_idx : int, optional
             Index of the Fourier filter to reconstruct, by default 0.
+        volume_idx : int, optional
+            Index of the volume/conformer to reconstruct, by default 0.
         in_plane_rotation : float, optional
             The in-plane rotation angle for the reconstruction, in degrees. Analytically
             applies a phase-shift to the constructed angular components. By default 0.0.
@@ -283,6 +286,11 @@ class ProjectionReconstructor:
                 f"orientation_idx {orientation_idx} out of bounds "
                 f"(max: {self.result.num_orientations - 1})"
             )
+        if not (0 <= volume_idx < self.result.num_volumes):
+            raise ValueError(
+                f"volume_idx {volume_idx} out of bounds "
+                f"(max: {self.result.num_volumes - 1})"
+            )
 
         num_components = self._resolve_num_components(num_components)
         k_idx_groups = self._build_k_idx_groups(num_components)
@@ -304,7 +312,7 @@ class ProjectionReconstructor:
                 [np.full(len(eig_indices), k_idx), eig_indices]
             )
             U_t, S_t, Vh_t = self.result.get_svd_tensors(indices_np, self.device)
-            u_ki = U_t[fourier_filter_idx, orientation_idx]  # (E,)
+            u_ki = U_t[volume_idx, fourier_filter_idx, orientation_idx]  # (E,)
             weighted_features = u_ki * S_t
             radial_contribution = weighted_features @ Vh_t
 
@@ -346,6 +354,7 @@ class ProjectionReconstructor:
     def reconstruct_projection_batch(
         self,
         queries: list[tuple[int, int, float]],
+        volume_idx: int = 0,
         num_components: int | None = None,
         return_polar: bool = False,
         return_torch: bool = False,
@@ -362,6 +371,9 @@ class ProjectionReconstructor:
         queries : list[tuple[int, int, float]]
             Each entry is
             (orientation_idx, fourier_filter_idx, in_plane_rotation_degrees).
+        volume_idx : int, optional
+            Index of the volume/conformer used for every query in this batch, by default
+            0.
         num_components : int | None, optional
             Number of top components to use. None uses all, by default None.
         return_polar : bool, optional
@@ -401,6 +413,11 @@ class ProjectionReconstructor:
                     f"orientation_idx {ori_idx} out of bounds "
                     f"(max: {self.result.num_orientations - 1})"
                 )
+        if not (0 <= volume_idx < self.result.num_volumes):
+            raise ValueError(
+                f"volume_idx {volume_idx} out of bounds "
+                f"(max: {self.result.num_volumes - 1})"
+            )
 
         B = len(queries)
         num_components = self._resolve_num_components(num_components)
@@ -434,8 +451,9 @@ class ProjectionReconstructor:
             )
 
             U_t, S_t, Vh_t = self.result.get_svd_tensors(indices_np, self.device)
-            # U_t: (FF, O, E); select one (ff, or) pair per batch element
-            u_batch = U_t[ff_batch, orient_batch, :]  # (B, E)
+            # U_t: (V, FF, O, E); select one (ff, or) pair per batch element,
+            # all sharing the same volume_idx.
+            u_batch = U_t[volume_idx, ff_batch, orient_batch, :]  # (B, E)
             radial = (u_batch * S_t[None, :]) @ Vh_t  # (B, R)
             tmp_contribution = angular_batch[:, :, None] * radial[:, None, :]
             polar_projections += tmp_contribution
