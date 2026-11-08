@@ -2068,8 +2068,6 @@ source = { editable = "." }
 dependencies = [
     { name = "h5py" },
     { name = "healpy", marker = "sys_platform != 'win32'" },
-    { name = "ipykernel" },
-    { name = "matplotlib" },
     { name = "mrcfile" },
     { name = "numpy" },
     { name = "roma" },
@@ -2081,7 +2079,6 @@ dependencies = [
     { name = "torch-grid-utils" },
     { name = "torch-so3" },
     { name = "tqdm" },
-    { name = "ttsim3d" },
 ]
 
 [package.optional-dependencies]
@@ -2099,7 +2096,9 @@ fused-kernels = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "ipykernel" },
     { name = "ipython" },
+    { name = "matplotlib" },
     { name = "mypy" },
     { name = "pdbpp" },
     { name = "pre-commit-uv" },
@@ -2107,10 +2106,13 @@ dev = [
     { name = "pytest-cov" },
     { name = "rich" },
     { name = "ruff" },
+    { name = "torch-ctf" },
+    { name = "ttsim3d" },
 ]
 test = [
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "torch-ctf" },
 ]
 
 [package.metadata]
@@ -2121,8 +2123,6 @@ requires-dist = [
     { name = "cupy-cuda13x", marker = "extra == 'cuda13'" },
     { name = "h5py" },
     { name = "healpy", marker = "sys_platform != 'win32'" },
-    { name = "ipykernel" },
-    { name = "matplotlib" },
     { name = "mrcfile" },
     { name = "ninja", marker = "extra == 'fused-kernels'" },
     { name = "numpy" },
@@ -2135,13 +2135,14 @@ requires-dist = [
     { name = "torch-grid-utils" },
     { name = "torch-so3", specifier = ">=0.6.0" },
     { name = "tqdm" },
-    { name = "ttsim3d" },
 ]
 provides-extras = ["cuda12", "cuda13", "fused-kernels"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "ipykernel" },
     { name = "ipython" },
+    { name = "matplotlib" },
     { name = "mypy" },
     { name = "pdbpp" },
     { name = "pre-commit-uv" },
@@ -2149,10 +2150,13 @@ dev = [
     { name = "pytest-cov" },
     { name = "rich" },
     { name = "ruff" },
+    { name = "torch-ctf" },
+    { name = "ttsim3d" },
 ]
 test = [
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "torch-ctf" },
 ]
 
 [[package]]

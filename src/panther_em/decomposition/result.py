@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 import panther_em.coordinates  # noqa: F401  # registers built-in transforms
+from panther_em._hdf5 import check_format, write_format
 from panther_em.coordinates.transform_base import (
     CoordinateTransform,
     GridTransform,
@@ -176,6 +177,7 @@ class DecompositionBase(ABC):
 
     def _write_hdf5_metadata(self, f: h5py.File) -> None:
         """Write scalar metadata as root-level HDF5 attributes."""
+        write_format(f, "decomposition")
         f.attrs["k_max"] = self.k_max
         f.attrs["eig_max"] = self.eig_max
         f.attrs["is_complex_projection"] = self.is_complex_projection
@@ -342,6 +344,7 @@ class DecompositionBase(ABC):
                 f"Unknown file extension '{path.suffix}'. Expected '.h5' or '.hdf5'."
             )
         with h5py.File(path, "r") as f:
+            check_format(f, "decomposition", path)
             is_sparse = bool(f.attrs.get("is_sparse", False))
         target = SparseDecompositionResult if is_sparse else DecompositionResult
         if not issubclass(target, cls):

@@ -22,6 +22,7 @@ import torch
 from torch_fourier_filter.whitening import calculate_num_freq_bins
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
+from panther_em._hdf5 import check_format, write_format
 from panther_em.coordinates.warp_config import WarpConfig
 from panther_em.decomposition.projections import (
     generate_projection_batch,
@@ -258,6 +259,7 @@ class PerSpatialFrequencyErrorTable:
     def save(self, path: str | Path) -> None:
         """Write to HDF5."""
         with h5py.File(path, "w") as f:
+            write_format(f, "error_table")
             f["frequencies"] = self.frequencies.numpy()
             for name in TABLE_NAMES:
                 f[name] = getattr(self, name).numpy()
@@ -271,6 +273,7 @@ class PerSpatialFrequencyErrorTable:
     def load(cls, path: str | Path) -> PerSpatialFrequencyErrorTable:
         """Read a file written by :meth:`save`."""
         with h5py.File(path, "r") as f:
+            check_format(f, "error_table", path)
             return cls(
                 frequencies=torch.from_numpy(f["frequencies"][()]),
                 **{name: torch.from_numpy(f[name][()]) for name in TABLE_NAMES},

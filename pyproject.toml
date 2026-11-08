@@ -43,16 +43,13 @@ dependencies = [
     "scikit-image",
     "mrcfile",
     "torch",
-    "matplotlib",
     "h5py",
-    "ttsim3d",
     "torch-fourier-slice>=0.6.0",
     "torch-fourier-filter",  # 1-D spectra, whitening and curve-to-grid helpers
     "torch-grid-utils",  # fftfreq_grid
     "torch-so3>=0.6.0",  # HierarchicalS2Grid: HEALPix orientation grids
     "healpy; platform_system != 'Windows'",
     "roma",
-    "ipykernel",
 ]
 
 # https://peps.python.org/pep-0621/#dependencies-optional-dependencies
@@ -78,15 +75,22 @@ repository = "https://github.com/mgiammar/panther-em"
 # https://peps.python.org/pep-0735/
 # setup with `uv sync` or `pip install -e . --group dev`
 [dependency-groups]
-test = ["pytest", "pytest-cov"]
+test = [
+    "pytest",
+    "pytest-cov",
+    "torch-ctf",  # CTF planes of the synthetic pipeline script (tests/test_pipeline.py)
+]
 dev = [
     { include-group = "test" },
+    "ipykernel",
     "ipython",
+    "matplotlib",
     "mypy",
     "pdbpp",                    # https://github.com/pdbpp/pdbpp
     "pre-commit-uv",
     "rich",                     # https://github.com/Textualize/rich
     "ruff",
+    "ttsim3d",                  # simulated volumes in examples/
 ]
 
 [tool.uv.sources]
@@ -123,7 +127,6 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*.py" = ["D", "S"]
-"docs/*.py" = ["D", "A"]
 
 # https://docs.astral.sh/ruff/formatter/
 [tool.ruff.format]

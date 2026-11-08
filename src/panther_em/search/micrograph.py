@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 import h5py
 import torch
 
+from panther_em._hdf5 import check_format, write_format
 from panther_em.filters.curves import curve_to_grid
 
 if TYPE_CHECKING:
@@ -255,6 +256,7 @@ class Micrograph:
     def save(self, path: str | Path) -> None:
         """Write to HDF5, so a micrograph is prepared once per dataset."""
         with h5py.File(path, "w") as f:
+            write_format(f, "micrograph")
             f.attrs["name"] = self.name
             f.attrs["pixel_size"] = self.pixel_size
             for field in ("image", "ctf", "frequencies", "noise", "signal", "level"):
@@ -264,6 +266,7 @@ class Micrograph:
     def load(cls, path: str | Path, device: torch.device | str = "cpu") -> Micrograph:
         """Read a file written by :meth:`save`; image and CTF planes on ``device``."""
         with h5py.File(path, "r") as f:
+            check_format(f, "micrograph", path)
 
             def read(field: str) -> torch.Tensor:
                 return torch.from_numpy(f[field][()])

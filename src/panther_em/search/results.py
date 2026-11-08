@@ -18,6 +18,7 @@ import h5py
 import numpy as np
 import torch
 
+from panther_em._hdf5 import check_format, write_format
 from panther_em.search.correlation.maps import StageMaps
 from panther_em.search.hypotheses import HypothesisSpace
 from panther_em.search.images import SearchGeometry
@@ -264,6 +265,7 @@ class SearchResult:
         ``best_virtual`` ids, ``labels_after``, ``score`` and timing attributes.
         """
         with h5py.File(path, "w") as f:
+            write_format(f, "search_result")
             for name, array in self.to_numpy().items():
                 f.create_dataset(name, data=array)
             g = self.geometry
@@ -320,6 +322,7 @@ class SearchResult:
     def load(cls, path: str | Path) -> SearchResult:
         """Read a result written by :meth:`save` (stage decisions are not restored)."""
         with h5py.File(path, "r") as f:
+            check_format(f, "search_result", path)
             maps = {name: torch.from_numpy(np.asarray(f[name])) for name in MAP_NAMES}
             geo = json.loads(f.attrs["geometry"])
             geometry = SearchGeometry(

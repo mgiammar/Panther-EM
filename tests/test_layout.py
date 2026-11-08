@@ -1,4 +1,4 @@
-"""Feature layouts and contraction engines (features.py)."""
+"""correlation.layout and correlation.contraction: feature layouts and engines."""
 
 from __future__ import annotations
 

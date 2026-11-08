@@ -33,6 +33,7 @@ import torch
 from torch_fourier_filter.bandpass import low_pass_filter
 from torch_fourier_filter.whitening import calculate_num_freq_bins
 
+from panther_em._hdf5 import check_format, write_format
 from panther_em.filters.curves import (
     CORNER_FREQ,
     amplitude_spectrum_1d,
@@ -368,6 +369,7 @@ class WhiteningFilter:
     def save(self, path: str | Path) -> None:
         """Write the filter to an HDF5 file."""
         with h5py.File(path, "w") as f:
+            write_format(f, "whitening_filter")
             f.create_dataset("frequencies", data=self.frequencies.numpy())
             f.create_dataset("spectra", data=self.spectra.numpy())
             f.create_dataset(
@@ -381,6 +383,7 @@ class WhiteningFilter:
     def load(cls, path: str | Path) -> WhiteningFilter:
         """Read a file written by :meth:`save`."""
         with h5py.File(path, "r") as f:
+            check_format(f, "whitening_filter", path)
             frequencies = torch.from_numpy(
                 np.asarray(f["frequencies"], dtype=np.float32)
             )
