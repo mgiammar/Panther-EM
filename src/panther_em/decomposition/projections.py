@@ -452,7 +452,7 @@ def do_pipelined_projection_and_transforms(
     storage_backend: Literal["on_device", "cpu", "mmap"] = "cpu",
     mmap_path: Path | str | None = None,
     device: str | torch.device | None = None,
-) -> tuple[torch.Tensor, bool, int]:
+) -> tuple[torch.Tensor, bool, int, torch.Tensor]:
     """Pipelined generation and transforms of projections in polar coordinates.
 
     Parameters
@@ -516,6 +516,11 @@ def do_pipelined_projection_and_transforms(
         Whether the projections are complex-valued.
     int
         The resolved ``k_max`` value actually used.
+    torch.Tensor
+        `(num_volumes, num_fourier_filters, num_projections, num_angular_mode)` float64
+        CPU energies (squared norm over the radius) of every angular-frequency block
+        before the ``k_max`` crop, in the stored block order (fft-shifted for complex
+        projections).
     """
     if storage_backend == "mmap" and mmap_path is None:
         raise ValueError("mmap_path must be provided when storage_backend='mmap'")
@@ -588,6 +593,11 @@ def do_pipelined_projection_and_transforms(
         output_tensor = torch.from_numpy(_mm)
         buffer = _HostStagingBuffer(output_tensor, block_index_min, block_index_max)
 
+    block_energy = torch.zeros(
+        (num_volumes, num_filters, num_orientations, num_angular_mode),
+        dtype=torch.float64,
+    )
+
     pbar = None
     if show_progress:
         pbar = tqdm.tqdm(
@@ -627,7 +637,13 @@ def do_pipelined_projection_and_transforms(
             )
 
             if is_complex:
-                result = torch.fft.fftshift(result, dim=-3)
+                result = torch.fft.fftshift(result, dim=-2)
+
+            # every block's energy before the crop (the truncation errors' reference)
+            energy = (result.real.square() + result.imag.square()).sum(
+                dim=-1, dtype=torch.float64
+            )
+            block_energy[vol_idx, :, slice_] = energy.cpu()
 
             buffer.write_batch(result, vol_idx, slice_)
             del result
@@ -641,4 +657,4 @@ def do_pipelined_projection_and_transforms(
         pbar.close()
 
     output = buffer.finalize()
-    return output, is_complex, k_max_actual
+    return output, is_complex, k_max_actual, block_energy

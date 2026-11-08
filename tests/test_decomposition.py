@@ -4,6 +4,7 @@ Covers:
 - _compute_freq_crop: index math for k_max cropping (real and complex modes)
 - precompute_volume_dft: shape, padding, edge-value handling
 - apply_fourier_filters: output shape and identity behaviour
+- the pipeline's block order (complex: centred on DC) and recorded block energies
 - DecompositionResult: shape validation, index helpers, get_component, get_top_n
 - DecompositionResult save/load round-trip
 """
@@ -19,7 +20,9 @@ from panther_em.coordinates.warp_config import WarpConfig
 from panther_em.decomposition.projections import (
     _compute_freq_crop,
     apply_fourier_filters,
+    do_pipelined_projection_and_transforms,
     precompute_volume_dft,
+    process_batch,
 )
 from panther_em.decomposition.result import (
     DecompositionBase,
@@ -274,6 +277,80 @@ class TestApplyFourierFilters:
 # ===========================================================================
 # DecompositionResult — construction and shape validation
 # ===========================================================================
+
+
+class TestPipelineBlockOrder:
+    """The pipeline crops the angular blocks around DC and records their energies."""
+
+    def _case(self, filters):
+        from scipy.ndimage import gaussian_filter
+
+        rng = np.random.default_rng(0)
+        volume = torch.from_numpy(
+            gaussian_filter(rng.standard_normal((16,) * 3), 1.5).astype(np.float32)
+        )
+        transform = OffsetPolarTransform.from_image(
+            image_shape=(16, 16), num_angle=16, num_radius=6
+        )
+        phi = torch.tensor([0.0, 40.0, 90.0, 150.0])
+        theta = torch.tensor([10.0, 30.0, 60.0, 80.0])
+        out = do_pipelined_projection_and_transforms(
+            volume[None],
+            phi,
+            theta,
+            torch.zeros(4),
+            filters,
+            transform,
+            WarpConfig(),
+            projection_batch_size=4,
+            k_max=3,
+            show_progress=False,
+        )
+        dft, edge, pad = precompute_volume_dft(volume)
+        singles = [
+            process_batch(
+                dft,
+                edge,
+                pad,
+                phi[i : i + 1],
+                theta[i : i + 1],
+                torch.zeros(1),
+                filters,
+                transform,
+                WarpConfig(),
+            )[0][0, 0]
+            for i in range(4)
+        ]
+        return out, singles
+
+    def test_complex_blocks_centred_on_dc(self):
+        """Complex projections: the blocks [-3, 3) of each orientation, in order."""
+        ramp = torch.exp(1j * torch.linspace(0.0, 1.0, 16))
+        filters = (torch.ones(1, 16, 16) * ramp).to(torch.complex64)
+        (out, is_complex, k_max, energy), singles = self._case(filters)
+        assert is_complex and k_max == 3 and out.shape == (1, 1, 4, 6, 6)
+        for i, single in enumerate(singles):
+            shifted = torch.fft.fftshift(single, dim=0)
+            torch.testing.assert_close(out[0, 0, i], shifted[8 - 3 : 8 + 3])
+            torch.testing.assert_close(
+                energy[0, 0, i],
+                shifted.abs().square().sum(-1).double(),
+                rtol=1e-5,
+                atol=0,
+            )
+
+    def test_real_energies_before_the_crop(self):
+        filters = torch.ones(1, 16, 9, dtype=torch.complex64)
+        (out, is_complex, _, energy), singles = self._case(filters)
+        assert not is_complex and energy.shape == (1, 1, 4, 9)
+        for i, single in enumerate(singles):
+            torch.testing.assert_close(out[0, 0, i], single[:3])
+            torch.testing.assert_close(
+                energy[0, 0, i],
+                single.abs().square().sum(-1).double(),
+                rtol=1e-5,
+                atol=0,
+            )
 
 
 class TestDecompositionResultConstruction:

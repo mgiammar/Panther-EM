@@ -48,6 +48,28 @@ def _read_fancy_last_axis(
     return source[..., idx]
 
 
+_METADATA_FIELDS = (
+    "k_max",
+    "eig_max",
+    "is_complex_projection",
+    "num_volumes",
+    "num_fourier_filters",
+    "num_orientations",
+    "num_angular_components",
+    "num_radial_components",
+    "created_at",
+    "phi_values",
+    "theta_values",
+    "fourier_filters",
+    "volume_labels",
+    "coordinate_transform",
+    "warp_config",
+    "block_energy",
+    "normalized_projections",
+)
+"""Constructor keywords of the metadata both layouts share (and convert between)."""
+
+
 class DecompositionBase(ABC):
     """Metadata and query interface shared by every decomposition storage layout."""
 
@@ -67,6 +89,8 @@ class DecompositionBase(ABC):
     volume_labels: np.ndarray | None
     coordinate_transform: CoordinateTransform | None
     warp_config: WarpConfig
+    block_energy: np.ndarray | None
+    normalized_projections: bool | None
 
     # Private state, initialised by the subclasses.
     _top_n_cache: dict[tuple[int, bool], np.ndarray]
@@ -157,6 +181,35 @@ class DecompositionBase(ABC):
                     f"expected ({self.num_volumes},)"
                 )
 
+        # Validate the optional energies of every row's angular-frequency blocks
+        if self.block_energy is not None:
+            expected = (
+                self.num_volumes,
+                self.num_fourier_filters,
+                self.num_orientations,
+                self.num_angular_blocks,
+            )
+            if self.block_energy.shape != expected:
+                raise ValueError(
+                    f"block_energy shape {self.block_energy.shape} does not match "
+                    f"expected {expected}"
+                )
+
+    @property
+    def num_angular_blocks(self) -> int:
+        """Angular-frequency blocks of a polar image before the ``k_max`` crop.
+
+        ``num_angular_components // 2 + 1`` for real projections (the rfft),
+        ``num_angular_components`` for complex ones.
+        """
+        if self.is_complex_projection:
+            return int(self.num_angular_components)
+        return int(self.num_angular_components) // 2 + 1
+
+    def _metadata(self) -> dict[str, Any]:
+        """Constructor keywords of the shared metadata (:data:`_METADATA_FIELDS`)."""
+        return {name: getattr(self, name) for name in _METADATA_FIELDS}
+
     def close(self) -> None:
         """Close the HDF5 file handle opened by ``load(..., mmap=True)``."""
         if self._h5_file is not None:
@@ -199,6 +252,8 @@ class DecompositionBase(ABC):
             )
         f.attrs["transform_config"] = json.dumps(self.coordinate_transform.to_dict())
         f.attrs["warp_config"] = json.dumps(self.warp_config.to_dict())
+        if self.normalized_projections is not None:
+            f.attrs["normalized_projections"] = self.normalized_projections
 
     @staticmethod
     def _read_hdf5_metadata(f: h5py.File, path: Path) -> dict[str, Any]:
@@ -265,6 +320,13 @@ class DecompositionBase(ABC):
             "volume_labels": optional("volume_labels"),
             "coordinate_transform": coordinate_transform,
             "warp_config": warp_config,
+            # absent from files written before the energies were recorded
+            "block_energy": optional("block_energy"),
+            "normalized_projections": (
+                bool(f.attrs["normalized_projections"])
+                if "normalized_projections" in f.attrs
+                else None
+            ),
         }
 
     def _write_hdf5_optional_arrays(self, f: h5py.File) -> None:
@@ -277,6 +339,8 @@ class DecompositionBase(ABC):
             f.create_dataset("fourier_filters", data=self.fourier_filters)
         if self.volume_labels is not None:
             f.create_dataset("volume_labels", data=self.volume_labels)
+        if self.block_energy is not None:
+            f.create_dataset("block_energy", data=self.block_energy)
 
     def _write_hdf5_transform_arrays(self, f: h5py.File) -> None:
         """Write coordinate grid arrays for a GridTransform into an HDF5 group."""
@@ -507,6 +571,14 @@ class DecompositionResult(DecompositionBase):
         Interpolation settings of the polar <-> Cartesian warp: the decomposer warped
         projections onto the polar grid with them, and every consumer warps polar
         images back with them.
+    block_energy : np.ndarray | None
+        Energy (squared norm over the radius) of every row's angular-frequency blocks
+        before the ``k_max`` crop and the SVD, shape ``(num_volumes,
+        num_fourier_filters, num_orientations, num_angular_blocks)`` float64 (blocks in
+        rfft order; fft-shifted for complex projections).
+    normalized_projections : bool | None
+        Whether the projections were normalized to zero mean and unit variance
+        before the polar warp. ``None`` when not recorded.
     """
 
     # Core SVD components
@@ -546,6 +618,10 @@ class DecompositionResult(DecompositionBase):
 
     # Interpolation settings of the polar <-> Cartesian warp (decomposer and consumers)
     warp_config: WarpConfig = field(default_factory=WarpConfig)
+
+    # Pre-truncation energies of the rows' angular blocks, and the normalization flag
+    block_energy: np.ndarray | None = field(default=None, repr=False)
+    normalized_projections: bool | None = None
 
     def __post_init__(self) -> None:
         """Validate shapes after initialization."""
@@ -692,21 +768,7 @@ class DecompositionResult(DecompositionBase):
             S_data=S_data,
             Vh_data=Vh_data,
             selected_indices=selected_indices,
-            k_max=self.k_max,
-            eig_max=self.eig_max,
-            is_complex_projection=self.is_complex_projection,
-            num_volumes=self.num_volumes,
-            num_fourier_filters=self.num_fourier_filters,
-            num_orientations=self.num_orientations,
-            num_angular_components=self.num_angular_components,
-            num_radial_components=self.num_radial_components,
-            coordinate_transform=self.coordinate_transform,
-            warp_config=self.warp_config,
-            created_at=self.created_at,
-            phi_values=self.phi_values,
-            theta_values=self.theta_values,
-            fourier_filters=self.fourier_filters,
-            volume_labels=self.volume_labels,
+            **self._metadata(),
         )
 
     @classmethod
@@ -913,6 +975,8 @@ class SparseDecompositionResult(DecompositionBase):
         theta_values: np.ndarray | None = None,
         fourier_filters: np.ndarray | None = None,
         volume_labels: np.ndarray | None = None,
+        block_energy: np.ndarray | None = None,
+        normalized_projections: bool | None = None,
         _h5_file: h5py.File | None = None,
     ) -> "SparseDecompositionResult":
         """Construct from compact arrays.
@@ -958,6 +1022,11 @@ class SparseDecompositionResult(DecompositionBase):
             Fourier-space filters applied during decomposition.
         volume_labels : np.ndarray | None, optional
             Per-volume labels/coordinates, shape ``(num_volumes,)``.
+        block_energy : np.ndarray | None, optional
+            Pre-truncation energies of the rows' angular blocks; see
+            :class:`DecompositionResult`.
+        normalized_projections : bool | None, optional
+            Whether the projections were normalized before the polar warp.
         _h5_file : h5py.File | None, optional
             Open HDF5 file handle backing ``U_data`` when it is a disk-backed
             ``h5py.Dataset`` (set internally by ``load(..., mmap=True)``).
@@ -994,6 +1063,8 @@ class SparseDecompositionResult(DecompositionBase):
         obj.theta_values = theta_values
         obj.fourier_filters = fourier_filters
         obj.volume_labels = volume_labels
+        obj.block_energy = block_energy
+        obj.normalized_projections = normalized_projections
 
         obj._U_data = U_data
         obj._S_data = S_data
@@ -1049,21 +1120,7 @@ class SparseDecompositionResult(DecompositionBase):
             U=U_dense,
             S=S_dense,
             Vh=Vh_dense,
-            k_max=self.k_max,
-            eig_max=self.eig_max,
-            is_complex_projection=self.is_complex_projection,
-            num_volumes=self.num_volumes,
-            num_fourier_filters=self.num_fourier_filters,
-            num_orientations=self.num_orientations,
-            num_angular_components=self.num_angular_components,
-            num_radial_components=self.num_radial_components,
-            created_at=self.created_at,
-            phi_values=self.phi_values,
-            theta_values=self.theta_values,
-            fourier_filters=self.fourier_filters,
-            volume_labels=self.volume_labels,
-            coordinate_transform=self.coordinate_transform,
-            warp_config=self.warp_config,
+            **self._metadata(),
         )
 
     def to_sparse(self, n: int) -> "SparseDecompositionResult":
@@ -1107,21 +1164,7 @@ class SparseDecompositionResult(DecompositionBase):
             S_data=self._S_data[compact_indices],
             Vh_data=self._Vh_data[compact_indices],
             selected_indices=self._selected_indices[compact_indices],
-            k_max=self.k_max,
-            eig_max=self.eig_max,
-            is_complex_projection=self.is_complex_projection,
-            num_volumes=self.num_volumes,
-            num_fourier_filters=self.num_fourier_filters,
-            num_orientations=self.num_orientations,
-            num_angular_components=self.num_angular_components,
-            num_radial_components=self.num_radial_components,
-            coordinate_transform=self.coordinate_transform,
-            warp_config=self.warp_config,
-            created_at=self.created_at,
-            phi_values=self.phi_values,
-            theta_values=self.theta_values,
-            fourier_filters=self.fourier_filters,
-            volume_labels=self.volume_labels,
+            **self._metadata(),
         )
 
     # ------------------------------------------------------------------

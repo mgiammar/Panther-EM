@@ -1,12 +1,18 @@
-"""Per-spatial-frequency error tables of a decomposition's truncated templates.
+"""Exact errors of a decomposition's truncated templates against a reference volume.
 
-The tables compare, ring by ring in Fourier space, every template row's
+One pass over the template rows (:func:`_template_rows`) gives every row's
 
 - reconstruction ``m~``: the SVD template restricted to the feature rectangles,
-- exact template ``m``: the volume's projection under the decomposition's filter
-  ``W_avg * band``, normalized and masked to the template support,
+  warped to Cartesian,
+- exact template ``m``: the volume's projection under the decomposition's filter,
+  normalized (as the decomposition's projections were) and masked to the support,
 - residual ``delta = m - m~``,
-- signal ``p``: the same projection under ``W_avg`` alone.
+- signal ``p``: the same projection under ``W_avg`` alone (noise model only).
+
+Two consumers reduce it: :func:`compute_errors` to the
+:class:`ApproximationErrors` (by frequency, radius, orientation, total) and
+:func:`compute_error_tables` to the noise model's ring cross-spectra
+(:class:`PerSpatialFrequencyErrorTable`, under the dataset's whitening).
 """
 
 from __future__ import annotations
@@ -14,7 +20,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import h5py
 import numpy as np
@@ -37,11 +43,12 @@ from panther_em.filters.whitening import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
     from pathlib import Path
 
     from panther_em.approximation.reconstructor import Reconstructor
     from panther_em.decomposition.rectangles import Rectangle
+    from panther_em.decomposition.result import DecompositionResult
     from panther_em.filters.whitening import WhiteningFilter
 
 TABLE_NAMES = (
@@ -369,7 +376,7 @@ class RadialBins:
 
 
 # --------------------------------------------------------------------------- #
-# Batch kernels
+# One pass over the template rows
 # --------------------------------------------------------------------------- #
 
 
@@ -384,20 +391,167 @@ def reconstruct_polar(
 
 def exact_and_signal(
     projections: torch.Tensor,
-    exact_filter: torch.Tensor,
-    signal_filter: torch.Tensor,
+    exact_filter: torch.Tensor | None,
+    signal_filter: torch.Tensor | None,
     support: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Exact templates ``m`` (filtered, normalized, masked) and signals ``p``."""
+    *,
+    normalize: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Exact templates ``m`` (filtered, normalized, masked) and signals ``p``.
+
+    A ``None`` ``exact_filter`` leaves the projections unfiltered; a ``None``
+    ``signal_filter`` computes no signal.
+    """
     size = projections.shape[-2:]
     spectrum = torch.fft.rfft2(projections)
 
-    exact = torch.fft.irfft2(spectrum * exact_filter, s=size)
-    var, mean = torch.var_mean(exact, dim=(-2, -1), keepdim=True)
-    exact = (exact - mean) / torch.sqrt(var + 1e-8) * support
+    exact = (
+        projections
+        if exact_filter is None
+        else torch.fft.irfft2(spectrum * exact_filter, s=size)
+    )
+    if normalize:
+        var, mean = torch.var_mean(exact, dim=(-2, -1), keepdim=True)
+        exact = (exact - mean) / torch.sqrt(var + 1e-8)
+    exact = exact * support
 
-    signal = torch.fft.irfft2(spectrum * signal_filter, s=size)
+    signal = (
+        None
+        if signal_filter is None
+        else torch.fft.irfft2(spectrum * signal_filter, s=size)
+    )
     return exact, signal
+
+
+def _row_filters(result: DecompositionResult) -> torch.Tensor | None:
+    """``(FF, kH, kW // 2 + 1)`` recorded Fourier filters (``None``: unfiltered)."""
+    if result.fourier_filters is None:
+        return None
+    filters = torch.as_tensor(np.asarray(result.fourier_filters))
+    h, w = result.coordinate_transform.cartesian_shape  # type: ignore[union-attr]
+    if filters.dim() != 3 or tuple(filters.shape[1:]) != (h, w // 2 + 1):
+        raise NotImplementedError(
+            f"the decomposition's Fourier filters are {tuple(filters.shape)}; only "
+            f"rfft-grid filters (FF, {h}, {w // 2 + 1}) are supported"
+        )
+    return filters if filters.is_complex() else filters.to(torch.float32)
+
+
+class _Rows(NamedTuple):
+    """One batch of template rows: the rows, ``m~``, ``m`` and ``p`` (or ``None``)."""
+
+    rows: slice
+    reconstruction: torch.Tensor
+    exact: torch.Tensor
+    signal: torch.Tensor | None
+
+
+@torch.no_grad()
+def _template_rows(
+    volume: torch.Tensor | np.ndarray,
+    reconstructor: Reconstructor,
+    rects: tuple[Rectangle, ...],
+    *,
+    exact_filter: torch.Tensor | None = None,
+    signal_filter: torch.Tensor | None = None,
+    batch: int,
+) -> Iterator[_Rows]:
+    """Every template row's reconstruction, exact template and signal, in batches.
+
+    Rows run over ``(Fourier filter, orientation)`` of the decomposition's one volume.
+    The exact template ``m`` is the volume's projection under ``exact_filter`` (the
+    same for every row) or, when ``None``, under each row's recorded decomposition
+    filter; normalized when the decomposition normalized its projections (or did not
+    record it); masked to the reconstructor's support. ``p`` is the projection under
+    ``signal_filter``, ``None`` without one.
+    """
+    result = reconstructor.result.to_dense()
+    if result.num_volumes != 1:
+        raise NotImplementedError(
+            f"error tables support one volume per decomposition, got "
+            f"{result.num_volumes}"
+        )
+    device = reconstructor.device
+    h, w = reconstructor.box_shape
+    n_or = result.num_orientations
+    n_rows = result.num_fourier_filters * n_or
+
+    vol = torch.as_tensor(np.asarray(volume), dtype=torch.float32)
+    if vol.dim() != 3 or tuple(vol.shape) != (h, h, w):
+        raise ValueError(
+            f"volume must be (d, d, d) with (d, d) the template box {(h, w)}, got "
+            f"{tuple(vol.shape)}"
+        )
+
+    k_stop = max(k0 + ke for k0, _, ke, _ in rects)
+    e_stop = max(m0 + me for _, m0, _, me in rects)
+    if k_stop > result.k_max or e_stop > result.eig_max:
+        raise ValueError(
+            f"rectangles reach ({k_stop}, {e_stop}) beyond the stored "
+            f"({result.k_max}, {result.eig_max})"
+        )
+
+    # S * Vh over the kept cells, cropped to the rectangles' bounding box
+    mask = torch.zeros((k_stop, e_stop))
+    for k0, m0, ke, me in rects:
+        mask[k0 : k0 + ke, m0 : m0 + me] = 1.0
+    s = torch.as_tensor(np.asarray(result.S)[:k_stop, :e_stop]) * mask
+    vh = torch.as_tensor(np.asarray(result.Vh)[:k_stop, :e_stop])
+    weighted_vh = (s[..., None] * vh).to(device, torch.complex64)
+    # U is (num_volumes = 1, FF, O, K, E): drop the volume axis, flatten (FF, O)
+    u = torch.as_tensor(np.asarray(result.U)).reshape(n_rows, *result.U.shape[3:])
+    u = u[:, :k_stop, :e_stop]
+
+    support = reconstructor.support.to(device)
+    row_filters = None
+    if exact_filter is None:
+        row_filters = _row_filters(result)
+        if row_filters is not None:
+            row_filters = row_filters.to(device)
+    else:
+        exact_filter = exact_filter.to(device)
+    if signal_filter is not None:
+        signal_filter = signal_filter.to(device)
+    normalize = result.normalized_projections is not False
+
+    dft, edge_value_scaled, pad_width = precompute_volume_dft(vol.to(device))
+    phi = torch.as_tensor(result.phi_values, dtype=torch.float32, device=device)
+    theta = torch.as_tensor(result.theta_values, dtype=torch.float32, device=device)
+
+    for r0 in range(0, n_rows, batch):
+        rows = slice(r0, min(r0 + batch, n_rows))
+        index = torch.arange(rows.start, rows.stop, device=device)
+        orientation = index % n_or
+
+        polar = reconstruct_polar(
+            u[rows].to(device, torch.complex64),
+            weighted_vh,
+            result.num_angular_components,
+        )
+        reconstruction = reconstructor.to_cartesian(polar)
+
+        psi = torch.zeros_like(phi[orientation])
+        projections = generate_projection_batch(
+            dft,
+            edge_value_scaled,
+            pad_width,
+            phi[orientation],
+            theta[orientation],
+            psi,
+        )
+        filt = exact_filter
+        if row_filters is not None:
+            filt = row_filters[index // n_or]
+        exact, signal = exact_and_signal(
+            projections, filt, signal_filter, support, normalize=normalize
+        )
+        yield _Rows(rows, reconstruction, exact, signal)
+
+
+def _rfft_power(images: torch.Tensor, bins: RadialBins) -> torch.Tensor:
+    """``(B, F)`` ring power of ``(B, h, w)`` images zero-padded to ``bins.shape``."""
+    spectrum = torch.fft.rfft2(images.to(bins.w_left.dtype), s=bins.shape)
+    return bins(spectrum.real.square() + spectrum.imag.square())
 
 
 def error_profiles(
@@ -420,8 +574,19 @@ def error_profiles(
     )
 
 
+def _padded_bins(
+    box: tuple[int, int], pad: int, device: torch.device, dtype: torch.dtype
+) -> tuple[torch.Tensor, RadialBins]:
+    """The float32 CPU frequency axis of the ``pad``-times padded box, its bins."""
+    padded = (pad * box[0], pad * box[1])
+    frequencies = frequency_axis(calculate_num_freq_bins(padded))
+    return frequencies, RadialBins.create(
+        padded, frequencies, device=device, dtype=dtype
+    )
+
+
 # --------------------------------------------------------------------------- #
-# Table construction
+# Noise-model tables
 # --------------------------------------------------------------------------- #
 
 
@@ -457,12 +622,7 @@ def compute_error_tables(
     dtype : torch.dtype
         Dtype of the padded spectra and the binning. Default float32.
     """
-    result = reconstructor.result.to_dense()
-    if result.num_volumes != 1:
-        raise NotImplementedError(
-            f"the search supports one volume per decomposition, got "
-            f"{result.num_volumes}"
-        )
+    result = reconstructor.result
     if result.fourier_filters is None:
         raise ValueError(
             "the decomposition carries no Fourier filter; build it under "
@@ -471,79 +631,176 @@ def compute_error_tables(
     whitening.check_template_filter(result.fourier_filters)
 
     device = reconstructor.device
-    h, w = reconstructor.box_shape
-    n_rows = result.num_fourier_filters * result.num_orientations  # one filter
-
-    vol = torch.as_tensor(np.asarray(volume), dtype=torch.float32)
-    if vol.dim() != 3 or tuple(vol.shape) != (h, h, w):
-        raise ValueError(
-            f"volume must be (d, d, d) with (d, d) the template box {(h, w)}, got "
-            f"{tuple(vol.shape)}"
-        )
-
+    box = reconstructor.box_shape
     rects = as_rectangles(rectangles)
-    k_stop = max(k0 + ke for k0, _, ke, _ in rects)
-    e_stop = max(m0 + me for _, m0, _, me in rects)
-    if k_stop > result.k_max or e_stop > result.eig_max:
-        raise ValueError(
-            f"rectangles reach ({k_stop}, {e_stop}) beyond the stored "
-            f"({result.k_max}, {result.eig_max})"
-        )
+    template_filter = whitening.template_filter(box)
+    frequencies, bins = _padded_bins(box, pad, device, dtype)
 
-    # S * Vh over the kept cells, cropped to the rectangles' bounding box
-    mask = torch.zeros((k_stop, e_stop))
-    for k0, m0, ke, me in rects:
-        mask[k0 : k0 + ke, m0 : m0 + me] = 1.0
-    s = torch.as_tensor(np.asarray(result.S)[:k_stop, :e_stop]) * mask
-    vh = torch.as_tensor(np.asarray(result.Vh)[:k_stop, :e_stop])
-    weighted_vh = (s[..., None] * vh).to(device, torch.complex64)
-    # U is (num_volumes = 1, FF, O, K, E): drop the volume axis, flatten (FF, O)
-    u = torch.as_tensor(np.asarray(result.U)).reshape(n_rows, *result.U.shape[3:])
-    u = u[:, :k_stop, :e_stop]
-
-    support = reconstructor.support.clone()
-
-    # volume projections, the exact template's filter and the signal's
-    dft, edge_value_scaled, pad_width = precompute_volume_dft(vol.to(device))
-    phi = torch.as_tensor(result.phi_values, dtype=torch.float32, device=device)
-    theta = torch.as_tensor(result.theta_values, dtype=torch.float32, device=device)
-    template_filter = whitening.template_filter((h, w))
-    exact_filter = template_filter.to(device)
-    signal_filter = whitening.average_filter((h, w), device)
-
-    padded = (pad * h, pad * w)
-    frequencies = frequency_axis(calculate_num_freq_bins(padded))
-    bins = RadialBins.create(padded, frequencies, device=device, dtype=dtype)
-
+    n_rows = result.num_fourier_filters * result.num_orientations
     tables = torch.empty((len(TABLE_NAMES), n_rows, bins.n_bins))
-    for r0 in range(0, n_rows, batch):
-        rows = torch.arange(r0, min(r0 + batch, n_rows), device=device)
-
-        polar = reconstruct_polar(
-            u[r0 : r0 + batch].to(device, torch.complex64),
-            weighted_vh,
-            result.num_angular_components,
-        )
-        reconstruction = reconstructor.to_cartesian(polar)
-
-        psi = torch.zeros_like(phi[rows])
-        projections = generate_projection_batch(
-            dft, edge_value_scaled, pad_width, phi[rows], theta[rows], psi
-        )
-        exact, signal = exact_and_signal(
-            projections, exact_filter, signal_filter, support.to(device)
-        )
-
-        tables[:, r0 : r0 + batch] = error_profiles(
-            reconstruction, exact, signal, bins
+    for b in _template_rows(
+        volume,
+        reconstructor,
+        rects,
+        exact_filter=template_filter,
+        signal_filter=whitening.average_filter(box, device),
+        batch=batch,
+    ):
+        assert b.signal is not None
+        tables[:, b.rows] = error_profiles(
+            b.reconstruction, b.exact, b.signal, bins
         ).cpu()
 
     return PerSpatialFrequencyErrorTable(
         frequencies=frequencies,
         **dict(zip(TABLE_NAMES, tables.to(torch.float32), strict=True)),
-        support=support,
+        support=reconstructor.support.clone(),
         template_filter=template_filter.cpu(),
         rectangles=rects,
         warp=reconstructor.warp,
         pad=int(pad),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Exact approximation errors
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, eq=False)
+class ApproximationErrors:
+    """Exact errors of a decomposition's truncated templates, per row.
+
+    ``m`` is the reference volume's projection under the decomposition's own recorded
+    filter (normalized like the decomposition's projections, masked to the support),
+    ``m~`` its reconstruction from the kept cells, warped to Cartesian, and
+    ``delta = m - m~``. Every reduction pools energies over the rows it combines,
+    ``sqrt(sum |delta|^2 / sum |m|^2)``.
+
+    Parameters
+    ----------
+    frequencies : torch.Tensor
+        ``(F,)`` float32 frequency axis (cycles per pixel).
+    template_spectrum : torch.Tensor
+        ``(N, F)`` float64 ring power of ``m``; ``N`` the template rows.
+    residual_spectrum : torch.Tensor
+        ``(N, F)`` float64 ring power of ``delta``.
+    template_radial : torch.Tensor
+        ``(N, R)`` float64 energy of ``m`` in each one-pixel annulus about the box
+        center (annulus ``r`` holds the pixels at distance ``[r, r + 1)``).
+    residual_radial : torch.Tensor
+        ``(N, R)`` float64 energy of ``delta`` per annulus.
+    rectangles : tuple of Rectangle
+        The kept ``(k_start, m_start, k_extent, m_extent)`` regions.
+    warp : WarpConfig
+        The warp of the reconstructions.
+    """
+
+    frequencies: torch.Tensor
+    template_spectrum: torch.Tensor
+    residual_spectrum: torch.Tensor
+    template_radial: torch.Tensor
+    residual_radial: torch.Tensor
+    rectangles: tuple[Rectangle, ...]
+    warp: WarpConfig
+
+    @property
+    def radii(self) -> torch.Tensor:
+        """``(R,)`` inner radius (pixels) of each annulus."""
+        return torch.arange(self.template_radial.shape[1], dtype=torch.float32)
+
+    def by_frequency(self) -> torch.Tensor:
+        """``(F,)`` relative error of each frequency ring over every row."""
+        return _ratio(self.residual_spectrum.sum(0), self.template_spectrum.sum(0))
+
+    def by_radius(self) -> torch.Tensor:
+        """``(R,)`` relative error of each annulus over every row.
+
+        NaN for the annuli outside the support, where ``m`` is zero; what the
+        reconstructions leak there still counts in :meth:`by_orientation` and
+        :meth:`total`.
+        """
+        return _ratio(self.residual_radial.sum(0), self.template_radial.sum(0))
+
+    def by_orientation(self) -> torch.Tensor:
+        """``(N,)`` relative error of each template row (whole box)."""
+        return _ratio(self.residual_radial.sum(1), self.template_radial.sum(1))
+
+    def total(self) -> float:
+        """Relative error of every row together (whole box)."""
+        return float(_ratio(self.residual_radial.sum(), self.template_radial.sum()))
+
+
+def _ratio(residual: torch.Tensor, template: torch.Tensor) -> torch.Tensor:
+    """``sqrt(residual / template)``, NaN where the template has no energy."""
+    return torch.where(template > 0, torch.sqrt(residual / template), torch.nan).float()
+
+
+def _annuli(box: tuple[int, int], device: torch.device) -> tuple[torch.Tensor, int]:
+    """Flat annulus index of every pixel of ``box`` about its center, and the count."""
+    h, w = box
+    y = torch.arange(h, device=device, dtype=torch.float64) - h // 2
+    x = torch.arange(w, device=device, dtype=torch.float64) - w // 2
+    r = torch.sqrt(y[:, None] ** 2 + x[None, :] ** 2).floor().long().flatten()
+    return r, int(r.max()) + 1
+
+
+@torch.no_grad()
+def compute_errors(
+    volume: torch.Tensor | np.ndarray,
+    reconstructor: Reconstructor,
+    rectangles: Sequence[Rectangle],
+    *,
+    pad: int = 2,
+    batch: int = 128,
+) -> ApproximationErrors:
+    """Exact errors of ``rectangles`` against the reference ``volume``'s projections.
+
+    Unlike :func:`compute_error_tables`, which the noise model reads, this needs no
+    whitening filter: ``m`` is filtered as the decomposition recorded (by its own
+    Fourier filters, or not at all), so an unwhitened decomposition gives unwhitened
+    errors.
+
+    Parameters
+    ----------
+    volume : torch.Tensor or numpy.ndarray
+        ``(d, d, d)`` reference volume; ``(d, d)`` is the template box.
+    reconstructor : Reconstructor
+        The decomposition and its warp.
+    rectangles : sequence of Rectangle
+        Kept ``(k_start, m_start, k_extent, m_extent)`` feature regions.
+    pad : int
+        Zero-padding factor of the spectra. Default 2.
+    batch : int
+        Template rows per batch. Default 128.
+    """
+    device = reconstructor.device
+    box = reconstructor.box_shape
+    rects = as_rectangles(rectangles)
+    frequencies, bins = _padded_bins(box, pad, device, torch.float64)
+    annulus, n_annuli = _annuli(box, device)
+
+    def radial(images: torch.Tensor) -> torch.Tensor:
+        flat = images.to(torch.float64).square().flatten(1)
+        out = flat.new_zeros((flat.shape[0], n_annuli))
+        return out.index_add_(1, annulus, flat)
+
+    parts: dict[str, list[torch.Tensor]] = {
+        "template_spectrum": [],
+        "residual_spectrum": [],
+        "template_radial": [],
+        "residual_radial": [],
+    }
+    for b in _template_rows(volume, reconstructor, rects, batch=batch):
+        residual = b.exact - b.reconstruction
+        parts["template_spectrum"].append(_rfft_power(b.exact, bins).cpu())
+        parts["residual_spectrum"].append(_rfft_power(residual, bins).cpu())
+        parts["template_radial"].append(radial(b.exact).cpu())
+        parts["residual_radial"].append(radial(residual).cpu())
+
+    return ApproximationErrors(
+        frequencies=frequencies,
+        **{name: torch.cat(chunks) for name, chunks in parts.items()},
+        rectangles=rects,
+        warp=reconstructor.warp,
     )

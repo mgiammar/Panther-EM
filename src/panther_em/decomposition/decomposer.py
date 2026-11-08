@@ -270,7 +270,7 @@ class PolarProjectionDecomposer:
         # Transforms are device-agnostic; GPU dispatch is handled internally.
         transformer = self._coordinate_transform
 
-        polar_projections_transformed_cpu, is_complex, k_max = (
+        polar_projections_transformed_cpu, is_complex, k_max, block_energy = (
             do_pipelined_projection_and_transforms(
                 volume=self.volume,
                 phi=self.phi_values,
@@ -379,6 +379,8 @@ class PolarProjectionDecomposer:
             volume_labels=volume_labels_np,
             coordinate_transform=result_transform,
             warp_config=self.warp,
+            block_energy=block_energy.numpy(),
+            normalized_projections=normalize_projections,
         )
 
         return self._result

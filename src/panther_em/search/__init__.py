@@ -110,7 +110,9 @@ Panther-EM supplies the steps; an external application drives the loops.
    (:class:`~panther_em.decomposition.PolarProjectionDecomposer` with
    ``fourier_filters=whitening.template_filter(box)[None]``); the result records the
    warp every later step uses.
-4. Per feature selection: :func:`~panther_em.approximation.compute_error_tables`
+4. Per feature selection (:func:`~panther_em.approximation.suggest_rectangles`
+   proposes ranks for an error target or a budget):
+   :func:`~panther_em.approximation.compute_error_tables`
    ``(volume, template.reconstructor, rectangles, whitening)`` (saved once per
    template). Per micrograph: :meth:`Micrograph.prepare` whitens it by
    ``W_avg * C_i^2`` and estimates its curves and level map; :meth:`Searcher.run`;
