@@ -75,6 +75,7 @@ def test_threshold_test_pipeline_runs_end_to_end(tmp_path):
     assert particle["label"] == "ACCEPTED"
     assert particle["orientation"] == 3 and particle["defocus"] == 1
     assert particle["zscore"] > summary["threshold"]
-    # the empty micrographs accept nothing
+    # the empty micrographs accept nothing; a fixed-seed statistical outcome, see the
+    # note at NOISE_SEED in the script before changing either
     for name in ("m1", "m2"):
         assert summary["micrographs"][name]["final"]["ACCEPTED"] == 0
