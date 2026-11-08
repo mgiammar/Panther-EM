@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 if TYPE_CHECKING:
-    from panther_em.decomposition.result import DecompositionResult
+    from panther_em.decomposition.result import DecompositionBase
 
 
 def psi_degrees(n_psi: int, device: torch.device | str = "cpu") -> torch.Tensor:
@@ -63,7 +63,7 @@ class HypothesisSpace:
     @classmethod
     def from_result(
         cls,
-        result: DecompositionResult,
+        result: DecompositionBase,
         n_defocus: int = 1,
         defocus_values: torch.Tensor | None = None,
     ) -> HypothesisSpace:

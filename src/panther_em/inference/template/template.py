@@ -7,10 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from panther_em.decomposition.result import (
-    DecompositionResult,
-    SparseDecompositionResult,
-)
+from panther_em.decomposition.result import DecompositionBase
 from panther_em.inference.template.warp import KernelConfig, TemplateWarp
 from panther_em.inference.template.weights import WeightSource
 
@@ -28,7 +25,7 @@ class Template:
 
     Parameters
     ----------
-    result : DecompositionResult
+    result : DecompositionBase
         The (dense or sparse) decomposition, with its coordinate transform.
     device : torch.device or str
         Compute device for kernels and weights.
@@ -41,7 +38,7 @@ class Template:
 
     def __init__(
         self,
-        result: DecompositionResult,
+        result: DecompositionBase,
         *,
         device: torch.device | str,
         kernel: KernelConfig | None = None,
@@ -102,10 +99,7 @@ class Template:
         weights_cells: Rectangle | Sequence[Rectangle] | None = None,
     ) -> Template:
         """Load a dense or sparse decomposition and wrap it."""
-        try:
-            result: DecompositionResult = DecompositionResult.load(path)
-        except ValueError:
-            result = SparseDecompositionResult.load(path)
+        result = DecompositionBase.load(path)
         return cls(result, device=device, kernel=kernel, weights_cells=weights_cells)
 
     def release(self) -> None:

@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from panther_em.coordinates.transform_base import CoordinateTransform
-from panther_em.decomposition.result import DecompositionResult
+from panther_em.decomposition.result import DecompositionBase
 
 
 class ProjectionReconstructor:
@@ -12,7 +12,7 @@ class ProjectionReconstructor:
 
     def __init__(
         self,
-        result: DecompositionResult,
+        result: DecompositionBase,
         device: str | torch.device = "cpu",
     ) -> None:
         if result.coordinate_transform is None:

@@ -182,6 +182,10 @@ def test_template_bundle_and_hdf5_round_trip(synthetic_result, tmp_path):
     template.release()
     assert template._weights is None
 
+    result.to_sparse(7).save(tmp_path / "sparse.h5")
+    sparse = Template.from_hdf5(tmp_path / "sparse.h5", device="cpu")
+    assert sparse.n_templates == template.n_templates
+
 
 @requires_cuda
 def test_separable_build_matches_generic_on_a_side_stream(synthetic_result):

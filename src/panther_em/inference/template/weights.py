@@ -10,7 +10,7 @@ import torch
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from panther_em.decomposition.result import DecompositionResult
+    from panther_em.decomposition.result import DecompositionBase
     from panther_em.inference.search.correlation.layout import FeatureLayout
 
 Rectangle = tuple[int, int, int, int]
@@ -21,9 +21,9 @@ class WeightSource:
 
     Parameters
     ----------
-    result : DecompositionResult
+    result : DecompositionBase
         Dense or sparse single-volume decomposition (sparse pairs absent from the
-        stored set are zeros, as in :meth:`~DecompositionResult.get_component`).
+        stored set are zeros, as in :meth:`~DecompositionBase.get_component`).
     device : torch.device or str
         Where the weights live.
     cells_union : Rectangle or sequence of Rectangle, optional
@@ -33,7 +33,7 @@ class WeightSource:
 
     def __init__(
         self,
-        result: DecompositionResult,
+        result: DecompositionBase,
         device: torch.device | str,
         cells_union: Rectangle | Sequence[Rectangle] | None = None,
     ) -> None:

@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
     from panther_em.coordinates.transform_base import CoordinateTransform
-    from panther_em.decomposition.result import DecompositionResult
+    from panther_em.decomposition.result import DecompositionBase
     from panther_em.inference.template.adjoint import AdjointBases
 
 Rectangle = tuple[int, int, int, int]
@@ -88,7 +88,7 @@ class TemplateWarp:
 
     Parameters
     ----------
-    result : DecompositionResult
+    result : DecompositionBase
         The decomposition and its coordinate transform.
     config : KernelConfig, optional
         Warp settings; defaults to ``KernelConfig()``.
@@ -98,7 +98,7 @@ class TemplateWarp:
 
     def __init__(
         self,
-        result: DecompositionResult,
+        result: DecompositionBase,
         config: KernelConfig | None = None,
         *,
         device: torch.device | str,

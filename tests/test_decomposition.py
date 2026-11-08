@@ -21,6 +21,7 @@ from panther_em.decomposition.pipeline_projections import (
     precompute_volume_dft,
 )
 from panther_em.decomposition.result import (
+    DecompositionBase,
     DecompositionResult,
     SparseDecompositionResult,
 )
@@ -682,3 +683,58 @@ class TestMultiVolumeShapes:
 
         dense = loaded.to_dense()
         assert dense.U.shape[0] == NUM_VOL
+
+
+class TestDenseAndSparseAreSiblings:
+    """Dense and sparse results share DecompositionBase, not each other."""
+
+    def test_sparse_is_not_a_dense_result(self):
+        sparse = _make_result(is_complex=False).to_sparse(n=5)
+        assert isinstance(sparse, DecompositionBase)
+        assert not isinstance(sparse, DecompositionResult)
+        assert not hasattr(sparse, "U")  # absent, rather than a property that raises
+
+    def test_load_dispatches_on_the_is_sparse_flag(self, tmp_path: Path):
+        result = _make_result(is_complex=False)
+        result.save(tmp_path / "dense.h5")
+        result.to_sparse(n=5).save(tmp_path / "sparse.h5")
+
+        assert (
+            type(DecompositionBase.load(tmp_path / "dense.h5")) is DecompositionResult
+        )
+        loaded = DecompositionBase.load(tmp_path / "sparse.h5")
+        assert type(loaded) is SparseDecompositionResult
+
+    def test_concrete_load_rejects_the_other_kind(self, tmp_path: Path):
+        result = _make_result(is_complex=False)
+        result.save(tmp_path / "dense.h5")
+        result.to_sparse(n=5).save(tmp_path / "sparse.h5")
+
+        with pytest.raises(ValueError, match="contains a sparse result"):
+            DecompositionResult.load(tmp_path / "sparse.h5")
+        with pytest.raises(ValueError, match="contains a dense result"):
+            SparseDecompositionResult.load(tmp_path / "dense.h5")
+
+    def test_sparse_validates_metadata_like_dense(self):
+        result = _make_result(is_complex=False)
+        result.phi_values = np.zeros(NUM_OR + 1)
+        with pytest.raises(ValueError, match="phi_values shape"):
+            result.to_sparse(n=5)
+
+    def test_sparse_rejects_inconsistent_arrays(self):
+        sparse = _make_result(is_complex=False).to_sparse(n=5)
+        with pytest.raises(ValueError, match="inconsistent with selected_indices"):
+            SparseDecompositionResult.from_sparse_arrays(
+                U_data=sparse._U_data[..., :-1],
+                S_data=sparse._S_data,
+                Vh_data=sparse._Vh_data,
+                selected_indices=sparse._selected_indices,
+                k_max=sparse.k_max,
+                eig_max=sparse.eig_max,
+                is_complex_projection=sparse.is_complex_projection,
+                num_fourier_filters=sparse.num_fourier_filters,
+                num_orientations=sparse.num_orientations,
+                num_angular_components=sparse.num_angular_components,
+                num_radial_components=sparse.num_radial_components,
+                num_volumes=sparse.num_volumes,
+            )
