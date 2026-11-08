@@ -31,8 +31,8 @@ from panther_em.inference.search.featurization import FeatureStore
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from panther_em.decomposition.rectangles import Rectangle
     from panther_em.inference.search.correlation import Correlator, StageMaps
-    from panther_em.inference.search.correlation.layout import Rectangle
     from panther_em.inference.search.featurization import (
         BaseImageFeaturization,
         Mode,

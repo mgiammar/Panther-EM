@@ -4,7 +4,7 @@ A feature kernel ``K_km`` is the polar outer product of the angular phase ``a_k`
 the radial SVD vector ``Vh_km``, warped onto the template's Cartesian box. Every
 consumer of the decomposition must warp it the same way: the featurizations (forward
 kernels, or the warp's adjoint) and the noise model's error tables (the reconstruction
-and the support disk). :class:`KernelConfig` names the warp and :class:`TemplateWarp`
+and the support disk). :class:`WarpConfig` names the warp and :class:`TemplateWarp`
 is its single implementation:
 
 * :meth:`TemplateWarp.spatial` -- the kernels ``(n, kH, kW)``, built on demand (no
@@ -18,13 +18,13 @@ is its single implementation:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 
+from panther_em.coordinates.warp_config import WarpConfig
 from panther_em.inference.projection_reconstruction import ProjectionReconstructor
 from panther_em.inference.template.adjoint import WarpAdjoint, build_bases
 
@@ -35,43 +35,8 @@ if TYPE_CHECKING:
     from panther_em.decomposition.result import DecompositionBase
     from panther_em.inference.template.adjoint import AdjointBases
 
-Rectangle = tuple[int, int, int, int]
-
 BUILD_CHUNK = 64
 """Kernels built per polar-to-Cartesian call."""
-
-
-@dataclass(frozen=True)
-class KernelConfig:
-    """Polar-to-Cartesian warp settings of a template's kernels.
-
-    Attributes
-    ----------
-    order : int
-        B-spline interpolation order.
-    mode, cval : str, float
-        Boundary handling outside the polar grid (``"constant"`` with ``cval``).
-    preserve_energy : bool
-        Divide by the transform's Jacobian before warping.
-    wrap_angular_axis : bool
-        Treat the angular axis as periodic.
-    """
-
-    order: int = 5
-    mode: str = "constant"
-    cval: float = 0.0
-    preserve_energy: bool = True
-    wrap_angular_axis: bool = True
-
-    def as_kwargs(self) -> dict[str, int | str | float | bool]:
-        """Keyword arguments of ``CoordinateTransform.to_cartesian``."""
-        return {
-            "order": self.order,
-            "mode": self.mode,
-            "cval": self.cval,
-            "preserve_energy": self.preserve_energy,
-            "wrap_angular_axis": self.wrap_angular_axis,
-        }
 
 
 def _as_cells(cells: torch.Tensor | Iterable[Sequence[int]]) -> list[tuple[int, int]]:
@@ -84,14 +49,14 @@ def _as_cells(cells: torch.Tensor | Iterable[Sequence[int]]) -> list[tuple[int, 
 
 
 class TemplateWarp:
-    """The warp of one decomposition's kernels under one :class:`KernelConfig`.
+    """The warp of one decomposition's kernels under one :class:`WarpConfig`.
 
     Parameters
     ----------
     result : DecompositionBase
         The decomposition and its coordinate transform.
-    config : KernelConfig, optional
-        Warp settings; defaults to ``KernelConfig()``.
+    config : WarpConfig, optional
+        Warp settings; defaults to ``WarpConfig()``.
     device : torch.device or str
         Where kernels, the adjoint and the bases are built.
     """
@@ -99,14 +64,14 @@ class TemplateWarp:
     def __init__(
         self,
         result: DecompositionBase,
-        config: KernelConfig | None = None,
+        config: WarpConfig | None = None,
         *,
         device: torch.device | str,
     ) -> None:
         if result.is_complex_projection:
             raise NotImplementedError("Complex-valued projections not yet supported")
         self.result = result
-        self.config = config or KernelConfig()
+        self.config = config or WarpConfig()
         self.device = torch.device(device)
         self.reconstructor = ProjectionReconstructor(result, device=self.device)
         self.box_shape: tuple[int, int] = tuple(  # type: ignore[assignment]

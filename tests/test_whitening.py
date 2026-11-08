@@ -1,4 +1,4 @@
-"""noise_model.WhiteningFilter: the filters, the corrections and the guards."""
+"""filters.WhiteningFilter: the filters, the corrections and the guards."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from torch_fourier_filter.bandpass import low_pass_filter
 from torch_fourier_filter.whitening import calculate_num_freq_bins, whitening_filter
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
-from panther_em.inference.search.noise_model import whitening as whitening_module
-from panther_em.inference.search.noise_model.whitening import (
+from panther_em.filters import whitening as whitening_module
+from panther_em.filters.whitening import (
     WhiteningFilter,
     canonical_device,
 )

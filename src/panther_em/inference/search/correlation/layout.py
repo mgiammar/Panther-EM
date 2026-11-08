@@ -12,26 +12,10 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, NamedTuple
 
+from panther_em.decomposition.rectangles import Rectangle, as_rectangle
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
-
-# (k_start, m_start, k_extent, m_extent) block of ``(angular frequency, eigenvector)``
-# feature space.
-Rectangle = tuple[int, int, int, int]
-
-
-def as_rectangle(rect: Sequence[int]) -> Rectangle:
-    """``(k_start, m_start, k_extent, m_extent)`` as validated Python ints."""
-    if len(rect) != 4:
-        raise ValueError(
-            f"a rectangle is (k_start, m_start, k_extent, m_extent), got {rect!r}"
-        )
-    k0, m0, k_ext, m_ext = (int(v) for v in rect)
-    if k0 < 0 or m0 < 0:
-        raise ValueError(f"rectangle starts must be >= 0, got {rect!r}")
-    if k_ext <= 0 or m_ext <= 0:
-        raise ValueError(f"rectangle extents must be > 0, got {rect!r}")
-    return (k0, m0, k_ext, m_ext)
 
 
 def rectangles_disjoint(rectangles: Sequence[Rectangle]) -> bool:

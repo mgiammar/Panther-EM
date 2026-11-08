@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from conftest import requires_cuda
 
-from panther_em.utils.warp_backends import warp_numpy, warp_torch_cuda
+from panther_em.coordinates.warp_backends import warp_numpy, warp_torch_cuda
 
 
 @requires_cuda

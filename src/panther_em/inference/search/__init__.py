@@ -13,9 +13,10 @@ Objects, by lifetime
   :class:`~panther_em.decomposition.result.DecompositionResult` with its kernel warp
   (:class:`~panther_em.inference.template.TemplateWarp`: Cartesian kernels on demand,
   the transposed warp the direct engine uses) and device-resident ``U * S``.
-* **Per dataset** (:mod:`.noise_model`): the
-  :class:`~.noise_model.WhiteningFilter` (``W_avg``, every micrograph's ``C_i``, the
-  template band) the decomposition and every search image are built under.
+* **Per dataset** (:mod:`panther_em.filters`): the
+  :class:`~panther_em.filters.WhiteningFilter` (``W_avg``, every micrograph's
+  ``C_i``, the template band) the decomposition and every search image are built
+  under.
 * **Per template and feature selection** (:mod:`.noise_model`):
   :class:`~.noise_model.PerSpatialFrequencyErrorTable`, the ring profiles of the
   reconstruction, residual and signal of every template row, which the coloured-noise
@@ -98,9 +99,9 @@ The pipeline around a search
 Panther-EM supplies the steps; an external application drives the loops.
 
 1. Select the micrographs (names and a generator of pre-processed real-space images).
-2. :class:`~.noise_model.WhiteningFilter` ``.from_images(generator)``: the averaged
-   whitening filter ``W_avg``, every micrograph's correction ``C_i`` and the template
-   band (saved once per dataset).
+2. :class:`~panther_em.filters.WhiteningFilter` ``.from_images(generator)``: the
+   averaged whitening filter ``W_avg``, every micrograph's correction ``C_i`` and the
+   template band (saved once per dataset).
 3. Decompose the structure under ``W_avg * band`` (``PolarProjectionDecomposer`` with
    ``fourier_filters=whitening.template_filter(box)[None]``).
 4. Per feature selection: :func:`~.noise_model.compute_error_tables` ``(volume,
@@ -128,7 +129,6 @@ Example
 from panther_em.inference.search.config import ExecutionConfig, Tuning
 from panther_em.inference.search.correlation import Correlator, FeatureLayout
 from panther_em.inference.search.correlation.contraction import BatchShape, Precision
-from panther_em.inference.search.correlation.layout import Rectangle
 from panther_em.inference.search.decision import Decision, PixelLabel
 from panther_em.inference.search.featurization import (
     BaseImageFeaturization,
@@ -142,10 +142,6 @@ from panther_em.inference.search.hypotheses import (
     HypBatch,
     HypothesisSet,
     HypothesisSpace,
-    healpix_ipix,
-    healpix_level_ids,
-    healpix_orientations,
-    psi_degrees,
 )
 from panther_em.inference.search.images import (
     PixelSelection,
@@ -158,7 +154,6 @@ from panther_em.inference.search.noise_model import (
     NoiseScales,
     PerSpatialFrequencyErrorTable,
     ThresholdTest,
-    WhiteningFilter,
     compute_error_tables,
     zeta_quantile,
     zscore_threshold,
@@ -197,7 +192,6 @@ __all__ = [
     "PixelLedger",
     "PixelSelection",
     "Precision",
-    "Rectangle",
     "SearchGeometry",
     "SearchImages",
     "SearchResult",
@@ -209,15 +203,10 @@ __all__ = [
     "StageRunner",
     "ThresholdTest",
     "Tuning",
-    "WhiteningFilter",
     "choose_mode",
     "compute_error_tables",
-    "healpix_ipix",
-    "healpix_level_ids",
-    "healpix_orientations",
     "make_featurization",
     "plan_stage",
-    "psi_degrees",
     "zeta_quantile",
     "zscore_threshold",
 ]

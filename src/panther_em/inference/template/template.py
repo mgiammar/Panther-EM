@@ -8,16 +8,16 @@ from typing import TYPE_CHECKING
 import torch
 
 from panther_em.decomposition.result import DecompositionBase
-from panther_em.inference.template.warp import KernelConfig, TemplateWarp
+from panther_em.inference.template.warp import TemplateWarp
 from panther_em.inference.template.weights import WeightSource
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
+    from panther_em.coordinates.warp_config import WarpConfig
+    from panther_em.decomposition.rectangles import Rectangle
     from panther_em.inference.search.hypotheses import HypothesisSpace
-
-Rectangle = tuple[int, int, int, int]
 
 
 class Template:
@@ -29,8 +29,8 @@ class Template:
         The (dense or sparse) decomposition, with its coordinate transform.
     device : torch.device or str
         Compute device for kernels and weights.
-    kernel : KernelConfig, optional
-        Polar-to-Cartesian warp settings (default ``KernelConfig()``).
+    kernel : WarpConfig, optional
+        Polar-to-Cartesian warp settings (default ``WarpConfig()``).
     weights_cells : Rectangle or sequence of Rectangle, optional
         Bounding box of the feature space any stage will use; restricts the resident
         ``U * S`` (see :class:`~.weights.WeightSource`).
@@ -41,7 +41,7 @@ class Template:
         result: DecompositionBase,
         *,
         device: torch.device | str,
-        kernel: KernelConfig | None = None,
+        kernel: WarpConfig | None = None,
         weights_cells: Rectangle | Sequence[Rectangle] | None = None,
     ) -> None:
         self.result = result
@@ -51,7 +51,7 @@ class Template:
         self._weights: WeightSource | None = None
 
     @property
-    def kernel_config(self) -> KernelConfig:
+    def kernel_config(self) -> WarpConfig:
         """The warp settings of every kernel, adjoint and error table."""
         return self.warp.config
 
@@ -95,7 +95,7 @@ class Template:
         path: str | Path,
         device: torch.device | str,
         *,
-        kernel: KernelConfig | None = None,
+        kernel: WarpConfig | None = None,
         weights_cells: Rectangle | Sequence[Rectangle] | None = None,
     ) -> Template:
         """Load a dense or sparse decomposition and wrap it."""

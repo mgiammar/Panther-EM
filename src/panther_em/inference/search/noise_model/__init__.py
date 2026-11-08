@@ -1,8 +1,7 @@
-"""The coloured-noise model of a search: whitening, curves, error tables, the test.
+"""The coloured-noise model of a search: the prepared image, error tables, the test.
 
-- :class:`WhiteningFilter`: ``W_avg``, every micrograph's ``C_i`` and the template band,
-  the one source of the decomposition filter, the search-image filter and the signal
-  correction, with guards on the links between them;
+The whitening it relies on lives in :mod:`panther_em.filters`.
+
 - :class:`ImageSet`: one micrograph's search image, CTF planes, noise / signal curves
   and level map;
 - :class:`PerSpatialFrequencyErrorTable` (:func:`compute_error_tables`): the template's
@@ -27,7 +26,6 @@ from panther_em.inference.search.noise_model.threshold_test import (
     zeta_quantile,
     zscore_threshold,
 )
-from panther_em.inference.search.noise_model.whitening import WhiteningFilter
 
 __all__ = [
     "Calibration",
@@ -36,7 +34,6 @@ __all__ = [
     "PerSpatialFrequencyErrorTable",
     "RadialBins",
     "ThresholdTest",
-    "WhiteningFilter",
     "compute_error_tables",
     "zeta_quantile",
     "zscore_threshold",

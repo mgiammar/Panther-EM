@@ -7,13 +7,14 @@ import torch
 from noise_case import BAND, BOX, SHAPE, decompose, noise_case, prepare
 from torch_fourier_filter.bandpass import low_pass_filter
 
+from panther_em.coordinates import WarpConfig
 from panther_em.inference.search.noise_model.spatial_frequency_error import (
     TABLE_NAMES,
     PerSpatialFrequencyErrorTable,
     RadialBins,
     compute_error_tables,
 )
-from panther_em.inference.template import KernelConfig, Template
+from panther_em.inference.template import Template
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",
@@ -59,9 +60,7 @@ def test_check_template(whitening, decomposition, synthetic_result):
     table.check_template(template)
     result = template.result
     with pytest.raises(ValueError, match="kernel warp"):
-        table.check_template(
-            Template(result, device="cpu", kernel=KernelConfig(order=3))
-        )
+        table.check_template(Template(result, device="cpu", kernel=WarpConfig(order=3)))
     with pytest.raises(ValueError, match="box"):
         table.check_template(Template(synthetic_result(box=20), device="cpu"))
     with pytest.raises(ValueError, match="template rows"):

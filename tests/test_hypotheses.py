@@ -1,16 +1,13 @@
-"""HypothesisSpace / HypothesisSet index math and the HEALPix level sampling."""
+"""HypothesisSpace / HypothesisSet index math."""
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 import torch
 
 from panther_em.inference.search.hypotheses import (
     HypothesisSet,
     HypothesisSpace,
-    healpix_level_ids,
-    psi_degrees,
     template_rows_for,
 )
 
@@ -37,7 +34,6 @@ def test_decode_is_the_inverse_of_the_global_id_with_passthrough():
     assert torch.equal(back_d, d) and torch.equal(back_f, f) and torch.equal(back_o, o)
     neg_d, neg_f, neg_o = space.decode(torch.tensor([-1, 5]))
     assert neg_d[0] == -1 and neg_f[0] == -1 and neg_o[0] == -1 and neg_o[1] == 5
-    assert torch.equal(psi_degrees(4), torch.tensor([0.0, 90.0, 180.0, 270.0]))
 
 
 def test_set_full_space_is_contiguous_defocus_outer():
@@ -115,15 +111,3 @@ def test_set_signature_distinguishes_selections():
         space, torch.arange(0, 14, 2), None, hyp_batch=4, n_psi=8
     ).signature
     assert a != b and b == c
-
-
-def test_healpix_level_ids_keep_one_child_per_coarser_pixel():
-    ipix = np.arange(48)  # nside = 2, NESTED: parents at nside = 1 own 4 children
-    assert healpix_level_ids(ipix, 1).tolist() == list(range(0, 48, 4))
-    assert healpix_level_ids(ipix, 2).tolist() == list(range(0, 48, 16))
-    assert healpix_level_ids(ipix, 0).tolist() == list(range(48))
-    # orientation ids index the template's own orientation order, not the sphere
-    sub = np.array([5, 4, 8, 0])
-    assert healpix_level_ids(sub, 1).tolist() == [1, 2, 3]
-    with pytest.raises(ValueError):
-        healpix_level_ids(ipix, -1)

@@ -36,10 +36,10 @@ if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
     from panther_em.coordinates.transform_base import CoordinateTransform
+    from panther_em.coordinates.warp_config import WarpConfig
+    from panther_em.decomposition.rectangles import Rectangle
     from panther_em.inference.projection_reconstruction import ProjectionReconstructor
     from panther_em.inference.search.correlation.contraction import Precision
-    from panther_em.inference.search.correlation.layout import Rectangle
-    from panther_em.inference.template.warp import KernelConfig
 
 NPAD = 12
 """ndimage's ``grid-constant`` pre-padding (samples of ``cval`` per edge) before the
@@ -110,7 +110,7 @@ def _tf32(enabled: bool) -> Iterator[None]:
 
 
 def unsupported_reason(
-    transform: CoordinateTransform, config: KernelConfig
+    transform: CoordinateTransform, config: WarpConfig
 ) -> str | None:
     """Why the adjoint cannot mirror ``to_cartesian`` for this transform/config."""
     if config.mode != "constant" or float(config.cval) != 0.0:
@@ -179,7 +179,7 @@ class WarpAdjoint:
     def build(
         cls,
         transform: CoordinateTransform,
-        config: KernelConfig,
+        config: WarpConfig,
         device: torch.device | str,
     ) -> WarpAdjoint | None:
         """The adjoint for ``transform`` under ``config``; ``None`` if unsupported."""

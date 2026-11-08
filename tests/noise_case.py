@@ -17,11 +17,8 @@ from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
 from panther_em.coordinates import OffsetPolarTransform
 from panther_em.decomposition import PolarProjectionDecomposer
-from panther_em.inference.search.noise_model import (
-    ImageSet,
-    WhiteningFilter,
-    compute_error_tables,
-)
+from panther_em.filters import WhiteningFilter
+from panther_em.inference.search.noise_model import ImageSet, compute_error_tables
 from panther_em.inference.template import Template
 
 SHAPE = (96, 96)

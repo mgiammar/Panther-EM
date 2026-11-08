@@ -1,4 +1,4 @@
-"""noise_model.curves: the frequency axis, amplitude spectra, whitening curves."""
+"""filters.curves: the frequency axis, amplitude spectra, whitening curves."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import torch
 from torch_fourier_filter.whitening import calculate_num_freq_bins
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
-from panther_em.inference.search.noise_model.curves import (
+from panther_em.filters.curves import (
     amplitude_spectrum_1d,
     curve_to_grid,
     frequency_axis,

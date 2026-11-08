@@ -44,6 +44,7 @@ from panther_em.decomposition.pipeline_projections import (
     precompute_volume_dft,
 )
 from panther_em.decomposition.result import DecompositionResult
+from panther_em.filters import WhiteningFilter
 from panther_em.inference.search import (
     Calibration,
     Decision,
@@ -54,12 +55,11 @@ from panther_em.inference.search import (
     SearchResult,
     Stage,
     ThresholdTest,
-    WhiteningFilter,
     compute_error_tables,
-    healpix_orientations,
     zscore_threshold,
 )
 from panther_em.inference.template import Template
+from panther_em.orientations import healpix_orientations
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

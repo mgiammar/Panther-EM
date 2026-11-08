@@ -10,10 +10,9 @@ import torch
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from panther_em.decomposition.rectangles import Rectangle
     from panther_em.decomposition.result import DecompositionBase
     from panther_em.inference.search.correlation.layout import FeatureLayout
-
-Rectangle = tuple[int, int, int, int]
 
 
 class WeightSource:

@@ -10,16 +10,16 @@ from torch_fourier_filter.utils import bin_1dim_with_lerp
 from torch_fourier_filter.whitening import calculate_num_freq_bins
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
-from panther_em.inference.search.noise_model.curves import (
+from panther_em.coordinates import WarpConfig
+from panther_em.filters.curves import (
     curve_to_grid,
     frequency_axis,
 )
+from panther_em.filters.whitening import WhiteningFilter
 from panther_em.inference.search.noise_model.image_set import FLATTEN_FLOOR, ImageSet
 from panther_em.inference.search.noise_model.spatial_frequency_error import (
     PerSpatialFrequencyErrorTable,
 )
-from panther_em.inference.search.noise_model.whitening import WhiteningFilter
-from panther_em.inference.template import KernelConfig
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -65,7 +65,7 @@ def error_table(whitening):
         support=support_disk(),
         template_filter=whitening.template_filter((BOX, BOX)),
         rectangles=((0, 0, 1, 1),),
-        kernel_config=KernelConfig(),
+        kernel_config=WarpConfig(),
     )
 
 

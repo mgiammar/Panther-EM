@@ -28,13 +28,13 @@ def test_batch_shape_validation():
 def test_kernel_config_kwargs_match_construct_cartesian_feature_signature():
     import inspect
 
+    from panther_em.coordinates import WarpConfig
     from panther_em.inference.projection_reconstruction import ProjectionReconstructor
-    from panther_em.inference.template import KernelConfig
 
     params = inspect.signature(
         ProjectionReconstructor.construct_cartesian_feature
     ).parameters
-    for key in KernelConfig().as_kwargs():
+    for key in WarpConfig().as_kwargs():
         assert key in params
 
 

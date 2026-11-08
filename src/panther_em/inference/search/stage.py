@@ -18,21 +18,22 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+from panther_em.decomposition.rectangles import as_rectangle
 from panther_em.inference.search.correlation.contraction import Precision
 from panther_em.inference.search.correlation.layout import (
     FeatureLayout,
-    as_rectangle,
     rectangles_disjoint,
 )
 from panther_em.inference.search.decision import Decision
-from panther_em.inference.search.hypotheses import healpix_level_ids, template_rows_for
+from panther_em.inference.search.hypotheses import template_rows_for
+from panther_em.orientations import healpix_level_ids
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     import numpy as np
 
-    from panther_em.inference.search.correlation.layout import Rectangle
+    from panther_em.decomposition.rectangles import Rectangle
     from panther_em.inference.search.hypotheses import HypothesisSpace
 
 
@@ -56,8 +57,8 @@ class Stage:
         ``None`` searches every orientation; an int ``L`` keeps one orientation per
         HEALPix pixel ``L`` levels coarser than the template's sampling (the
         template's Euler angles must be HEALPix pixel centers, see
-        :func:`~.hypotheses.healpix_orientations`); a 1-D int64 tensor lists explicit
-        orientation ids. Every Fourier filter is searched either way.
+        :func:`~panther_em.orientations.healpix_orientations`); a 1-D int64 tensor
+        lists explicit orientation ids. Every Fourier filter is searched either way.
     planes : tuple of int, optional
         CTF (defocus) planes searched in this stage, sorted; ``None`` = all.
     decision : Decision, optional
@@ -204,7 +205,8 @@ class Stage:
         """``(template_ids, defocus_ids)`` of this stage (``None`` = all).
 
         ``ipix`` are the template's NESTED HEALPix pixel ids
-        (:func:`~.hypotheses.healpix_ipix`), needed when ``orientations`` is a level.
+        (:func:`~panther_em.orientations.healpix_ipix`), needed when ``orientations``
+        is a level.
         """
         planes = None if self.planes is None else torch.tensor(self.planes)
         if self.orientations is None or (

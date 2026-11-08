@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import json
 from dataclasses import dataclass
 from functools import cached_property
@@ -21,24 +20,25 @@ import torch
 from torch_fourier_filter.whitening import calculate_num_freq_bins
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
+from panther_em.coordinates.warp_config import WarpConfig
 from panther_em.decomposition.pipeline_projections import (
     generate_projection_batch,
     precompute_volume_dft,
 )
-from panther_em.inference.search.noise_model.curves import frequency_axis
-from panther_em.inference.search.noise_model.whitening import (
+from panther_em.decomposition.rectangles import as_rectangles
+from panther_em.filters.curves import frequency_axis
+from panther_em.filters.whitening import (
     FILTER_ATOL,
     FILTER_RTOL,
     canonical_device,
 )
-from panther_em.inference.template import KernelConfig
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
-    from panther_em.inference.search.correlation.layout import Rectangle
-    from panther_em.inference.search.noise_model.whitening import WhiteningFilter
+    from panther_em.decomposition.rectangles import Rectangle
+    from panther_em.filters.whitening import WhiteningFilter
     from panther_em.inference.template import Template
 
 TABLE_NAMES = (
@@ -75,7 +75,7 @@ class PerSpatialFrequencyErrorTable:
         ``(kH, kW // 2 + 1)`` float32 ``W_avg * band`` the tables were built under.
     rectangles : tuple of Rectangle
         The kept ``(k_start, m_start, k_extent, m_extent)`` feature regions.
-    kernel_config : KernelConfig
+    kernel_config : WarpConfig
         The warp the reconstructions and the support disk were built with; a search
         must use a template with the same (:meth:`check_template`).
     pad : int
@@ -91,7 +91,7 @@ class PerSpatialFrequencyErrorTable:
     support: torch.Tensor
     template_filter: torch.Tensor
     rectangles: tuple[Rectangle, ...]
-    kernel_config: KernelConfig
+    kernel_config: WarpConfig
     pad: int = 2
 
     def __post_init__(self) -> None:
@@ -142,8 +142,8 @@ class PerSpatialFrequencyErrorTable:
             ):
                 raise ValueError(f"bad rectangle {r!r}; see compute_error_tables")
 
-        if not isinstance(self.kernel_config, KernelConfig):
-            raise ValueError("kernel_config must be a KernelConfig")
+        if not isinstance(self.kernel_config, WarpConfig):
+            raise ValueError("kernel_config must be a WarpConfig")
 
         if self.pad < 1:
             raise ValueError("pad must be >= 1")
@@ -172,7 +172,7 @@ class PerSpatialFrequencyErrorTable:
             "n_bins": self.n_bins,
             "template_shape": list(self.template_shape),
             "rectangles": [list(r) for r in self.rectangles],
-            "kernel_config": dataclasses.asdict(self.kernel_config),
+            "kernel_config": self.kernel_config.to_dict(),
             "pad": self.pad,
         }
 
@@ -260,9 +260,7 @@ class PerSpatialFrequencyErrorTable:
             f["support"] = self.support.numpy()
             f["template_filter"] = self.template_filter.numpy()
             f.attrs["rectangles"] = json.dumps(self.rectangles)
-            f.attrs["kernel_config"] = json.dumps(
-                dataclasses.asdict(self.kernel_config)
-            )
+            f.attrs["kernel_config"] = json.dumps(self.kernel_config.to_dict())
             f.attrs["pad"] = self.pad
 
     @classmethod
@@ -275,7 +273,9 @@ class PerSpatialFrequencyErrorTable:
                 support=torch.from_numpy(np.asarray(f["support"][()], dtype=bool)),
                 template_filter=torch.from_numpy(f["template_filter"][()]),
                 rectangles=as_rectangles(json.loads(f.attrs["rectangles"])),
-                kernel_config=KernelConfig(**json.loads(f.attrs["kernel_config"])),
+                kernel_config=WarpConfig.from_dict(
+                    json.loads(f.attrs["kernel_config"])
+                ),
                 pad=int(f.attrs["pad"]),
             )
 
@@ -363,16 +363,6 @@ class RadialBins:
 # --------------------------------------------------------------------------- #
 # Batch kernels
 # --------------------------------------------------------------------------- #
-
-
-def as_rectangles(rectangles: Sequence[Sequence[int]]) -> tuple[Rectangle, ...]:
-    """``(k_start, m_start, k_extent, m_extent)`` int tuples of a rectangle sequence."""
-    rects: list[Rectangle] = []
-    for r in rectangles:
-        if len(r) != 4:
-            raise ValueError(f"a rectangle has four entries, got {r!r}")
-        rects.append((int(r[0]), int(r[1]), int(r[2]), int(r[3])))
-    return tuple(rects)
 
 
 def reconstruct_polar(

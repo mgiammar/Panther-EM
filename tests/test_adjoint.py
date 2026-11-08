@@ -7,9 +7,10 @@ import pytest
 import torch
 from conftest import make_synthetic_result, requires_cuda
 
+from panther_em.coordinates import WarpConfig
 from panther_em.coordinates.spiral_polar import SpiralPolarTransform
 from panther_em.decomposition.result import DecompositionResult
-from panther_em.inference.template import KernelConfig, TemplateWarp
+from panther_em.inference.template import TemplateWarp
 from panther_em.inference.template.adjoint import bspline, build_bases
 
 pytestmark = pytest.mark.filterwarnings(
@@ -77,7 +78,7 @@ def test_bspline_partition_of_unity_and_scipy_weights():
 @pytest.mark.parametrize("spiral", [False, True])
 def test_adjoint_matches_the_warps_kernels(order, spiral):
     result = _spiral_result() if spiral else make_synthetic_result(box=24, n_angular=32)
-    bank = TemplateWarp(result, KernelConfig(order=order), device="cpu")
+    bank = TemplateWarp(result, WarpConfig(order=order), device="cpu")
     rect = (0, 0, 4, 3)
     cells = _cells(rect)
     gen = torch.Generator().manual_seed(1)
@@ -112,7 +113,7 @@ def test_unsupported_configs_fall_back_to_none():
     result = make_synthetic_result()
 
     def warp(**config):
-        return TemplateWarp(result, KernelConfig(**config), device="cpu")
+        return TemplateWarp(result, WarpConfig(**config), device="cpu")
 
     assert warp(mode="edge").adjoint is None
     assert warp(cval=1.0).adjoint is None

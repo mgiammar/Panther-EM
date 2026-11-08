@@ -33,7 +33,6 @@ from panther_em.inference.search.correlation.layout import (
     FeatureLayout,
     KRun,
     LayoutPart,
-    as_rectangle,
     rectangles_disjoint,
 )
 from panther_em.inference.search.correlation.local import LocalWork
@@ -59,7 +58,6 @@ __all__ = [
     "MomentForms",
     "Spectrum",
     "StageMaps",
-    "as_rectangle",
     "concat_stage_maps",
     "make_engine",
     "merge_stage_maps",

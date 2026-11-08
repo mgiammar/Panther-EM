@@ -14,11 +14,11 @@ from pathlib import Path
 import torch
 
 from panther_em.decomposition.result import DecompositionResult
+from panther_em.filters import WhiteningFilter
 from panther_em.inference.search import (
     PerSpatialFrequencyErrorTable,
     PixelLabel,
     SearchResult,
-    WhiteningFilter,
 )
 from panther_em.inference.template import Template
 

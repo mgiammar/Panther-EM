@@ -64,11 +64,7 @@ from panther_em.inference.search.correlation import Correlator
 from panther_em.inference.search.correlation.contraction import Precision
 from panther_em.inference.search.decision import PixelLabel
 from panther_em.inference.search.featurization import make_featurization
-from panther_em.inference.search.hypotheses import (
-    HypothesisSpace,
-    LocalHypotheses,
-    healpix_ipix,
-)
+from panther_em.inference.search.hypotheses import HypothesisSpace, LocalHypotheses
 from panther_em.inference.search.images import (
     PixelSelection,
     SearchGeometry,
@@ -78,11 +74,12 @@ from panther_em.inference.search.noise_model import ImageSet
 from panther_em.inference.search.planning import DeviceInfo, plan_stage
 from panther_em.inference.search.results import PixelLedger, SearchResult, StageResult
 from panther_em.inference.search.runner import StageRunner, Timeline
+from panther_em.orientations import healpix_ipix
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
 
-    from panther_em.inference.search.correlation.layout import Rectangle
+    from panther_em.decomposition.rectangles import Rectangle
     from panther_em.inference.search.featurization import (
         BaseImageFeaturization,
         FeatureStore,
@@ -174,7 +171,9 @@ class Searcher:
         self.nside: int | None = None
         self.ipix = None
         if any(isinstance(s.orientations, int) or s.is_local for s in self.stages):
-            found = healpix_ipix(self.space)
+            found = None
+            if self.space.phi_deg is not None and self.space.theta_deg is not None:
+                found = healpix_ipix(self.space.phi_deg, self.space.theta_deg)
             if found is not None:
                 self.nside, self.ipix = found
         self.local: dict[int, LocalHypotheses] = {}

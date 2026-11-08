@@ -18,6 +18,7 @@ from .transform_base import (
     reconstruct_transform,
     register_transform,
 )
+from .warp_config import WarpConfig
 
 __all__ = [
     "CoordinateTransform",
@@ -26,6 +27,7 @@ __all__ = [
     "OffsetPolarTransform",
     "SpiralPolarTransform",
     "StandardPolarTransform",
+    "WarpConfig",
     "get_transform",
     "get_transform_class",
     "reconstruct_transform",

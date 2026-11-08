@@ -3,7 +3,6 @@
 Shared by every consumer of a decomposition: the search's featurizations and executor,
 and the noise model's error tables.
 
-* :class:`KernelConfig` -- the polar-to-Cartesian warp settings.
 * :class:`TemplateWarp` -- the single implementation of that warp: Cartesian kernels
   on demand, the transposed warp (:class:`WarpAdjoint`) and its per-rectangle bases,
   the generic warp of polar images and the support disk.
@@ -21,12 +20,11 @@ from panther_em.inference.template.adjoint import (
     unsupported_reason,
 )
 from panther_em.inference.template.template import Template
-from panther_em.inference.template.warp import KernelConfig, TemplateWarp
+from panther_em.inference.template.warp import TemplateWarp
 from panther_em.inference.template.weights import WeightSource
 
 __all__ = [
     "AdjointBases",
-    "KernelConfig",
     "Template",
     "TemplateWarp",
     "WarpAdjoint",

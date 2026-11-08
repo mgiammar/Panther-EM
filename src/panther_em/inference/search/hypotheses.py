@@ -11,17 +11,13 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
-import healpy as hp
 import numpy as np
 import torch
 
+from panther_em.orientations import ring_neighborhoods, unique_rows
+
 if TYPE_CHECKING:
     from panther_em.decomposition.result import DecompositionBase
-
-
-def psi_degrees(n_psi: int, device: torch.device | str = "cpu") -> torch.Tensor:
-    """Uniformly spaced in-plane angles in degrees, ``(n_psi,)`` float32."""
-    return 360.0 * torch.arange(n_psi, device=device, dtype=torch.float32) / n_psi
 
 
 @dataclass(frozen=True, eq=False)
@@ -366,100 +362,8 @@ class HypothesisSet:
 
 
 # --------------------------------------------------------------------------- #
-# HEALPix orientation grids
-# --------------------------------------------------------------------------- #
-
-
-def healpix_orientations(nside: int) -> tuple[np.ndarray, np.ndarray]:
-    """``(phi_deg, theta_deg)`` of every HEALPix pixel at ``nside``, NESTED order.
-
-    Float32, in the argument order of ``PolarProjectionDecomposer``; orientation
-    index == NESTED pixel id, which is what :func:`healpix_level_ids` relies on.
-    """
-    from torch_so3.hierarchical_s2_grid import (
-        HierarchicalS2Grid,
-    )
-
-    theta, phi = HierarchicalS2Grid(nside, 1).get_level_orientations(0)
-    return phi.astype(np.float32), theta.astype(np.float32)
-
-
-def _unit_vectors(theta_deg: np.ndarray, phi_deg: np.ndarray) -> np.ndarray:
-    theta, phi = np.radians(theta_deg), np.radians(phi_deg)
-    return np.stack(
-        [np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi), np.cos(theta)], -1
-    )
-
-
-def healpix_ipix(
-    space: HypothesisSpace, *, tol_deg: float = 1e-3, max_nside: int = 4096
-) -> tuple[int, np.ndarray] | None:
-    """``(nside, ipix)`` when the space's orientations are HEALPix pixel centers.
-
-    The smallest ``nside`` whose NESTED pixel centers coincide with every orientation
-    (within ``tol_deg``, all distinct) wins; ``None`` when there is none.
-    """
-    if space.phi_deg is None or space.theta_deg is None:
-        return None
-    from torch_so3.hierarchical_s2_grid import HierarchicalS2Grid
-
-    phi = space.phi_deg.cpu().numpy().astype(np.float64)
-    theta = space.theta_deg.cpu().numpy().astype(np.float64)
-    vec = _unit_vectors(theta, phi)
-    nside = 1
-    while nside <= max_nside:
-        grid = HierarchicalS2Grid(nside, 1)
-        if grid.get_level(0).npix >= phi.size:
-            ipix = grid.index_from_angle(theta, phi, level=0)
-            if np.unique(ipix).size == ipix.size:
-                t2, p2 = grid.angle_from_index(ipix, level=0)
-                cos = np.clip((vec * _unit_vectors(t2, p2)).sum(-1), -1.0, 1.0)
-                if np.degrees(np.arccos(cos)).max() <= tol_deg:
-                    return nside, np.asarray(ipix, dtype=np.int64)
-        nside *= 2
-    return None
-
-
-def healpix_level_ids(ipix: np.ndarray, level: int) -> torch.Tensor:
-    """Orientation ids forming a sampling ``level`` HEALPix levels coarser."""
-    if level < 0:
-        raise ValueError("level must be >= 0")
-    ipix = np.asarray(ipix, dtype=np.int64)
-    keep = np.nonzero(ipix % (4**level) == 0)[0]
-    return torch.from_numpy(keep.astype(np.int64))
-
-
-# --------------------------------------------------------------------------- #
 # Local neighborhoods on a HEALPix grid
 # --------------------------------------------------------------------------- #
-
-
-def _unique_rows(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Per-row sorted unique non-negative values of a 2-D array (``-1`` = absent).
-
-    Parameters
-    ----------
-    values : numpy.ndarray
-        ``(N, M)`` int64 array of values, where ``-1`` marks absent values.
-
-    Returns
-    -------
-    table : numpy.ndarray
-        ``(N, W)`` int64 array of each row's distinct values in ascending order, padded
-        by repeating the first value.
-    counts : numpy.ndarray
-        ``(N,)`` int64 array of each row's distinct value count (0 = no value).
-    """
-    big = np.iinfo(np.int64).max
-    s = np.sort(np.where(values < 0, big, values), axis=1)
-    dup = np.zeros_like(s, dtype=bool)
-    dup[:, 1:] = s[:, 1:] == s[:, :-1]
-    s = np.sort(np.where(dup, big, s), axis=1)
-    counts = (s != big).sum(axis=1)
-    width = max(1, int(counts.max()))
-    s = s[:, :width]
-    first = np.where(counts > 0, s[:, 0], -1)
-    return np.where(s == big, first[:, None], s), counts
 
 
 @dataclass(frozen=True, eq=False)
@@ -517,7 +421,7 @@ class LocalHypotheses:
             The searcher's space.
         nside, ipix : int, numpy.ndarray
             The template's HEALPix grid and its orientations' NESTED pixel ids
-            (:func:`healpix_ipix`).
+            (:func:`~panther_em.orientations.healpix_ipix`).
         level : int
             The local stage's sampling level (its ``orientations``, 0 when ``None``).
         seed_level : int
@@ -544,15 +448,9 @@ class LocalHypotheses:
         ipix = np.asarray(ipix, dtype=np.int64)
         inverse = np.full(12 * int(nside) ** 2, -1, dtype=np.int64)
         inverse[ipix] = np.arange(ipix.size)
-        npix_l = 12 * nside_l**2
 
-        # every stage-grid pixel's ring neighborhood (itself first, padded)
-        ring = np.arange(npix_l, dtype=np.int64)[:, None]
-
-        for _ in range(int(rings)):
-            nb = hp.get_all_neighbours(nside_l, ring.reshape(-1), nest=True)
-            nb = np.asarray(nb, dtype=np.int64).T.reshape(npix_l, -1)
-            ring, _ = _unique_rows(np.concatenate([ring, nb], axis=1))
+        # every stage-grid pixel's ring neighborhood (padded)
+        ring = ring_neighborhoods(nside_l, rings)
 
         # a base cell's stage-grid pixels, widened, restricted to the template's
         children = 4 ** (base - level)
@@ -562,7 +460,7 @@ class LocalHypotheses:
         )
         widened = ring[members].reshape(n_cells, -1)
         orientation = inverse[widened << (2 * level)]
-        orientation, n_orient = _unique_rows(orientation)
+        orientation, n_orient = unique_rows(orientation)
 
         # every filter of each orientation, as positions in the stage's rows
         o_count = space.n_orientations

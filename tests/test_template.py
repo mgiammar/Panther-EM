@@ -7,9 +7,9 @@ import pytest
 import torch
 from conftest import count_kernel_builds, requires_cuda
 
+from panther_em.coordinates import WarpConfig
 from panther_em.inference.search.correlation import FeatureLayout
 from panther_em.inference.template import (
-    KernelConfig,
     Template,
     TemplateWarp,
     WeightSource,
@@ -77,7 +77,7 @@ def test_spatial_respects_the_kernel_config(synthetic_result):
     cells = _cells((1, 2))
     default = TemplateWarp(result, device="cpu").spatial(cells)
     linear_warp = TemplateWarp(
-        result, KernelConfig(order=1, preserve_energy=False), device="cpu"
+        result, WarpConfig(order=1, preserve_energy=False), device="cpu"
     )
     linear = linear_warp.spatial(cells)
     assert not torch.allclose(default, linear)
@@ -162,7 +162,7 @@ def test_weight_source_bounding_box_and_sparse(synthetic_result):
 
 def test_template_bundle_and_hdf5_round_trip(synthetic_result, tmp_path):
     result = synthetic_result()
-    config = KernelConfig(order=3)
+    config = WarpConfig(order=3)
     template = Template(result, device="cpu", kernel=config, weights_cells=(0, 0, 4, 5))
     assert template.template_shape == (20, 20) and template.kernel_config is config
     assert (template.k_max, template.eig_max, template.n_templates) == (4, 5, 6)

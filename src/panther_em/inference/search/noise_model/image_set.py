@@ -16,13 +16,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from panther_em.inference.search.noise_model.curves import curve_to_grid
+from panther_em.filters.curves import curve_to_grid
 
 if TYPE_CHECKING:
+    from panther_em.filters.whitening import WhiteningFilter
     from panther_em.inference.search.noise_model.spatial_frequency_error import (
         PerSpatialFrequencyErrorTable,
     )
-    from panther_em.inference.search.noise_model.whitening import WhiteningFilter
 
 # Fraction of the in-band mean noise power the level map's flattening is floored at
 # (keeps near-empty rings from being amplified).
@@ -64,7 +64,7 @@ class ImageSet:
     Parameters
     ----------
     name : str
-        The micrograph's name in the :class:`~.whitening.WhiteningFilter`.
+        The micrograph's name in the :class:`~panther_em.filters.WhiteningFilter`.
     image : torch.Tensor
         ``(H, W)`` float32 search image (the micrograph under ``W_avg * C_i^2``, zero
         mean, unit variance).

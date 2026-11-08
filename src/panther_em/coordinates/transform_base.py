@@ -36,7 +36,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from panther_em.utils.warp_backends import (
+from panther_em.coordinates.warp_backends import (
     detect_device,
     ensure_device,
     get_warp_function,
