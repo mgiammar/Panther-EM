@@ -2,13 +2,13 @@
 
 import json
 import textwrap
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Self, cast
 
 import h5py
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -41,13 +41,314 @@ def _read_fancy_last_axis(
     if isinstance(source, h5py.Dataset):
         idx = np.asarray(idx)
         unique_idx, inverse = np.unique(idx, return_inverse=True)
-        data = source[..., unique_idx]
+        data: np.ndarray = source[..., unique_idx]
         return data[..., inverse]
     return source[..., idx]
 
 
+class DecompositionBase(ABC):
+    """Metadata and query interface shared by every decomposition storage layout."""
+
+    # Metadata common to both layouts (dataclass fields on the dense subclass).
+    k_max: int
+    eig_max: int
+    is_complex_projection: bool
+    num_fourier_filters: int
+    num_orientations: int
+    num_angular_components: int
+    num_radial_components: int
+    num_volumes: int
+    created_at: str
+    phi_values: np.ndarray | None
+    theta_values: np.ndarray | None
+    fourier_filters: np.ndarray | None
+    volume_labels: np.ndarray | None
+    coordinate_transform: CoordinateTransform | None
+
+    # Private state, initialised by the subclasses.
+    _top_n_cache: dict[tuple[int, bool], np.ndarray]
+    _h5_file: h5py.File | None
+
+    # ------------------------------------------------------------------
+    # Interface every layout implements
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def get_component(
+        self,
+        k_idx: int | np.ndarray,
+        eig_idx: int | np.ndarray,
+        return_u: bool = True,
+        return_s: bool = True,
+        return_vh: bool = True,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+        """Retrieve specific components of the SVD.
+
+        Note
+        ----
+        Returns ``(U, S, Vh)`` for the requested ``(k_idx, eig_idx)`` pairs; elements
+        not selected by ``return_u``, ``return_s`` and ``return_vh`` are ``None``.
+
+        Note
+        ----
+        Optional tuple elements force callers to assert they are not ``None``.
+        Separate ``get_u``, ``get_s`` and ``get_vh`` methods would be more
+        interpretable and are planned for a follow-up refactor.
+        """
+
+    @abstractmethod
+    def get_top_n(self, top_k: int, include_negative: bool = True) -> np.ndarray:
+        """Return the ``(k_idx, eig_idx)`` pairs of the top singular values."""
+
+    @abstractmethod
+    def to_dense(self) -> "DecompositionResult":
+        """Return the equivalent dense result (``self`` if it already is one)."""
+
+    @abstractmethod
+    def to_sparse(self, n: int) -> "SparseDecompositionResult":
+        """Return a sparse result keeping only the top-``n`` components."""
+
+    @abstractmethod
+    def save(self, path: str | Path) -> None:
+        """Save to an HDF5 file readable by :meth:`load`."""
+
+    @classmethod
+    @abstractmethod
+    def _load_hdf5(cls, path: Path, mmap: bool = False) -> "DecompositionBase":
+        """Read an HDF5 file of this layout (called by :meth:`load`)."""
+
+    # ------------------------------------------------------------------
+    # Shared behaviour
+    # ------------------------------------------------------------------
+
+    def _validate_metadata(self) -> None:
+        """Validate the optional metadata arrays against the scalar metadata."""
+        # Validate optional angle arrays
+        if self.phi_values is not None:
+            if self.phi_values.shape != (self.num_orientations,):
+                raise ValueError(
+                    f"phi_values shape {self.phi_values.shape} does not match "
+                    f"expected ({self.num_orientations},)"
+                )
+        if self.theta_values is not None:
+            if self.theta_values.shape != (self.num_orientations,):
+                raise ValueError(
+                    f"theta_values shape {self.theta_values.shape} does not match "
+                    f"expected ({self.num_orientations},)"
+                )
+
+        # Validate optional Fourier filters
+        if self.fourier_filters is not None:
+            if self.fourier_filters.shape[0] != self.num_fourier_filters:
+                raise ValueError(
+                    f"fourier_filters leading dimension "
+                    f"{self.fourier_filters.shape[0]} does not match "
+                    f"num_fourier_filters={self.num_fourier_filters}"
+                )
+
+        # Validate optional volume labels
+        if self.volume_labels is not None:
+            if self.volume_labels.shape != (self.num_volumes,):
+                raise ValueError(
+                    f"volume_labels shape {self.volume_labels.shape} does not match "
+                    f"expected ({self.num_volumes},)"
+                )
+
+    def close(self) -> None:
+        """Close the HDF5 file handle opened by ``load(..., mmap=True)``."""
+        if self._h5_file is not None:
+            self._h5_file.close()
+            self._h5_file = None
+
+    def __enter__(self) -> Self:
+        """Enter the context manager and return this result."""
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Exit the context manager, closing any open HDF5 file handle."""
+        self.close()
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def _write_hdf5_metadata(self, f: h5py.File) -> None:
+        """Write scalar metadata as root-level HDF5 attributes."""
+        f.attrs["k_max"] = self.k_max
+        f.attrs["eig_max"] = self.eig_max
+        f.attrs["is_complex_projection"] = self.is_complex_projection
+        f.attrs["num_volumes"] = self.num_volumes
+        f.attrs["num_fourier_filters"] = self.num_fourier_filters
+        f.attrs["num_orientations"] = self.num_orientations
+        f.attrs["num_angular_components"] = self.num_angular_components
+        f.attrs["num_radial_components"] = self.num_radial_components
+        f.attrs["created_at"] = self.created_at
+
+        # Embed coordinate transform geometry so the file is self-contained.
+        # A result without a transform cannot be saved — inference depends on it.
+        if self.coordinate_transform is None:
+            raise ValueError(
+                "DecompositionResult.coordinate_transform is None. "
+                "A coordinate transform must be set before saving. "
+                "Run do_decomposition() first, or assign a CoordinateTransform "
+                "instance to result.coordinate_transform."
+            )
+        f.attrs["transform_config"] = json.dumps(self.coordinate_transform.to_dict())
+
+    def _write_hdf5_optional_arrays(self, f: h5py.File) -> None:
+        """Write optional orientation angles and Fourier filters if present."""
+        if self.phi_values is not None:
+            f.create_dataset("phi_values", data=self.phi_values)
+        if self.theta_values is not None:
+            f.create_dataset("theta_values", data=self.theta_values)
+        if self.fourier_filters is not None:
+            f.create_dataset("fourier_filters", data=self.fourier_filters)
+        if self.volume_labels is not None:
+            f.create_dataset("volume_labels", data=self.volume_labels)
+
+    def _write_hdf5_transform_arrays(self, f: h5py.File) -> None:
+        """Write coordinate grid arrays for a GridTransform into an HDF5 group."""
+        if not isinstance(self.coordinate_transform, GridTransform):
+            return
+
+        grp = f.create_group("transform")
+        grp.create_dataset(
+            "transform_coords", data=self.coordinate_transform.transform_coords
+        )
+        grp.create_dataset(
+            "cartesian_coords", data=self.coordinate_transform.cartesian_coords
+        )
+        jac = self.coordinate_transform.jacobian_grid
+        if jac is not None:
+            grp.create_dataset("jacobian", data=jac)
+
+    def save_top_n(self, path: str | Path, top_k: int) -> None:
+        r"""Save only the ``top_k`` most significant components to HDF5.
+
+        Convenience wrapper for ``self.to_sparse(top_k).save(path)``.
+
+        Parameters
+        ----------
+        path : str | Path
+            Destination path.  Extension is normalized to ``.h5``.
+        top_k : int
+            Number of unique ``(k_stored, eig_idx)`` pairs to store.
+
+        Raises
+        ------
+        ValueError
+            If ``top_k < 1``.
+        """
+        if top_k < 1:
+            raise ValueError(f"top_k must be >= 1, got {top_k}")
+        self.to_sparse(top_k).save(path)
+
+    @classmethod
+    def load(cls, path: str | Path, mmap: bool = False) -> Self:
+        """Load a decomposition result from an HDF5 file written by :meth:`save`.
+
+        Parameters
+        ----------
+        path : str | Path
+            Path to the ``.h5`` or ``.hdf5`` file.
+        mmap : bool, optional
+            If True, keep the HDF5 file open on disk and read ``U`` lazily on demand.
+            ``S``, ``Vh``, and other metadata/arrays are always loaded eagerly.
+
+        Returns
+        -------
+        DecompositionBase
+            A :class:`DecompositionResult` or :class:`SparseDecompositionResult`.
+
+        Raises
+        ------
+        ValueError
+            If the file extension is not ``.h5`` or ``.hdf5``, or if the file holds the
+            other kind of result than the class this is called on.
+        """
+        path = Path(path)
+        if path.suffix not in {".h5", ".hdf5"}:
+            raise ValueError(
+                f"Unknown file extension '{path.suffix}'. Expected '.h5' or '.hdf5'."
+            )
+        with h5py.File(path, "r") as f:
+            is_sparse = bool(f.attrs.get("is_sparse", False))
+        target = SparseDecompositionResult if is_sparse else DecompositionResult
+        if not issubclass(target, cls):
+            raise ValueError(
+                f"File '{path}' contains a {'sparse' if is_sparse else 'dense'} "
+                f"result. Use {target.__name__}.load() instead."
+            )
+        return cast("Self", target._load_hdf5(path, mmap=mmap))
+
+    # ------------------------------------------------------------------
+    # Index helpers
+    # ------------------------------------------------------------------
+
+    def k_to_stored(self, k_idx: int | np.ndarray) -> int | np.ndarray:
+        """Convert an angular-frequency index to its storage-array row index."""
+        if self.is_complex_projection:
+            return k_idx + self.k_max
+
+        # Since singular values are real-valued, complex conjugate returns same
+        return np.abs(k_idx) if isinstance(k_idx, np.ndarray) else abs(k_idx)
+
+    def is_conjugate_mode(self, k_idx: int | np.ndarray) -> bool | np.ndarray:
+        """Helper for determining when conj is needed across real/complex modes."""
+        # Always False for complex-valued decompositions
+        if self.is_complex_projection:
+            return (
+                np.zeros_like(k_idx, dtype=bool)
+                if isinstance(k_idx, np.ndarray)
+                else False
+            )
+
+        # True when k_idx is negative for real-valued decompositions
+        return (
+            (k_idx < 0)
+            if isinstance(k_idx, (int, np.integer))
+            else (np.asarray(k_idx) < 0)
+        )
+
+    def get_svd_tensors(
+        self,
+        indices: np.ndarray,
+        device: str | torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get device-allocated SVD tensors for the given ``(k_idx, eig_idx)`` pairs.
+
+        Delegates to :meth:`get_component` so dense and sparse results both work
+        correctly via polymorphism, including automatic conjugation for negative
+        ``k_idx`` in real-valued decompositions.
+
+        Parameters
+        ----------
+        indices : np.ndarray
+            Shape ``(L, 2)`` integer array; each row is ``(k_idx, eig_idx)``.
+        device : str or torch.device
+            Target device for the returned tensors.
+
+        Returns
+        -------
+        U : torch.Tensor
+            Left singular vectors, shape ``(V, FF, O, L)``, complex64.
+        S : torch.Tensor
+            Singular values, shape ``(L,)``, float32.
+        Vh : torch.Tensor
+            Right singular vectors, shape ``(L, R)``, complex64.
+        """
+        k_idx = indices[:, 0]
+        eig_idx = indices[:, 1]
+        U_np, S_np, Vh_np = self.get_component(k_idx, eig_idx)
+        return (
+            torch.tensor(U_np, dtype=torch.complex64, device=device),
+            torch.tensor(S_np, dtype=torch.float32, device=device),
+            torch.tensor(Vh_np, dtype=torch.complex64, device=device),
+        )
+
+
 @dataclass
-class DecompositionResult:
+class DecompositionResult(DecompositionBase):
     """Stores the full results of a polar projection decomposition.
 
     Note
@@ -198,60 +499,14 @@ class DecompositionResult:
                 f"Vh shape {self.Vh.shape} does not match expected {expected_Vh_shape}"
             )
 
-        # Validate optional angle arrays
-        if self.phi_values is not None:
-            if self.phi_values.shape != (self.num_orientations,):
-                raise ValueError(
-                    f"phi_values shape {self.phi_values.shape} does not match "
-                    f"expected ({self.num_orientations},)"
-                )
-        if self.theta_values is not None:
-            if self.theta_values.shape != (self.num_orientations,):
-                raise ValueError(
-                    f"theta_values shape {self.theta_values.shape} does not match "
-                    f"expected ({self.num_orientations},)"
-                )
-
-        # Validate optional Fourier filters
-        if self.fourier_filters is not None:
-            if self.fourier_filters.shape[0] != self.num_fourier_filters:
-                raise ValueError(
-                    f"fourier_filters leading dimension "
-                    f"{self.fourier_filters.shape[0]} does not match "
-                    f"num_fourier_filters={self.num_fourier_filters}"
-                )
-
-        # Validate optional volume labels
-        if self.volume_labels is not None:
-            if self.volume_labels.shape != (self.num_volumes,):
-                raise ValueError(
-                    f"volume_labels shape {self.volume_labels.shape} does not match "
-                    f"expected ({self.num_volumes},)"
-                )
+        self._validate_metadata()
 
         # Per-instance cache for top-n queries
-        self._top_n_cache: dict[tuple[int, bool], np.ndarray] = {}
+        self._top_n_cache = {}
 
         # Open HDF5 file handle backing lazily-loaded arrays (set by load(mmap=True)).
         if not hasattr(self, "_h5_file"):
-            self._h5_file: h5py.File | None = None
-
-    def close(self) -> None:
-        """Close the HDF5 file handle opened by ``load(..., mmap=True)``.
-
-        No-op if this result was not loaded with ``mmap=True``, or the file handle has
-        already been closed. Any arrays not yet read from disk (e.g. ``U``) become
-        unusable after this call.
-        """
-        if self._h5_file is not None:
-            self._h5_file.close()
             self._h5_file = None
-
-    def __enter__(self) -> "DecompositionResult":
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.close()
 
     def __repr__(self) -> str:
         """String representation of the DecompositionResult."""
@@ -283,56 +538,6 @@ class DecompositionResult:
     # Persistence
     # ------------------------------------------------------------------
 
-    def _write_hdf5_metadata(self, f: h5py.File) -> None:
-        """Write scalar metadata as root-level HDF5 attributes."""
-        f.attrs["k_max"] = self.k_max
-        f.attrs["eig_max"] = self.eig_max
-        f.attrs["is_complex_projection"] = self.is_complex_projection
-        f.attrs["num_volumes"] = self.num_volumes
-        f.attrs["num_fourier_filters"] = self.num_fourier_filters
-        f.attrs["num_orientations"] = self.num_orientations
-        f.attrs["num_angular_components"] = self.num_angular_components
-        f.attrs["num_radial_components"] = self.num_radial_components
-        f.attrs["created_at"] = self.created_at
-
-        # Embed coordinate transform geometry so the file is self-contained.
-        # A result without a transform cannot be saved — inference depends on it.
-        if self.coordinate_transform is None:
-            raise ValueError(
-                "DecompositionResult.coordinate_transform is None. "
-                "A coordinate transform must be set before saving. "
-                "Run do_decomposition() first, or assign a CoordinateTransform "
-                "instance to result.coordinate_transform."
-            )
-        f.attrs["transform_config"] = json.dumps(self.coordinate_transform.to_dict())
-
-    def _write_hdf5_optional_arrays(self, f: h5py.File) -> None:
-        """Write optional orientation angles and Fourier filters if present."""
-        if self.phi_values is not None:
-            f.create_dataset("phi_values", data=self.phi_values)
-        if self.theta_values is not None:
-            f.create_dataset("theta_values", data=self.theta_values)
-        if self.fourier_filters is not None:
-            f.create_dataset("fourier_filters", data=self.fourier_filters)
-        if self.volume_labels is not None:
-            f.create_dataset("volume_labels", data=self.volume_labels)
-
-    def _write_hdf5_transform_arrays(self, f: h5py.File) -> None:
-        """Write coordinate grid arrays for a GridTransform into an HDF5 group."""
-        if not isinstance(self.coordinate_transform, GridTransform):
-            return
-
-        grp = f.create_group("transform")
-        grp.create_dataset(
-            "transform_coords", data=self.coordinate_transform.transform_coords
-        )
-        grp.create_dataset(
-            "cartesian_coords", data=self.coordinate_transform.cartesian_coords
-        )
-        jac = self.coordinate_transform.jacobian_grid
-        if jac is not None:
-            grp.create_dataset("jacobian", data=jac)
-
     def save(self, path: str | Path) -> None:
         """Save the full decomposition result to an HDF5 file.
 
@@ -356,27 +561,6 @@ class DecompositionResult:
             f.create_dataset("Vh", data=self.Vh)
             self._write_hdf5_optional_arrays(f)
             self._write_hdf5_transform_arrays(f)
-
-    def save_top_n(self, path: str | Path, top_k: int) -> None:
-        r"""Save only the ``top_k`` most significant components to HDF5.
-
-        Convenience wrapper for ``self.to_sparse(top_k).save(path)``.
-
-        Parameters
-        ----------
-        path : str | Path
-            Destination path.  Extension is normalized to ``.h5``.
-        top_k : int
-            Number of unique ``(k_stored, eig_idx)`` pairs to store.
-
-        Raises
-        ------
-        ValueError
-            If ``top_k < 1``.
-        """
-        if top_k < 1:
-            raise ValueError(f"top_k must be >= 1, got {top_k}")
-        self.to_sparse(top_k).save(path)
 
     def to_dense(self) -> "DecompositionResult":
         """Return self — already a dense result.
@@ -441,46 +625,6 @@ class DecompositionResult:
             fourier_filters=self.fourier_filters,
             volume_labels=self.volume_labels,
         )
-
-    @classmethod
-    def load(cls, path: str | Path, mmap: bool = False) -> "DecompositionResult":
-        """Load a decomposition result from an HDF5 file written by :meth:`save`.
-
-        Parameters
-        ----------
-        path : str | Path
-            Path to the ``.h5`` or ``.hdf5`` file.
-        mmap : bool, optional
-            If True, keep the HDF5 file open on disk and read ``U`` lazily on demand.
-            ``S``, ``Vh``, and other metadata/arrays are always loaded eagerly since
-            they are typically tiny compared to ``U``. Useful when ``U`` is larger than
-            available RAM. Call :meth:`close` (or use the result as a context manager)
-            to release the file handle when done. Default is False.
-
-        Returns
-        -------
-        DecompositionResult
-            The loaded decomposition result.
-
-        Raises
-        ------
-        ValueError
-            If the file extension is not ``.h5`` or ``.hdf5``, or if the file
-            contains a sparse result (use :meth:`SparseDecompositionResult.load`
-            instead).
-        """
-        path = Path(path)
-        if path.suffix not in {".h5", ".hdf5"}:
-            raise ValueError(
-                f"Unknown file extension '{path.suffix}'. Expected '.h5' or '.hdf5'."
-            )
-        with h5py.File(path, "r") as f:
-            if bool(f.attrs.get("is_sparse", False)):
-                raise ValueError(
-                    f"File '{path}' contains a sparse result. "
-                    "Use SparseDecompositionResult.load() instead."
-                )
-        return cls._load_hdf5(path, mmap=mmap)
 
     @classmethod
     def _load_hdf5(cls, path: Path, mmap: bool = False) -> "DecompositionResult":
@@ -603,31 +747,6 @@ class DecompositionResult:
     # Index helpers
     # ------------------------------------------------------------------
 
-    def k_to_stored(self, k_idx: int | np.ndarray) -> int | np.ndarray:
-        """Convert an angular-frequency index to its storage-array row index."""
-        if self.is_complex_projection:
-            return k_idx + self.k_max
-
-        # Since singular values are real-valued, complex conjugate returns same
-        return np.abs(k_idx) if isinstance(k_idx, np.ndarray) else abs(k_idx)
-
-    def is_conjugate_mode(self, k_idx: int | np.ndarray) -> bool | np.ndarray:
-        """Helper for determining when conj is needed across real/complex modes."""
-        # Always False for complex-valued decompositions
-        if self.is_complex_projection:
-            return (
-                np.zeros_like(k_idx, dtype=bool)
-                if isinstance(k_idx, np.ndarray)
-                else False
-            )
-
-        # True when k_idx is negative for real-valued decompositions
-        return (
-            (k_idx < 0)
-            if isinstance(k_idx, (int, np.integer))
-            else (np.asarray(k_idx) < 0)
-        )
-
     def get_top_n(self, top_k: int, include_negative: bool = True) -> np.ndarray:
         """Get the top-n singular values across all (frequency, radial) pairs.
 
@@ -740,136 +859,8 @@ class DecompositionResult:
 
         return u, s, vh
 
-    def get_svd_tensors(
-        self,
-        indices: np.ndarray,
-        device: str | torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Get device-allocated SVD tensors for the given ``(k_idx, eig_idx)`` pairs.
 
-        Delegates to :meth:`get_component` so dense and sparse results both work
-        correctly via polymorphism, including automatic conjugation for negative
-        ``k_idx`` in real-valued decompositions.
-
-        Parameters
-        ----------
-        indices : np.ndarray
-            Shape ``(L, 2)`` integer array; each row is ``(k_idx, eig_idx)``.
-        device : str or torch.device
-            Target device for the returned tensors.
-
-        Returns
-        -------
-        U : torch.Tensor
-            Left singular vectors, shape ``(V, FF, O, L)``, complex64.
-        S : torch.Tensor
-            Singular values, shape ``(L,)``, float32.
-        Vh : torch.Tensor
-            Right singular vectors, shape ``(L, R)``, complex64.
-        """
-        k_idx = indices[:, 0]
-        eig_idx = indices[:, 1]
-        U_np, S_np, Vh_np = self.get_component(k_idx, eig_idx)
-        return (
-            torch.tensor(U_np, dtype=torch.complex64, device=device),
-            torch.tensor(S_np, dtype=torch.float32, device=device),
-            torch.tensor(Vh_np, dtype=torch.complex64, device=device),
-        )
-
-    # ------------------------------------------------------------------
-    # Plotting helpers
-    # ------------------------------------------------------------------
-
-    def scree_plot(
-        self, k_idx: int | None = None, **kwargs: dict[str, Any]
-    ) -> tuple[plt.Figure, plt.Axes]:
-        """Helper function for plotting sorted singular values vs index.
-
-        Parameters
-        ----------
-        k_idx : int | None, optional
-            Actual angular frequency to plot. Valid range is ``[0, k_max]``
-            for real-valued and ``[-k_max, k_max]`` for complex decompositions.
-            If None, plot all singular values across all frequencies, sorted by
-            decreasing magnitude. Default is None.
-        **kwargs : dict[str, Any]
-            Additional keyword arguments to pass to plt.subplots()
-
-        Returns
-        -------
-        plt.Figure, plt.Axes
-            The matplotlib figure object and axes containing the scree plot.
-        """
-        fig, ax = plt.subplots(**kwargs)
-        svs = (
-            self.S[self.k_to_stored(k_idx), :]
-            if k_idx is not None
-            else self.S.flatten()
-        )
-        title = (
-            f"Scree Plot for k={k_idx}"
-            if k_idx is not None
-            else "Scree Plot for All Singular Values"
-        )
-
-        sorted_svs = svs[np.argsort(np.abs(svs))[::-1]]
-        ax.plot(sorted_svs)
-        ax.set_title(title)
-        ax.set_xlabel("Index (sorted by magnitude)")
-        ax.set_ylabel("Singular Value (magnitude)")
-        return fig, ax
-
-    def variance_explained_plot(
-        self,
-        k_idx: int | None = None,
-        inverted: bool = True,
-        **kwargs: dict[str, Any],
-    ) -> tuple[plt.Figure, plt.Axes]:
-        """Helper function for plotting cumulative variance explained.
-
-        Parameters
-        ----------
-        k_idx : int | None, optional
-            Actual angular frequency to plot.  Valid range is ``[0, k_max]``
-            for real-valued and ``[-k_max, k_max]`` for complex decompositions.
-            If None, plot for all frequencies. Default is None.
-        inverted : bool, optional
-            If True, plot (1 - var exp) rather than (var exp). Default is True.
-        **kwargs : dict[str, Any]
-            Additional keyword arguments to pass to plt.subplots()
-
-        Returns
-        -------
-        plt.Figure, plt.Axes
-            The matplotlib figure object and axes containing the variance explained
-            plot.
-        """
-        fig, ax = plt.subplots(**kwargs)
-        svs = (
-            self.S[self.k_to_stored(k_idx), :]
-            if k_idx is not None
-            else self.S.flatten()
-        )
-        title = (
-            f"Cumulative Variance Explained for k={k_idx}"
-            if k_idx is not None
-            else "Cumulative Variance Explained for All Singular Values"
-        )
-
-        sorted_svs = svs[np.argsort(np.abs(svs))[::-1]]
-        denom = np.sum(np.abs(sorted_svs) ** 2)
-        variance_explained = np.cumsum(np.abs(sorted_svs) ** 2) / denom
-        if inverted:
-            variance_explained = 1 - variance_explained
-
-        ax.plot(variance_explained)
-        ax.set_title(title)
-        ax.set_xlabel("Number of Components")
-        ax.set_ylabel("Cumulative Variance Explained")
-        return fig, ax
-
-
-class SparseDecompositionResult(DecompositionResult):
+class SparseDecompositionResult(DecompositionBase):
     """Sparse SVD result storing only the top-L most significant components.
 
     Unlike :class:`DecompositionResult`, this class holds compact arrays of shape
@@ -888,35 +879,6 @@ class SparseDecompositionResult(DecompositionResult):
     _Vh_data: np.ndarray
     _selected_indices: np.ndarray
     _index_map: dict[tuple[int, int], int]
-    _top_n_cache: dict[tuple[int, bool], np.ndarray]
-
-    # Properties that raise rather than returning non-existent dense arrays.
-
-    @property
-    def U(self) -> np.ndarray:
-        """Not available — use get_component() or to_dense()."""
-        raise AttributeError(
-            "SparseDecompositionResult does not store the full U array. "
-            "Use get_component() to retrieve specific components, or "
-            "call to_dense() to materialize the full result."
-        )
-
-    @property
-    def S(self) -> np.ndarray:
-        """Not available — use get_component() or to_dense()."""
-        raise AttributeError(
-            "SparseDecompositionResult does not store the full S array. "
-            "Use get_component() or to_dense()."
-        )
-
-    @property
-    def Vh(self) -> np.ndarray:
-        """Not available — use get_component() or to_dense()."""
-        raise AttributeError(
-            "SparseDecompositionResult does not store the full Vh array. "
-            "Use get_component() to retrieve specific components, or "
-            "call to_dense() to materialize the full result."
-        )
 
     @property
     def num_stored(self) -> int:
@@ -1000,10 +962,15 @@ class SparseDecompositionResult(DecompositionResult):
             raise ValueError(
                 f"selected_indices must have shape (L, 2), got {selected_indices.shape}"
             )
-        if S_data.shape != (L,) or Vh_data.shape[0] != L or U_data.shape[-1] != L:
+        if (
+            S_data.shape != (L,)
+            or Vh_data.shape != (L, num_radial_components)
+            or U_data.shape != (num_volumes, num_fourier_filters, num_orientations, L)
+        ):
             raise ValueError(
-                "Sparse arrays have inconsistent leading dimension L; expected "
-                "S=(L,), Vh=(L, R), and U[..., L] to match selected_indices."
+                "Sparse arrays are inconsistent with selected_indices; expected "
+                "S=(L,), Vh=(L, num_radial_components) and "
+                "U=(num_volumes, num_fourier_filters, num_orientations, L)."
             )
 
         obj: SparseDecompositionResult = object.__new__(cls)
@@ -1031,6 +998,7 @@ class SparseDecompositionResult(DecompositionResult):
         }
         obj._top_n_cache = {}
         obj._h5_file = _h5_file
+        obj._validate_metadata()
         return obj
 
     # ------------------------------------------------------------------
@@ -1311,42 +1279,10 @@ class SparseDecompositionResult(DecompositionResult):
             self._write_hdf5_transform_arrays(f)
 
     @classmethod
-    def load(cls, path: str | Path, mmap: bool = False) -> "SparseDecompositionResult":
-        """Load a sparse result from an HDF5 file written by :meth:`save`.
-
-        Parameters
-        ----------
-        path : str | Path
-            Path to the ``.h5`` or ``.hdf5`` file.
-        mmap : bool, optional
-            If True, keep the HDF5 file open on disk to read ``U`` lazily. Other data
-            and metadata loaded eagerly. Default is False.
-
-        Returns
-        -------
-        SparseDecompositionResult
-            The loaded sparse result.
-
-        Raises
-        ------
-        ValueError
-            If the file extension is wrong, or the file does not contain a
-            sparse result (use :meth:`DecompositionResult.load` instead).
-        """
-        path = Path(path)
-        if path.suffix not in {".h5", ".hdf5"}:
-            raise ValueError(
-                f"Unknown file extension '{path.suffix}'. Expected '.h5' or '.hdf5'."
-            )
-
+    def _load_hdf5(cls, path: Path, mmap: bool = False) -> "SparseDecompositionResult":
+        """Load a sparse result written by :meth:`save` (called by :meth:`load`)."""
         f = h5py.File(path, "r")
         try:
-            if not bool(f.attrs.get("is_sparse", False)):
-                raise ValueError(
-                    f"File '{path}' contains a dense result. "
-                    "Use DecompositionResult.load() instead."
-                )
-
             k_max = int(f.attrs["k_max"])
             eig_max = int(f.attrs["eig_max"])
             is_complex = bool(f.attrs["is_complex_projection"])

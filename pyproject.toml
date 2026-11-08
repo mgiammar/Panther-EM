@@ -22,7 +22,7 @@ name = "panther-em"
 dynamic = ["version"]
 description = "Pipelined AcceleratioN of Template matcHing via Eigendecomposition of Rotational projections in cryo-EM"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = { text = "BSD-3-Clause" }
 authors = [{ name = "Matthew Giammar", email = "mdgiammar@gmail.com" }]
 # https://pypi.org/classifiers/
@@ -30,8 +30,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -48,8 +46,11 @@ dependencies = [
     "matplotlib",
     "h5py",
     "ttsim3d",
-    "torch-fourier-slice",
-    "torch-so3",
+    "torch-fourier-slice>=0.6.0",
+    "torch-fourier-filter",  # 1-D spectra, whitening and curve-to-grid helpers
+    "torch-grid-utils",  # fftfreq_grid
+    "torch-so3>=0.6.0",  # HierarchicalS2Grid: HEALPix orientation grids
+    "healpy; platform_system != 'Windows'",
     "roma",
     "ipykernel",
 ]
@@ -59,6 +60,7 @@ dependencies = [
 [project.optional-dependencies]
 cuda13 = ["cupy-cuda13x", "cucim-cu13"]
 cuda12 = ["cupy-cuda12x", "cucim-cu12"]
+fused-kernels = ["ninja"]
 
 [project.urls]
 homepage = "https://github.com/mgiammar/panther-em"
@@ -133,11 +135,14 @@ skip-magic-trailing-comma = false # default is false
 minversion = "7.0"
 addopts = ["--color=yes"]
 testpaths = ["tests"]
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    "ignore:.*torch\\.jit\\.script_method.*:DeprecationWarning",
+]
 
 # https://mypy.readthedocs.io/en/stable/config_file.html
 [tool.mypy]
-files = "src/**/"
+files = ["src"]
 strict = true
 disallow_any_generics = false
 disallow_subclassing_any = false
@@ -145,10 +150,33 @@ show_error_codes = true
 pretty = true
 # plugins = ["pydantic.mypy"]
 
-# # module specific overrides
-# [[tool.mypy.overrides]]
-# module = ["numpy.*",]
-# ignore_errors = true
+# module specific overrides
+[[tool.mypy.overrides]]
+module = "panther_em.inference.search.*"
+disallow_untyped_decorators = false
+
+# third-party packages without type information
+[[tool.mypy.overrides]]
+module = [
+    "cupy",
+    "cupy.*",
+    "cupyx",
+    "cupyx.*",
+    "h5py",
+    "healpy",
+    "roma",
+    "scipy",
+    "scipy.*",
+    "torch_fourier_slice",
+    "torch_fourier_slice.*",
+    "torch_grid_utils",
+    "torch_grid_utils.*",
+    "torch_so3",
+    "torch_so3.*",
+    "tqdm",
+    "tqdm.*",
+]
+ignore_missing_imports = true
 
 # https://coverage.readthedocs.io/
 [tool.coverage.report]
@@ -174,6 +202,7 @@ source = ["panther_em"]
 ignore = [
     ".pre-commit-config.yaml",
     ".ruff_cache/**/*",
+    "examples/**/*",
     "tests/**/*",
     "uv.lock",
 ]
@@ -181,3 +210,18 @@ ignore = [
 # https://github.com/crate-ci/typos/blob/master/docs/reference.md
 [tool.typos.default]
 extend-ignore-identifiers-re = []
+extend-ignore-re = [
+    # the PANTHER acronym capitalises letters inside words ("matcHing", "AcceleratioN")
+    "Acceleratio(\\*\\*)?N",
+    "matc(\\*\\*)?H(\\*\\*)?ing",
+    # jupyter cell ids
+    '"id": "[0-9a-f]{8}"',
+]
+
+[tool.typos.default.extend-words]
+arange = "arange"  # numpy
+iy = "iy"  # row index, paired with ix
+
+[tool.typos.type.cu]
+extend-glob = ["*.cu", "*.cuh"]
+extend-ignore-words-re = ["(?i)^optin$"]

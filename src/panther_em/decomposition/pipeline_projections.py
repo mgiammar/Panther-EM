@@ -117,7 +117,7 @@ def project_from_precomputed_dft(
     projections : torch.Tensor
         `(..., d, d)` real-space projections.
     """
-    projections = extract_central_slices_rfft_3d(
+    projections: torch.Tensor = extract_central_slices_rfft_3d(
         volume_rfft=dft,
         rotation_matrices=rotation_matrices,
         fftfreq_max=fftfreq_max,
@@ -174,11 +174,12 @@ def apply_fourier_filters(
     if _is_complex:
         projections_fft = torch.fft.fft2(projections)
         projections_fft = projections_fft[None, ...] * fourier_filters[:, None, :, :]
-        return torch.fft.ifft2(projections_fft)
+        filtered: torch.Tensor = torch.fft.ifft2(projections_fft)
     else:
         projections_fft = torch.fft.rfft2(projections)
         projections_fft = projections_fft[None, ...] * fourier_filters[:, None, :, :]
-        return torch.fft.irfft2(projections_fft)
+        filtered = torch.fft.irfft2(projections_fft)
+    return filtered
 
 
 def process_batch(
@@ -192,6 +193,7 @@ def process_batch(
     transformer: CoordinateTransform,
     warp_polar_kwargs: dict,
     fftfreq_max: float = 0.5,
+    normalize_projections: bool = False,
 ) -> tuple[torch.Tensor, bool, int]:
     """Generate a batch of polar proj. from a DFT, FFT along angular dim.
 
@@ -215,6 +217,9 @@ def process_batch(
         Additional kwargs forwarded to ``transformer.to_transform_space``.
     fftfreq_max : float
         Maximum frequency in cycles per pixel for Fourier slicing. Default is 0.5.
+    normalize_projections : bool
+        If True, normalize projections to have mean zero and unit variance. Default is
+        False so projections are un-normalized.
 
     Returns
     -------
@@ -239,6 +244,10 @@ def process_batch(
     )
 
     projections_filtered = apply_fourier_filters(projections, fourier_filters)
+
+    if normalize_projections:
+        var, mean = torch.var_mean(projections_filtered, dim=(-2, -1), keepdim=True)
+        projections_filtered = (projections_filtered - mean) / torch.sqrt(var + 1e-8)
 
     # to_transform_space expects a single batch dimension; flatten the two outer dims.
     num_defocus = fourier_filters.shape[0]
@@ -436,6 +445,7 @@ def do_pipelined_projection_and_transforms(
     projection_batch_size: int = 128,
     pad_factor: float = 2.0,
     fftfreq_max: float = 0.5,
+    normalize_projections: bool = False,
     show_progress: bool = True,
     k_max: int | None = None,
     storage_backend: Literal["on_device", "cpu", "mmap"] = "cpu",
@@ -464,6 +474,9 @@ def do_pipelined_projection_and_transforms(
         Volume padding factor for Fourier slicing. Default is 2.0.
     fftfreq_max : float
         Maximum frequency in cycles per pixel. Default is 0.5.
+    normalize_projections : bool
+        If True, normalize projections to have mean zero and unit variance. Default is
+        False so projections are un-normalized.
     show_progress : bool
         Whether to show a tqdm progress bar. Default is True.
     k_max : int | None
@@ -543,6 +556,7 @@ def do_pipelined_projection_and_transforms(
         transformer=transformer,
         warp_polar_kwargs=warp_polar_kwargs,
         fftfreq_max=fftfreq_max,
+        normalize_projections=normalize_projections,
     )
 
     block_index_min, block_index_max, k_max_actual = _compute_freq_crop(
@@ -568,6 +582,7 @@ def do_pipelined_projection_and_transforms(
         output_tensor = torch.empty(buffer_shape, dtype=torch.complex64, device="cpu")
         buffer = _HostStagingBuffer(output_tensor, block_index_min, block_index_max)
     else:  # "mmap"
+        assert mmap_path is not None  # validated at the top of the function
         _mm = np.memmap(mmap_path, dtype=np.complex64, mode="w+", shape=buffer_shape)
         output_tensor = torch.from_numpy(_mm)
         buffer = _HostStagingBuffer(output_tensor, block_index_min, block_index_max)
@@ -607,6 +622,7 @@ def do_pipelined_projection_and_transforms(
                 transformer=transformer,
                 warp_polar_kwargs=warp_polar_kwargs,
                 fftfreq_max=fftfreq_max,
+                normalize_projections=normalize_projections,
             )
 
             if is_complex:

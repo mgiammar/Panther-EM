@@ -220,6 +220,7 @@ class PolarProjectionDecomposer:
         eig_max: int | None = None,
         projection_batch_size: int = 128,
         block_batch_size: int = 8,
+        normalize_projections: bool = False,
         storage_backend: Literal["on_device", "cpu", "mmap"] = "cpu",
         mmap_path: Path | str | None = None,
         svd_method: Literal["dense", "low_rank"] = "dense",
@@ -247,6 +248,9 @@ class PolarProjectionDecomposer:
         block_batch_size : int, optional
             Number of frequency blocks to process at a time on GPU for SVD.
             Default is 8.
+        normalize_projections : bool, optional
+            If True, normalize projections to have mean zero and unit variance before
+            decomposition. Default is False.
         storage_backend : {"on_device", "cpu", "mmap"}, optional
             Where to accumulate Stage 1 results:
 
@@ -294,6 +298,7 @@ class PolarProjectionDecomposer:
                 transformer=transformer,
                 warp_polar_kwargs={"preserve_energy": True},
                 projection_batch_size=projection_batch_size,
+                normalize_projections=normalize_projections,
                 k_max=k_max,
                 storage_backend=storage_backend,
                 mmap_path=mmap_path,

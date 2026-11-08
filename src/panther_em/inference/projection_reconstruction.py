@@ -3,7 +3,8 @@
 import numpy as np
 import torch
 
-from panther_em.decomposition.result import DecompositionResult
+from panther_em.coordinates.transform_base import CoordinateTransform
+from panther_em.decomposition.result import DecompositionBase
 
 
 class ProjectionReconstructor:
@@ -11,7 +12,7 @@ class ProjectionReconstructor:
 
     def __init__(
         self,
-        result: DecompositionResult,
+        result: DecompositionBase,
         device: str | torch.device = "cpu",
     ) -> None:
         if result.coordinate_transform is None:
@@ -23,6 +24,11 @@ class ProjectionReconstructor:
         # GridTransform is device-agnostic; GPU dispatch is handled internally.
         self._coordinate_transform = result.coordinate_transform
         self.image_shape: tuple[int, int] = self._coordinate_transform.cartesian_shape
+
+    @property
+    def coordinate_transform(self) -> CoordinateTransform:
+        """The result's polar <-> Cartesian transform."""
+        return self._coordinate_transform
 
     def clear_coordinate_transform_cache(self) -> None:
         """Remove any cached interpolation grids."""
@@ -60,6 +66,10 @@ class ProjectionReconstructor:
     def _get_angular_phase_component(
         self, k_idx: int, phase_shift: float
     ) -> torch.Tensor:
+        """Backwards-compatible alias of :meth:`angular_phase_component`."""
+        return self.angular_phase_component(k_idx, phase_shift)
+
+    def angular_phase_component(self, k_idx: int, phase_shift: float) -> torch.Tensor:
         """Compute the k-th discrete angular Fourier basis vector.
 
         Parameters
@@ -78,7 +88,8 @@ class ProjectionReconstructor:
         base_angles = 2.0 * np.pi * k_idx * n / N
         angles = base_angles + k_idx * phase_shift_rad
 
-        return torch.exp(1j * angles) / np.sqrt(N)
+        component: torch.Tensor = torch.exp(1j * angles) / np.sqrt(N)
+        return component
 
     def _get_angular_phase_components_batch(
         self, k_idx: int, phase_shifts: torch.Tensor
@@ -105,7 +116,8 @@ class ProjectionReconstructor:
         base_angles = 2.0 * np.pi * k_idx * n / N
         angles = base_angles[None, :] + k_idx * phase_shifts_rad[:, None]
 
-        return torch.exp(1j * angles) / np.sqrt(N)
+        components: torch.Tensor = torch.exp(1j * angles) / np.sqrt(N)
+        return components
 
     def construct_polar_feature(
         self,
@@ -193,6 +205,7 @@ class ProjectionReconstructor:
         polar_feature = self.construct_polar_feature(
             k_idx, eig_idx, in_plane_rotation, return_torch=True
         )
+        assert isinstance(polar_feature, torch.Tensor)  # return_torch=True
 
         cartesian_feature = self._coordinate_transform.to_cartesian(
             polar_feature,
@@ -335,11 +348,7 @@ class ProjectionReconstructor:
 
         if return_torch:
             return cartesian_projection
-        return (
-            cartesian_projection.cpu().numpy()
-            if isinstance(cartesian_projection, torch.Tensor)
-            else cartesian_projection
-        )
+        return cartesian_projection.cpu().numpy()
 
     def reconstruct_projection_batch(
         self,
@@ -470,8 +479,4 @@ class ProjectionReconstructor:
 
         if return_torch:
             return cartesian_projections
-        return (
-            cartesian_projections.cpu().numpy()
-            if isinstance(cartesian_projections, torch.Tensor)
-            else cartesian_projections
-        )
+        return cartesian_projections.cpu().numpy()
