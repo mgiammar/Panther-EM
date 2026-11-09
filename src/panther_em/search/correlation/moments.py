@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from panther_em.search.correlation.contraction import ContractionEngine
     from panther_em.search.correlation.layout import FeatureLayout
     from panther_em.search.correlation.loop import LoopPlan
-    from panther_em.search.weights import WeightSource
+    from panther_em.search.weights import TensorWeights
 
 
 def real_weight_columns(
@@ -118,7 +118,7 @@ class MomentForms:
     @torch.no_grad()
     def build(
         cls,
-        weights: WeightSource,
+        weights: TensorWeights,
         layout: FeatureLayout,
         engine: ContractionEngine,
         n_psi: int,
@@ -130,7 +130,7 @@ class MomentForms:
 
         Parameters
         ----------
-        weights : WeightSource
+        weights : TensorWeights
             The template's ``U * S`` weights.
         layout : FeatureLayout
             The stage's rectangles (one form set per k-run).

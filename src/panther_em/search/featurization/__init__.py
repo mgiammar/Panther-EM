@@ -36,8 +36,10 @@ from panther_em.search.featurization.selection import (
 )
 from panther_em.search.featurization.store import (
     ColumnGroup,
+    ColumnSubset,
     FeatureStore,
     ReadyBlock,
+    StoreLike,
 )
 
 __all__ = [
@@ -47,6 +49,7 @@ __all__ = [
     "BaseImageFeaturization",
     "BoxContraction",
     "ColumnGroup",
+    "ColumnSubset",
     "DirectFeaturization",
     "FFTFeaturization",
     "FeatureChunk",
@@ -54,6 +57,7 @@ __all__ = [
     "Mode",
     "PlanarContraction",
     "ReadyBlock",
+    "StoreLike",
     "box_contraction",
     "choose_mode",
     "make_featurization",

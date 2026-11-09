@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from panther_em.search.correlation.reduction import BlockStats
     from panther_em.search.featurization.store import (
         ColumnGroup,
-        FeatureStore,
+        StoreLike,
     )
     from panther_em.search.hypotheses import HypothesisSet
     from panther_em.search.planning import MemoryPlan
@@ -91,7 +91,7 @@ class LoopPlan:
     signature: tuple
 
     @classmethod
-    def create(cls, stage: Stage, store: FeatureStore, memory: MemoryPlan) -> LoopPlan:
+    def create(cls, stage: Stage, store: StoreLike, memory: MemoryPlan) -> LoopPlan:
         """Resolve a pass's memory plan against a store whose groups already exist."""
         layout = stage.layout()
         planes = memory.hyps.defocus_planes()

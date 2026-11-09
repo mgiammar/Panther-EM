@@ -11,12 +11,16 @@ featurized it. A group's features live in one ``(n_blocks, *block)`` tensor whos
 blocks are the contraction engine's operand layout (``(D, num_k, block_pixels,
 num_m)`` complex64, or ``(D, num_k, block_pixels, 2 num_m)`` float16 ``[Re | Im]``);
 the tail of the last block stays zero.
+
+What the correlation reads of a store is the :class:`StoreLike` protocol; a
+:class:`ColumnSubset` serves some of a store's columns as blocks of its own size
+without copying the whole store (a seed pass over a lattice of a band's pixels).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
@@ -98,6 +102,26 @@ class ReadyBlock:
     col_range: tuple[int, int]
     n_valid: int
     operands: Mapping[int, torch.Tensor]
+
+
+class StoreLike(Protocol):
+    """What the correlation reads of a store: columns served in engine-layout blocks."""
+
+    n_pixels: int
+    block_pixels: int
+    device: torch.device
+    precision: Precision
+    planes: tuple[int, ...]
+
+    def groups_covering(
+        self, rect: Sequence[int], precision: Precision | str, planes: Sequence[int]
+    ) -> list[tuple[ColumnGroup, int]]:
+        """``(group, local plane index)`` for each of ``planes``, in request order."""
+        ...
+
+    def blocks(self, groups: Sequence[ColumnGroup]) -> Iterator[ReadyBlock]:
+        """The blocks of ``groups`` in column order."""
+        ...
 
 
 class FeatureStore:
@@ -260,3 +284,80 @@ class FeatureStore:
             yield ReadyBlock(
                 i, (start, stop), stop - start, {g.id: g.data[i] for g in groups}
             )
+
+
+class ColumnSubset:
+    """Some columns of a store, served as blocks of their own size.
+
+    Column ``s`` of the subset is column ``columns[s]`` of the store; each block is
+    gathered from the store when read (the tail block zero-padded), so nothing is
+    copied until the correlation asks for it. The groups are the store's own
+    (``groups_covering`` delegates), which keeps the hypothesis loop's cache keys and
+    plane lookup identical to the store's.
+
+    Parameters
+    ----------
+    store : FeatureStore
+        The store the columns come from.
+    columns : torch.Tensor
+        ``(S,)`` int64 store columns (any order; a column may repeat).
+    block_pixels : int
+        Columns per block of the subset (the seed pass's memory plan).
+    """
+
+    def __init__(
+        self, store: FeatureStore, columns: torch.Tensor, block_pixels: int
+    ) -> None:
+        columns = columns.to(store.device, torch.long).reshape(-1)
+        if columns.numel() and (
+            int(columns.min()) < 0 or int(columns.max()) >= store.n_pixels
+        ):
+            raise ValueError("subset columns must lie within the store")
+        if block_pixels < 1:
+            raise ValueError("block_pixels must be >= 1")
+        self.store = store
+        self.columns = columns
+        self.n_pixels = int(columns.numel())
+        self.block_pixels = int(block_pixels)
+        self.device = store.device
+        self.precision = store.precision
+        self.planes = store.planes
+        self.groups = store.groups
+
+    @property
+    def n_blocks(self) -> int:
+        """Blocks along the subset's pixel axis."""
+        return -(-self.n_pixels // self.block_pixels)
+
+    def block_range(self, index: int) -> tuple[int, int]:
+        """Subset columns ``[start, stop)`` of block ``index``."""
+        start = index * self.block_pixels
+        return start, min(start + self.block_pixels, self.n_pixels)
+
+    def groups_covering(
+        self, rect: Sequence[int], precision: Precision | str, planes: Sequence[int]
+    ) -> list[tuple[ColumnGroup, int]]:
+        """The store's groups (see :meth:`FeatureStore.groups_covering`)."""
+        return self.store.groups_covering(rect, precision, planes)
+
+    def blocks(self, groups: Sequence[ColumnGroup]) -> Iterator[ReadyBlock]:
+        """The subset's blocks, gathered from the store one at a time."""
+        for g in groups:
+            if g not in self.groups:
+                raise ValueError("group does not belong to this store")
+        bp = self.store.block_pixels
+        for i in range(self.n_blocks):
+            start, stop = self.block_range(i)
+            cols = self.columns[start:stop]
+            b_idx, p_idx = cols // bp, cols % bp
+            operands = {}
+            for g in groups:
+                gathered = g.data[b_idx, :, :, p_idx]  # (n, D, K, inner)
+                block = torch.zeros(
+                    (*g.data.shape[1:3], self.block_pixels, g.data.shape[4]),
+                    dtype=g.data.dtype,
+                    device=g.data.device,
+                )
+                block[:, :, : stop - start] = gathered.permute(1, 2, 0, 3)
+                operands[g.id] = block
+            yield ReadyBlock(i, (start, stop), stop - start, operands)

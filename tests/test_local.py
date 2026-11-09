@@ -14,6 +14,7 @@ from test_search import EXEC, EXEC_JOINT, StubFeaturizer
 from panther_em.search.config import Tuning
 from panther_em.search.correlation import (
     Correlator,
+    LocalWeights,
     LocalWork,
     LoopPlan,
     MomentForms,
@@ -167,6 +168,7 @@ def _pass(
     n_planes=2,
     n_pixels=37,
     device="cpu",
+    fused=False,
 ):
     template = Template(
         synthetic_result(n_orientations=6, n_filters=2, k_max=6, eig_max=6),
@@ -181,10 +183,10 @@ def _pass(
         batch=BatchShape(8, 5),
         block_pixels=16,
         use_cuda_graph=False,
-        use_fused_kernel=False,
+        use_fused_kernel=fused,
     )
     memory = plan_memory(
-        DeviceInfo(torch.device(device)),
+        DeviceInfo.probe(device) if fused else DeviceInfo(torch.device(device)),
         stage,
         n_pixels=n_pixels,
         space=space,
@@ -270,14 +272,20 @@ def test_closed_form_moments_equal_the_loop_fp16(
 
 
 def _local_reference(template, plan, store, work):
-    """Per column: the maximum over its group's hypotheses by an explicit irfft."""
+    """Per column: the maximum over its entries' hypotheses by an explicit irfft.
+
+    A column with several entries (``work.columns``) is scored over the union of
+    their groups' hypotheses.
+    """
     hyps = plan.hyps
     n_psi, f = plan.stage.n_psi, plan.n_freq
     us = template.weights.us.to(torch.complex64)  # (N, K, M) from (0, 0)
     rows = hyps.template_rows(us.device)
+    column_of = work.column_of("cpu")
     out = []
     for p in range(store.n_pixels):
-        j = work.rows[int(work.cells[p])].to(us.device)
+        cells = work.cells.cpu()[column_of == p]
+        j = torch.unique(work.rows[cells].reshape(-1)).to(us.device)
         w = us[rows[j]]  # (W, K, M)
         c = torch.zeros(
             hyps.n_defocus_selected,
@@ -512,3 +520,165 @@ def test_correlator_waits_for_the_callers_stream(synthetic_result, local):
     torch.cuda.synchronize()
     torch.testing.assert_close(after.mip, 2 * before.mip)
     torch.testing.assert_close(after.variance, 4 * before.variance, rtol=1e-4, atol=0)
+
+
+# --------------------------------------------------------------------------- #
+# Entries: several groups per column, column subsets, alternate weights
+# --------------------------------------------------------------------------- #
+
+
+def _entries(n_pixels, n_groups, gen):
+    """Every column in one to three entries of distinct groups."""
+    columns, cells = [], []
+    for p in range(n_pixels):
+        k = int(torch.randint(1, 4, (1,), generator=gen))
+        for c in torch.randperm(n_groups, generator=gen)[:k].tolist():
+            columns.append(p)
+            cells.append(c)
+    perm = torch.randperm(len(columns), generator=gen)
+    return torch.tensor(columns)[perm], torch.tensor(cells)[perm]
+
+
+@pytest.mark.parametrize(("rects", "n_psi", "orientations"), CASES)
+def test_entries_take_the_maximum_over_a_columns_groups(
+    synthetic_result, rects, n_psi, orientations
+):
+    template, plan, store = _pass(
+        synthetic_result, rects, n_psi, orientations=orientations
+    )
+    gen = torch.Generator().manual_seed(11)
+    columns, cells = _entries(store.n_pixels, 4, gen)
+    work = LocalWork(
+        cells=cells,
+        rows=torch.randint(0, plan.hyps.n_selected, (4, 3), generator=gen),
+        columns=columns,
+    )
+    correlator = Correlator("cpu", template.weights)
+    maps = correlator.run_local(store, plan, work, chunk_bytes=1 << 12)
+    ref = _local_reference(template, plan, store, work)
+    torch.testing.assert_close(
+        maps.mip, torch.tensor([r[0] for r in ref]), rtol=1e-5, atol=1e-5
+    )
+    assert maps.best_virtual.tolist() == [r[1] for r in ref]
+    assert maps.best_psi.tolist() == [r[2] for r in ref]
+    assert torch.isfinite(maps.zscore).all()
+    # a column without any entry is an error
+    with pytest.raises(ValueError, match="at least one entry"):
+        correlator.run_local(
+            store,
+            plan,
+            LocalWork(cells[columns != 3], work.rows, columns[columns != 3]),
+            chunk_bytes=1 << 12,
+        )
+    with pytest.raises(ValueError, match="columns must be"):
+        LocalWork(cells, work.rows, columns[:-1])
+
+
+def test_column_subset_serves_the_stores_columns(synthetic_result):
+    template, plan, store = _pass(synthetic_result, [(0, 0, 4, 5)], 8)
+    from panther_em.search.featurization import ColumnSubset
+
+    columns = torch.tensor([36, 3, 17, 17, 0, 31, 20])
+    subset = ColumnSubset(store, columns, block_pixels=8)
+    assert subset.n_pixels == 7 and subset.n_blocks == 1
+    memory = replace(plan.memory, block_pixels=8)
+    sub_plan = LoopPlan.create(plan.stage, subset, memory)
+    correlator = Correlator("cpu", template.weights)
+    full = correlator.run(store, plan)
+    part = correlator.run(subset, sub_plan)
+    for name in ("mip", "mean", "variance", "zscore", "best_virtual", "best_psi"):
+        torch.testing.assert_close(
+            getattr(part, name), getattr(full, name)[columns], rtol=1e-5, atol=1e-5
+        )
+    blocks = list(subset.blocks(plan.groups))
+    assert blocks[0].n_valid == 7
+    gathered = read_group(store, store.groups[0])[columns]
+    got = blocks[0].operands[0][0][:, :7].permute(1, 0, 2)  # plane 0, (P, K, M)
+    torch.testing.assert_close(got, gathered)
+    with pytest.raises(ValueError, match="within the store"):
+        ColumnSubset(store, torch.tensor([store.n_pixels]), 8)
+
+
+def test_correlator_runs_an_alternate_weight_set(synthetic_result):
+    from panther_em.search.weights import TensorWeights
+
+    template, plan, store = _pass(synthetic_result, [(0, 0, 4, 5)], 8)
+    gen = torch.Generator().manual_seed(5)
+    n = template.weights.n_templates
+    other_us = torch.complex(
+        torch.randn(n, 6, 6, generator=gen), torch.randn(n, 6, 6, generator=gen)
+    )
+    other = TensorWeights(other_us, n_filters=2, n_orientations=6, key=("other",))
+    shared = Correlator("cpu", template.weights)
+    own = shared.run(store, plan)
+    alt = shared.run(store, plan, weights=other)
+    direct = Correlator("cpu", other).run(store, plan)
+    for name in ("mip", "mean", "variance", "best_virtual", "best_psi"):
+        torch.testing.assert_close(getattr(alt, name), getattr(direct, name))
+    assert not torch.allclose(alt.mip, own.mip)
+    # the caches keep the two sets apart
+    torch.testing.assert_close(shared.run(store, plan).mip, own.mip)
+    assert len(shared.loops) == 2
+    with pytest.raises(ValueError, match="needs a key"):
+        shared.run(
+            store, plan, weights=TensorWeights(other_us, n_filters=2, n_orientations=6)
+        )
+    with pytest.raises(ValueError, match="template rows"):
+        shared.run(
+            store,
+            plan,
+            weights=TensorWeights(
+                other_us[:6], n_filters=1, n_orientations=6, key=("x",)
+            ),
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("rects", "orientations"),
+    [([(0, 0, 4, 5)], None), ([(0, 0, 3, 3), (1, 3, 4, 2)], [0, 2, 3, 5])],
+)
+@pytest.mark.parametrize("repeated", [False, True])
+def test_lean_local_path_matches_the_reference(
+    synthetic_result, rects, orientations, repeated
+):
+    """fp16 store + prepared weights + fused kernel, against the explicit irfft."""
+    template, plan, store = _pass(
+        synthetic_result,
+        rects,
+        128,
+        precision="fp16",
+        orientations=orientations,
+        device="cuda",
+        fused=True,
+    )
+    if not plan.fused:
+        pytest.skip("fused kernels unavailable")
+    gen = torch.Generator().manual_seed(6)
+    rows = torch.randint(0, plan.hyps.n_selected, (4, 3), generator=gen)
+    if repeated:
+        columns, cells = _entries(store.n_pixels, 4, gen)
+        work = LocalWork(cells.cuda(), rows, columns.cuda())
+    else:
+        work = LocalWork(torch.randint(0, 4, (store.n_pixels,), generator=gen), rows)
+    correlator = Correlator("cuda", template.weights)
+    prepared = correlator.local_weights(plan, rows, ("test", 4, 3), budget=None)
+    assert prepared is not None and prepared.n_groups == 4 and prepared.width == 3
+    assert prepared.nbytes == LocalWeights.estimate_bytes(plan.layout, 4, 3)
+    assert correlator.local_weights(plan, rows, ("test", 4, 3), budget=1) is None
+    from panther_em.search.correlation.local import lean_path_applies
+
+    assert lean_path_applies(plan, prepared)
+    lean = correlator.run_local(
+        store, plan, work, chunk_bytes=1 << 16, local_weights=prepared
+    )
+    plain = correlator.run_local(store, plan, work, chunk_bytes=1 << 16)
+    ref = _local_reference(template, plan, store, work)
+    mip = torch.tensor([r[0] for r in ref])
+    torch.testing.assert_close(plain.mip.cpu(), mip, rtol=1e-5, atol=1e-5)
+    # the lean path rounds the spectrum to fp16 (the dense fp16 stage does too)
+    torch.testing.assert_close(lean.mip.cpu(), mip, rtol=5e-3, atol=5e-3)
+    same = (lean.best_virtual == plain.best_virtual) & (lean.best_psi == plain.best_psi)
+    assert float(same.float().mean()) >= 0.9
+    torch.testing.assert_close(lean.variance, plain.variance)
+    torch.testing.assert_close(lean.mean, plain.mean)

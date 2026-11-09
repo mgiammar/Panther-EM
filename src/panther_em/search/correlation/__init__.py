@@ -35,7 +35,7 @@ from panther_em.search.correlation.layout import (
     LayoutPart,
     rectangles_disjoint,
 )
-from panther_em.search.correlation.local import LocalWork
+from panther_em.search.correlation.local import LocalWeights, LocalWork
 from panther_em.search.correlation.loop import HypLoop, LoopPlan
 from panther_em.search.correlation.maps import (
     StageMaps,
@@ -53,6 +53,7 @@ __all__ = [
     "HypLoop",
     "KRun",
     "LayoutPart",
+    "LocalWeights",
     "LocalWork",
     "LoopPlan",
     "MomentForms",
