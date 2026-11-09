@@ -46,9 +46,12 @@ stage 0 searches every unmasked pixel, each later stage re-scores the pixels the
 previous decision left AMBIGUOUS or ACCEPTED, and the session stops early when that
 set is empty. A *local* stage (``Stage.local_rings``) scores each of those pixels only
 over a HEALPix neighborhood of the orientation the previous stage found best there,
-with the mean and variance of its whole set from the closed-form moments. A stage
-whose decision runs the threshold test needs the micrograph's noise model (an
-``Micrograph`` on the table's frequency axis); the session refuses to start without it.
+with the mean and variance of its whole set from the closed-form moments. A *seeded*
+stage (``Stage.seeding``) finds those neighborhoods itself: a seed pass over coarse
+cell templates names each pixel's cells, then the same local search covers them
+(:mod:`.seeding`). A stage whose decision runs the threshold test needs the
+micrograph's noise model (an ``Micrograph`` on the table's frequency axis); the
+session refuses to start without it.
 """
 
 from __future__ import annotations
@@ -76,6 +79,7 @@ from panther_em.search.micrograph import Micrograph
 from panther_em.search.planning import DeviceInfo, plan_stage
 from panther_em.search.results import SearchResult, StageResult
 from panther_em.search.runner import StageRunner, Timeline
+from panther_em.search.seeding import SeedResources
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -129,6 +133,8 @@ class Searcher:
         stage samples orientations by level or searches neighborhoods.
     local : dict[int, LocalHypotheses]
         The neighborhoods of each local stage, by stage index.
+    seeded : dict[int, SeedResources]
+        The seed templates and neighborhoods of each seeded stage, by stage index.
     device_info : DeviceInfo
         The compute device's capabilities (probed once).
     correlator : Correlator
@@ -172,13 +178,17 @@ class Searcher:
         # template is not on a HEALPix grid)
         self.nside: int | None = None
         self.ipix = None
-        if any(isinstance(s.orientations, int) or s.is_local for s in self.stages):
+        if any(
+            isinstance(s.orientations, int) or s.is_local or s.is_seeded
+            for s in self.stages
+        ):
             found = None
             if self.space.phi_deg is not None and self.space.theta_deg is not None:
                 found = healpix_ipix(self.space.phi_deg, self.space.theta_deg)
             if found is not None:
                 self.nside, self.ipix = found
         self.local: dict[int, LocalHypotheses] = {}
+        self.seeded: dict[int, SeedResources] = {}
         self.device_info = DeviceInfo.probe(template.device)
         self.correlator = Correlator(
             self.device_info.device,
@@ -214,6 +224,8 @@ class Searcher:
                 raise ValueError(f"stage {i}: orientation ids exceed the template's")
             if stage.is_local:
                 self.local[i] = self._local_hypotheses(i, template_ids)
+            if stage.is_seeded:
+                self.seeded[i] = self._seed_resources(i, template_ids)
             if stage.decision is not None and stage.decision.test is not None:
                 table = stage.decision.test.table
                 try:
@@ -255,6 +267,31 @@ class Searcher:
         except ValueError as exc:
             raise ValueError(f"stage {index}: {exc}") from exc
 
+    def _seed_resources(
+        self, index: int, template_ids: torch.Tensor | None
+    ) -> SeedResources:
+        stage = self.stages[index]
+        assert stage.seeding is not None
+        if self.ipix is None or self.nside is None:
+            raise ValueError(
+                f"stage {index}: a seeded stage needs a template whose orientations "
+                "are HEALPix pixel centers (see healpix_orientations)"
+            )
+        try:
+            return SeedResources.build(
+                self.template.weights,
+                stage.layout(),
+                stage.seeding,
+                self.space,
+                self.nside,
+                self.ipix,
+                level=stage.level,
+                template_ids=template_ids,
+                n_psi=stage.n_psi,
+            )
+        except ValueError as exc:
+            raise ValueError(f"stage {index}: {exc}") from exc
+
     @property
     def device(self) -> torch.device:
         """Compute device."""
@@ -292,6 +329,7 @@ class Searcher:
             free_bytes=self.device_info.free_bytes(),
             local=self.local.get(index),
             seeds=seeds,
+            seeded=self.seeded.get(index),
         )
 
     def session(self, images: Micrograph | SearchImages) -> SearchSession:
@@ -401,6 +439,7 @@ class SearchSession:
             timeline=self.timeline,
             show_progress=exe.show_progress,
             local_bytes=exe.tuning.local_bytes,
+            local_weights_bytes=exe.tuning.local_weights_bytes,
         )
         self._mark("session")
 

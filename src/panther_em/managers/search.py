@@ -96,6 +96,17 @@ class DecisionSpec(Model):
     absorb_radius: int = Field(default=0, ge=0)
 
 
+class SeedingSpec(Model):
+    """A stage's :class:`~panther_em.search.Seeding` (a self-seeded stage)."""
+
+    level: int = Field(default=1, ge=1)
+    rings: int = Field(default=2, ge=0)
+    templates: Literal["cell_mean", "subset"] = "cell_mean"
+    n_psi: int | None = Field(default=None, ge=2)
+    lattice: int = Field(default=1, ge=1)
+    top_k: int | None = Field(default=None, ge=1)
+
+
 class StageSpec(Model):
     """A :class:`~panther_em.search.Stage` (see :meth:`Stage.create`)."""
 
@@ -106,6 +117,7 @@ class StageSpec(Model):
     orientations: int | list[int] | None = None
     planes: list[int] | None = None
     local_rings: int | None = Field(default=None, ge=0)
+    seeding: SeedingSpec | None = None
     decision: DecisionSpec = DecisionSpec()
     name: str = ""
 
@@ -269,6 +281,9 @@ class _Run:
                         orientations=spec.orientations,
                         planes=spec.planes,
                         local_rings=spec.local_rings,
+                        seeding=(
+                            None if spec.seeding is None else spec.seeding.model_dump()
+                        ),
                         decision=Decision(
                             self.threshold(spec, shape),
                             test,

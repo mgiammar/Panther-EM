@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import torch
+from conftest import requires_cuda
+from test_local import _healpix_template, _images, _local_reference
+from test_search import EXEC, EXEC_JOINT, StubFeaturizer
 
 from panther_em.orientations import healpix_ipix, healpix_level_ids
-from panther_em.search.correlation import StageMaps
+from panther_em.search.correlation import LoopPlan, StageMaps
 from panther_em.search.correlation.layout import FeatureLayout
 from panther_em.search.correlation.reduction import hermitian_spectrum
+from panther_em.search.featurization import ColumnSubset
 from panther_em.search.hypotheses import HypothesisSet, HypothesisSpace
 from panther_em.search.images import PixelSelection, SearchGeometry, SearchImages
+from panther_em.search.planning import DeviceInfo, plan_stage
+from panther_em.search.searcher import Searcher
 from panther_em.search.seeding import (
     CellMeanWeights,
     LatticeSelection,
@@ -20,11 +28,13 @@ from panther_em.search.seeding import (
     cell_mean_templates,
     seed_work,
 )
+from panther_em.search.stage import Stage, stage_from_json, stage_to_json
 from panther_em.search.template import Template
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",
     "ignore:.*__array__ implementation doesn't accept.*:DeprecationWarning",
+    "ignore:ComplexHalf support is experimental",
 )
 
 
@@ -333,3 +343,226 @@ def test_seed_work_builds_distinct_entries_and_keeps_the_best_candidates(
         assert got == want
         assert len(got) == work.n_entries  # distinct
         assert set(work.columns.tolist()) == set(range(len(pixels)))
+
+
+# --------------------------------------------------------------------------- #
+# Seeded stages in a search
+# --------------------------------------------------------------------------- #
+
+
+def _stage(seeding=None, **kwargs):
+    return Stage.create([(0, 0, 4, 5)], n_psi=8, seeding=seeding, **kwargs)
+
+
+def _run_stages(template, stages, execution=EXEC_JOINT):
+    searcher = Searcher(
+        template,
+        stages,
+        execution=execution,
+        featurization=StubFeaturizer(),
+        n_defocus=2,
+        keep_stage_results=True,
+    )
+    session = searcher.session(_images())
+    return searcher, session, list(session)
+
+
+def _assert_same_maps(a, b, best_a, best_b):
+    torch.testing.assert_close(b.mip, a.mip, rtol=1e-5, atol=1e-5)
+    assert torch.equal(best_a, best_b)
+    assert torch.equal(a.best_psi, b.best_psi)
+    torch.testing.assert_close(b.variance, a.variance, rtol=2e-4, atol=0)
+    torch.testing.assert_close(b.mean, a.mean, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("templates", ["cell_mean", "subset"])
+@pytest.mark.parametrize("execution", [EXEC_JOINT, EXEC])
+def test_seeded_stage_covering_everything_equals_the_dense_stage(
+    synthetic_result, templates, execution
+):
+    template = _healpix_template(synthetic_result)
+    _, _, dense = _run_stages(template, [_stage()], execution)
+    seeding = Seeding(level=1, rings=8, templates=templates, lattice=2, top_k=1)
+    searcher, _, seeded = _run_stages(template, [_stage(seeding)], execution)
+    assert int(searcher.seeded[0].local.counts.min()) == 2 * 48
+    _assert_same_maps(
+        dense[0].maps, seeded[0].maps, dense[0].best_index, seeded[0].best_index
+    )
+    assert torch.equal(dense[0].labels_after, seeded[0].labels_after)
+
+
+def test_seeded_stage_in_bands_equals_the_dense_stage(synthetic_result, monkeypatch):
+    template = _healpix_template(synthetic_result)
+    _, _, dense = _run_stages(template, [_stage()])
+    monkeypatch.setattr(DeviceInfo, "free_bytes", lambda self: 40_000)
+    seeding = Seeding(level=1, rings=8, lattice=2)
+    searcher, session, seeded = _run_stages(template, [_stage(seeding)])
+    plan = searcher.plan(0, PixelSelection.all(session.geometry), session.geometry)
+    assert len(plan.bands) > 1 and plan.seeding is not None
+    for band in plan.bands:
+        assert band.lattice is not None
+        assert band.lattice.n_seeded < len(band.pixels)
+        for step in band.passes:
+            assert step.seed_memory is not None
+    _assert_same_maps(
+        dense[0].maps, seeded[0].maps, dense[0].best_index, seeded[0].best_index
+    )
+
+
+@pytest.mark.parametrize(
+    "seeding",
+    [
+        Seeding(level=1, rings=0),
+        Seeding(level=1, rings=1, lattice=2),
+        Seeding(level=1, rings=0, lattice=2, top_k=2),
+        Seeding(level=1, rings=1, templates="subset", lattice=2, top_k=1, n_psi=16),
+    ],
+)
+def test_seeded_stage_scores_each_pixel_over_its_candidates(synthetic_result, seeding):
+    """The stage's maps equal the explicit maximum over the pixel's seed entries."""
+    template = _healpix_template(synthetic_result)
+    searcher, session, (result,) = _run_stages(template, [_stage(seeding)])
+    _, _, (dense,) = _run_stages(template, [_stage()])
+    res = searcher.seeded[0]
+    pixels = PixelSelection.all(session.geometry)
+    plan = searcher.plan(0, pixels, session.geometry)
+    (band,) = plan.bands
+    (step,) = band.passes
+    store = session.store  # the pass's features (one joint pass)
+    assert store is not None and band.lattice is not None
+    # the seed pass again, by hand
+    lattice = band.lattice
+    seed_store = store
+    if lattice.n_seeded < store.n_pixels:
+        seed_store = ColumnSubset(store, lattice.columns, step.seed_memory.block_pixels)
+    seed_plan = LoopPlan.create(plan.seeding.stage, seed_store, step.seed_memory)
+    assert seed_plan.stage.n_psi == (seeding.n_psi or 8)
+    seed_maps = searcher.correlator.run(seed_store, seed_plan, weights=res.weights)
+    work = seed_work(res, lattice, seed_plan.hyps, seed_maps)
+    loop_plan = LoopPlan.create(plan.stage, store, step.memory)
+    ref = _local_reference(template, loop_plan, store, work)
+    maps = result.maps
+    torch.testing.assert_close(
+        maps.mip, torch.tensor([r[0] for r in ref]), rtol=1e-5, atol=1e-5
+    )
+    assert maps.best_virtual.tolist() == [r[1] for r in ref]
+    assert maps.best_psi.tolist() == [r[2] for r in ref]
+    # never above the dense maximum, equal where the dense best lies in an entry
+    assert bool((maps.mip <= dense.maps.mip + 1e-4).all())
+    o_dense = searcher.space.decode(dense.best_index)[2]
+    in_entries = torch.zeros(len(pixels), dtype=torch.bool)
+    for col, cell in zip(work.columns.tolist(), work.cells.tolist(), strict=True):
+        rows = res.local.rows[cell] % searcher.space.n_orientations
+        in_entries[col] |= bool((rows == o_dense[col]).any())
+    assert bool(in_entries.any())
+    torch.testing.assert_close(
+        maps.mip[in_entries], dense.maps.mip[in_entries], rtol=1e-5, atol=1e-5
+    )
+    torch.testing.assert_close(maps.variance, dense.maps.variance, rtol=2e-4, atol=0)
+    assert maps.n_evaluated == dense.maps.n_evaluated
+    assert result.n_ambiguous_after == len(pixels)  # no decision: all ambiguous
+
+
+def test_seeded_stage_seeds_a_following_local_stage(synthetic_result):
+    template = _healpix_template(synthetic_result)
+    stages = [
+        Stage.create([(0, 0, 3, 3)], n_psi=8, seeding=Seeding(level=1, rings=1)),
+        Stage.create([(0, 0, 4, 5)], n_psi=8, local_rings=1),
+    ]
+    searcher, session, results = _run_stages(template, stages)
+    assert len(results) == 2
+    local = searcher.local[1]
+    seeds = searcher.space.decode(results[0].best_index)[2]
+    cells = local.groups(seeds)
+    plan = searcher.plan(1, session.pixels, session.geometry, seeds)
+    assert torch.equal(plan.bands[0].cells, cells)
+    o = searcher.space.decode(results[1].best_index)[2]
+    assert all(
+        int(o_p) in (local.rows[c] % searcher.space.n_orientations).tolist()
+        for o_p, c in zip(o, cells, strict=True)
+    )
+
+
+def test_seeded_stage_validation(synthetic_result):
+    with pytest.raises(ValueError, match="not both"):
+        _stage(Seeding(), local_rings=1)
+    with pytest.raises(ValueError, match="HEALPix grid"):
+        _stage(Seeding(), orientations=[0, 1])
+    with pytest.raises(ValueError, match="must exceed"):
+        _stage(Seeding(level=1), orientations=1)
+    with pytest.raises(ValueError, match=r"seeding\.n_psi"):
+        _stage(Seeding(n_psi=4))
+    with pytest.raises(ValueError, match="seeding must be"):
+        Stage(((0, 0, 4, 5),), n_psi=8, seeding="cell_mean")
+    plain = Template(synthetic_result(n_orientations=6), device="cpu")
+    with pytest.raises(ValueError, match="HEALPix pixel centers"):
+        Searcher(plain, [_stage(Seeding())])
+    stage = _stage({"level": 1, "rings": 3, "lattice": 2, "top_k": 2})
+    assert stage.is_seeded and not stage.is_local
+    assert stage.seeding == Seeding(level=1, rings=3, lattice=2, top_k=2)
+    assert stage.seed_n_psi == 8
+    seed = stage.seed_stage()
+    assert seed.seeding is None and seed.decision is None and seed.n_psi == 8
+    assert _stage(Seeding(n_psi=16)).seed_stage().n_psi == 16
+    assert stage_from_json(stage_to_json(stage)).seeding == stage.seeding
+    assert stage_from_json(stage_to_json(_stage())).seeding is None
+    with pytest.raises(ValueError, match="only a seeded stage"):
+        _stage().seed_stage()
+    # a seeded stage is planned with its resources, and only then
+    template = _healpix_template(synthetic_result)
+    searcher = Searcher(
+        template, [_stage()], featurization=StubFeaturizer(), n_defocus=2
+    )
+    geometry = SearchGeometry.from_images(_images(), template.template_shape)
+    pixels = PixelSelection.all(geometry)
+    with pytest.raises(ValueError, match="seed resources"):
+        plan_stage(
+            0,
+            _stage(Seeding()),
+            pixels,
+            geometry,
+            space=searcher.space,
+            device=searcher.device_info,
+        )
+
+
+def test_manager_spec_builds_a_seeded_stage():
+    from panther_em.managers.search import StageSpec
+
+    spec = StageSpec(
+        rectangles=[(0, 0, 4, 5)],
+        n_psi=8,
+        seeding={"level": 1, "rings": 2, "lattice": 2, "top_k": 3, "n_psi": 8},
+    )
+    assert spec.seeding is not None
+    stage = Stage.create(
+        spec.rectangles, n_psi=spec.n_psi, seeding=spec.seeding.model_dump()
+    )
+    assert stage.seeding == Seeding(level=1, rings=2, lattice=2, top_k=3, n_psi=8)
+    with pytest.raises(ValueError):
+        StageSpec(rectangles=[(0, 0, 4, 5)], seeding={"top_k": 0})
+
+
+@requires_cuda
+@pytest.mark.parametrize("budget", [None, 0])
+def test_seeded_fp16_stage_on_cuda_matches_the_cpu_result(synthetic_result, budget):
+    """fp16 store on CUDA (lean path within budget, reference path at budget 0)."""
+    cpu = _healpix_template(synthetic_result)
+    gpu = Template(synthetic_result(s2_nside=2, n_filters=2), device="cuda")
+    seeding = Seeding(level=1, rings=1, lattice=2, top_k=2)
+    stage32 = Stage.create([(0, 0, 4, 5)], n_psi=128, seeding=seeding)
+    stage16 = Stage.create([(0, 0, 4, 5)], n_psi=128, precision="fp16", seeding=seeding)
+    execution = replace(
+        EXEC_JOINT, tuning=replace(EXEC_JOINT.tuning, local_weights_bytes=budget)
+    )
+    _, _, (ref,) = _run_stages(cpu, [stage32])
+    searcher, _, (got,) = _run_stages(gpu, [stage16], execution)
+    cached = list(searcher.correlator.local_weights_cache.values())
+    assert len(cached) == 1 and ((cached[0] is None) == (budget == 0))
+    # fp16 features and spectrum: close, the same argmax at most pixels
+    torch.testing.assert_close(got.maps.mip.cpu(), ref.maps.mip, rtol=1e-2, atol=1e-2)
+    same = got.best_index.cpu() == ref.best_index
+    assert float(same.float().mean()) >= 0.9
+    torch.testing.assert_close(
+        got.maps.variance.cpu(), ref.maps.variance, rtol=5e-3, atol=0
+    )

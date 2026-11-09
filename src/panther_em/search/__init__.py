@@ -98,6 +98,25 @@ The two search types
    (:func:`~panther_em.orientations.healpix_orientations` generates them); explicit
    orientation ids work for any template.
 
+3. **Self-seeded first stage**: instead of the dense loop over every orientation,
+   the stage runs a cheap seed pass over one template per HEALPix level-1 cell (the
+   cell's psi-aligned mean template), on a lattice of every second row and column
+   of pixels, then the exact search of every pixel over the neighborhoods of its
+   best few bracketing seeds (:mod:`.seeding`; the ``Seeding`` knobs: seed level
+   and rings, template kind, seed ``n_psi``, ``lattice``, ``top_k``)::
+
+       Stage.create(
+           [(0, 0, 40, 40)],
+           precision="fp16",
+           planes=(D // 2,),
+           seeding=Seeding(level=1, rings=2, lattice=2, top_k=3),
+           decision=Decision(7.8, ThresholdTest(tables_40x40, cal), accept=False),
+       )
+
+   The maps decode as the dense stage's; a pixel's maximum equals the dense one
+   wherever a seed's neighborhood holds it and is lower elsewhere (more rejection,
+   never less), and the mean and variance are the whole set's.
+
 The pipeline around a search
 ----------------------------
 The programs of :mod:`panther_em.managers` (and the ``panther-em`` command) run these
@@ -147,6 +166,7 @@ from panther_em.search.images import SearchImages
 from panther_em.search.micrograph import Micrograph
 from panther_em.search.results import SearchResult, StageResult
 from panther_em.search.searcher import Searcher, SearchSession
+from panther_em.search.seeding import Seeding
 from panther_em.search.stage import Stage
 from panther_em.search.template import Template
 from panther_em.search.threshold import (
@@ -170,6 +190,7 @@ __all__ = [
     "SearchResult",
     "SearchSession",
     "Searcher",
+    "Seeding",
     "Stage",
     "StageResult",
     "Template",

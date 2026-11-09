@@ -1,7 +1,8 @@
 """One search stage: what it searches and the decision that ends it.
 
 Feature rectangles, precision, ``n_psi``, orientation sampling, CTF planes, an
-optional local neighborhood, and the decision.
+optional local neighborhood (seeded by the previous stage) or self-seeding
+(:class:`~.seeding.Seeding`), and the decision.
 
 A :class:`Stage` is a frozen value: build it with :meth:`Stage.create` (which
 coerces loose inputs) and read its derived state (``k_stop``, ``num_features``,
@@ -13,7 +14,7 @@ test (the error table is a separate file).
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -27,9 +28,10 @@ from panther_em.search.correlation.layout import (
 )
 from panther_em.search.decision import Decision
 from panther_em.search.hypotheses import template_rows_for
+from panther_em.search.seeding import Seeding
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     import numpy as np
 
@@ -67,6 +69,11 @@ class Stage:
     local_rings : int, optional
         Search each pixel in only the local neighborhood of orientations from the
         previous search stage.
+    seeding : Seeding, optional
+        Seed the stage itself: a seed pass over coarse cell templates names each
+        pixel's cells, the exact local search covers their neighborhoods (see
+        :mod:`.seeding`). Needs a HEALPix template; excludes ``local_rings`` and
+        explicit orientation ids.
     name : str
         Free-form label.
     """
@@ -78,6 +85,7 @@ class Stage:
     planes: tuple[int, ...] | None = None
     decision: Decision | None = None
     local_rings: int | None = None
+    seeding: Seeding | None = None
     name: str = ""
 
     @classmethod
@@ -91,13 +99,17 @@ class Stage:
         planes: Sequence[int] | None = None,
         decision: Decision | None = None,
         local_rings: int | None = None,
+        seeding: Seeding | Mapping[str, object] | None = None,
         name: str = "",
     ) -> Stage:
         """Build a stage from loose inputs.
 
         One rectangle or many, precision by name, planes in any order, orientation
-        ids as any int sequence or tensor.
+        ids as any int sequence or tensor, the seeding as a :class:`Seeding` or its
+        fields in a mapping.
         """
+        if seeding is not None and not isinstance(seeding, Seeding):
+            seeding = Seeding(**{str(k): v for k, v in seeding.items()})  # type: ignore[arg-type]
         rects: tuple[Rectangle, ...]
         if len(rectangles) > 0 and isinstance(rectangles[0], int):
             rects = (as_rectangle(cast("Sequence[int]", rectangles)),)
@@ -115,6 +127,7 @@ class Stage:
             planes=None if planes is None else tuple(sorted({int(p) for p in planes})),
             decision=decision,
             local_rings=None if local_rings is None else int(local_rings),
+            seeding=seeding,
             name=str(name),
         )
 
@@ -174,11 +187,64 @@ class Stage:
                     "a local stage samples orientations on a HEALPix grid: leave "
                     "orientations None or give a level"
                 )
+        if self.seeding is not None:
+            if not isinstance(self.seeding, Seeding):
+                raise ValueError("seeding must be a Seeding; see Stage.create()")
+            if self.local_rings is not None:
+                raise ValueError(
+                    "a stage is either self-seeded (seeding) or local to the previous "
+                    "stage (local_rings), not both"
+                )
+            if isinstance(self.orientations, torch.Tensor):
+                raise ValueError(
+                    "a seeded stage samples orientations on a HEALPix grid: leave "
+                    "orientations None or give a level"
+                )
+            if self.seeding.level <= self.level:
+                raise ValueError(
+                    f"seeding level {self.seeding.level} must exceed the stage's "
+                    f"orientation level {self.level}"
+                )
+            if self.k_stop > self.seed_n_psi // 2 + 1:
+                raise ValueError(
+                    f"k_stop ({self.k_stop}) exceeds the seed pass's n_psi // 2 + 1 "
+                    f"({self.seed_n_psi // 2 + 1}); raise seeding.n_psi to at least "
+                    f"{2 * (self.k_stop - 1)}"
+                )
 
     @property
     def is_local(self) -> bool:
-        """Whether the stage searches per-pixel neighborhoods."""
+        """Whether the stage searches per-pixel neighborhoods of the previous stage."""
         return self.local_rings is not None
+
+    @property
+    def is_seeded(self) -> bool:
+        """Whether the stage seeds itself (see :mod:`.seeding`)."""
+        return self.seeding is not None
+
+    @property
+    def seed_n_psi(self) -> int:
+        """In-plane samples of the seed pass (the stage's unless the seeding says)."""
+        if self.seeding is None or self.seeding.n_psi is None:
+            return self.n_psi
+        return self.seeding.n_psi
+
+    def seed_stage(self) -> Stage:
+        """The seed pass as a stage: this stage's features at the seed ``n_psi``.
+
+        Its hypotheses are the seed templates' (:class:`~.seeding.SeedResources`),
+        not this stage's; it carries no decision.
+        """
+        if self.seeding is None:
+            raise ValueError("only a seeded stage has a seed pass")
+        return replace(
+            self,
+            n_psi=self.seed_n_psi,
+            orientations=None,
+            decision=None,
+            seeding=None,
+            name=f"{self.name}:seed" if self.name else "seed",
+        )
 
     @property
     def level(self) -> int:
@@ -255,6 +321,7 @@ def stage_to_json(stage: Stage) -> dict:
         "planes": None if stage.planes is None else list(stage.planes),
         "decision": decision,
         "local_rings": stage.local_rings,
+        "seeding": None if stage.seeding is None else asdict(stage.seeding),
         "name": stage.name,
     }
 
@@ -283,5 +350,6 @@ def stage_from_json(data: dict) -> Stage:
         planes=data.get("planes"),
         decision=decision,
         local_rings=data.get("local_rings"),
+        seeding=data.get("seeding"),
         name=data.get("name", ""),
     )

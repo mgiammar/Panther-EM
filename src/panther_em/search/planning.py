@@ -8,7 +8,9 @@
   featurization engine, the *bands* (row-contiguous chunks of its pixels whose
   features fit the device) and, per band, the *passes* (one defocus plane at a
   time, or all at once), each with its memory plan. A local stage's plan also
-  carries its neighborhoods and, per band, each pixel's group.
+  carries its neighborhoods and, per band, each pixel's group; a seeded stage's
+  plan its seed pass (:class:`SeedPlan`) and, per band, the lattice of seeded
+  pixels and, per pass, the seed pass's memory plan.
 
 A plan is a value: it can be built and inspected (and tested) without running
 anything; :class:`~panther_em.search.runner.StageRunner` executes it.
@@ -16,7 +18,7 @@ anything; :class:`~panther_em.search.runner.StageRunner` executes it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -32,6 +34,7 @@ from panther_em.search.correlation.reduction import (
 from panther_em.search.featurization import choose_mode
 from panther_em.search.hypotheses import HypothesisSet
 from panther_em.search.images import PixelSelection
+from panther_em.search.seeding import LatticeSelection
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -45,6 +48,7 @@ if TYPE_CHECKING:
     from panther_em.search.featurization import Mode
     from panther_em.search.hypotheses import HypothesisSpace, LocalHypotheses
     from panther_em.search.images import SearchGeometry
+    from panther_em.search.seeding import SeedResources
     from panther_em.search.stage import Stage
 
 LoopKind = Literal["eager", "graph"]
@@ -299,22 +303,48 @@ def plan_memory(
 
 @dataclass(frozen=True, eq=False)
 class PassPlan:
-    """One featurize-and-correlate pass: the planes it holds and its shapes."""
+    """One featurize-and-correlate pass: the planes it holds and its shapes.
+
+    ``seed_memory`` (a seeded stage only) is the seed pass's memory plan over the
+    band's seeded columns; its ``block_pixels`` is the store's when every column is
+    seeded, the column subset's otherwise.
+    """
 
     planes: tuple[int, ...]
     memory: MemoryPlan
+    seed_memory: MemoryPlan | None = None
 
 
 @dataclass(frozen=True, eq=False)
 class BandPlan:
     """One band: a row-contiguous chunk of the stage's pixels and its passes.
 
-    ``cells`` (a local stage only) is each pixel's group, in ``pixels`` order.
+    ``cells`` (a local stage only) is each pixel's group, in ``pixels`` order;
+    ``lattice`` (a seeded stage only) the band's seeded columns and each pixel's
+    candidate seeds.
     """
 
     pixels: PixelSelection
     passes: tuple[PassPlan, ...]
     cells: torch.Tensor | None = None
+    lattice: LatticeSelection | None = None
+
+
+@dataclass(frozen=True, eq=False)
+class SeedPlan:
+    """A seeded stage's seed pass.
+
+    Attributes
+    ----------
+    resources : SeedResources
+        The seed templates, their hypothesis space and the neighborhoods.
+    stage : Stage
+        The seed pass as a stage (:meth:`Stage.seed_stage`): the stage's features
+        at the seed ``n_psi``.
+    """
+
+    resources: SeedResources
+    stage: Stage
 
 
 @dataclass(frozen=True, eq=False)
@@ -336,6 +366,8 @@ class StagePlan:
         searched in its passes; the maps are concatenated in band order.
     local : LocalHypotheses, optional
         A local stage's neighborhoods (``None``: every pixel over ``hyps``).
+    seeding : SeedPlan, optional
+        A seeded stage's seed pass (``None``: not seeded).
     """
 
     index: int
@@ -344,6 +376,7 @@ class StagePlan:
     mode: Mode
     bands: tuple[BandPlan, ...]
     local: LocalHypotheses | None = None
+    seeding: SeedPlan | None = None
 
     @property
     def pixel_index(self) -> torch.Tensor:
@@ -400,6 +433,7 @@ def plan_stage(
     free_bytes: int | None = None,
     local: LocalHypotheses | None = None,
     seeds: torch.Tensor | None = None,
+    seeded: SeedResources | None = None,
 ) -> StagePlan:
     """Plan one stage over ``pixels``.
 
@@ -429,10 +463,14 @@ def plan_stage(
         A local stage's neighborhoods (with ``seeds``).
     seeds : torch.Tensor, optional
         ``(P,)`` seed orientation of each pixel, in ``pixels`` order (local only).
+    seeded : SeedResources, optional
+        A seeded stage's seed templates and neighborhoods.
     """
     execution = execution or ExecutionConfig()
     if (local is None) != (seeds is None) or (local is None) == stage.is_local:
         raise ValueError("a local stage is planned with its neighborhoods and seeds")
+    if (seeded is None) == stage.is_seeded:
+        raise ValueError("a seeded stage is planned with its seed resources")
     cells = None
     if local is not None and seeds is not None:
         if seeds.numel() != len(pixels):
@@ -492,18 +530,62 @@ def plan_stage(
             return memory
         return memory_for(torch.tensor(planes, dtype=torch.long), len(band))
 
+    seed_plan = None
+    if seeded is not None:
+        assert stage.seeding is not None
+        seed_plan = SeedPlan(seeded, stage.seed_stage())
+
+    def seed_memory(
+        planes: tuple[int, ...], band: PixelSelection, lattice: LatticeSelection
+    ) -> MemoryPlan:
+        """The seed pass over the band's seeded columns.
+
+        It shares the store's blocks when every column is seeded.
+        """
+        assert seed_plan is not None
+        plane_ids = torch.tensor(planes, dtype=torch.long)
+
+        def plan_seed(block_pixels: int | None) -> MemoryPlan:
+            return plan_memory(
+                device,
+                seed_plan.stage,
+                n_pixels=lattice.n_seeded,
+                space=seed_plan.resources.space,
+                template_ids=seed_plan.resources.template_ids,
+                defocus_ids=plane_ids,
+                tuning=replace(tuning, block_pixels=block_pixels),
+            )
+
+        main = pass_memory(planes, band)
+        if lattice.n_seeded == len(band):
+            return plan_seed(main.block_pixels)
+        probe = plan_seed(tuning.block_pixels)
+        return plan_seed(min(probe.block_pixels, main.block_pixels))
+
+    def band_plan(i: int, band: PixelSelection) -> BandPlan:
+        lattice = None
+        if stage.seeding is not None:
+            lattice = LatticeSelection.build(geometry, band, stage.seeding.lattice)
+        return BandPlan(
+            band,
+            tuple(
+                PassPlan(
+                    p,
+                    pass_memory(p, band),
+                    None if lattice is None else seed_memory(p, band, lattice),
+                )
+                for p in passes
+            ),
+            None if cells is None else cells[offsets[i] : offsets[i + 1]],
+            lattice,
+        )
+
     return StagePlan(
         index=index,
         stage=stage,
         hyps=memory.hyps,
         mode=mode,
-        bands=tuple(
-            BandPlan(
-                band,
-                tuple(PassPlan(p, pass_memory(p, band)) for p in passes),
-                None if cells is None else cells[offsets[i] : offsets[i + 1]],
-            )
-            for i, band in enumerate(bands)
-        ),
+        bands=tuple(band_plan(i, band) for i, band in enumerate(bands)),
         local=local,
+        seeding=seed_plan,
     )

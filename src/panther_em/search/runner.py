@@ -5,8 +5,9 @@ for every band and every pass of the band it fills a fresh
 :class:`~.featurization.FeatureStore` with the pass's features (the plan's engine),
 correlates the store against the pass's hypotheses
 (:class:`~.correlation.Correlator`; a local stage scores each pixel over its group's
-neighborhood, :meth:`~.correlation.Correlator.run_local`), then merges the passes of a
-band (:func:`~.correlation.merge_stage_maps`) and concatenates the bands
+neighborhood, :meth:`~.correlation.Correlator.run_local`; a seeded stage first runs
+the seed pass over the store's seeded columns, :mod:`~.seeding`), then merges the
+passes of a band (:func:`~.correlation.merge_stage_maps`) and concatenates the bands
 (:func:`~.correlation.concat_stage_maps`). One store is alive at a time: a pass's
 store is dropped before the next one is allocated.
 """
@@ -26,7 +27,8 @@ from panther_em.search.correlation import (
     concat_stage_maps,
     merge_stage_maps,
 )
-from panther_em.search.featurization import FeatureStore
+from panther_em.search.featurization import ColumnSubset, FeatureStore
+from panther_em.search.seeding import seed_work
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -107,6 +109,8 @@ class StageRunner:
         Print a progress bar per stage.
     local_bytes : int, optional
         Working-memory budget of one chunk of a local stage's tiles.
+    local_weights_bytes : int, optional
+        Byte budget of a local pass's prepared fp16 weights (``None`` = unbounded).
 
     Attributes
     ----------
@@ -126,6 +130,7 @@ class StageRunner:
         timeline: Timeline | None = None,
         show_progress: bool = False,
         local_bytes: int = 512 * 1024**2,
+        local_weights_bytes: int | None = 2048 * 1024**2,
     ) -> None:
         self.images = images
         self.geometry = geometry
@@ -135,6 +140,9 @@ class StageRunner:
         self.timeline = timeline or Timeline(device)
         self.show_progress = show_progress
         self.local_bytes = int(local_bytes)
+        self.local_weights_bytes = (
+            None if local_weights_bytes is None else int(local_weights_bytes)
+        )
         self.store: FeatureStore | None = None
 
     def release(self) -> None:
@@ -176,7 +184,11 @@ class StageRunner:
         self.timeline.mark(f"stage{plan.index}:featurized")
         loop_plan = LoopPlan.create(plan.stage, store, step.memory)
         self.timeline.mark(f"stage{plan.index}:planned")
-        if plan.local is None:
+        if plan.seeding is not None:
+            maps = self._run_seeded(plan, band, step, store, loop_plan)
+            if progress is not None:
+                progress(store.n_pixels)
+        elif plan.local is None:
             maps = self.correlator.run(store, loop_plan, progress=progress)
         else:
             assert band.cells is not None
@@ -193,6 +205,43 @@ class StageRunner:
         timing[0] += t1 - t0
         timing[1] += t2 - t1
         return maps
+
+    def _run_seeded(
+        self,
+        plan: StagePlan,
+        band: BandPlan,
+        step: PassPlan,
+        store: FeatureStore,
+        loop_plan: LoopPlan,
+    ) -> StageMaps:
+        """A seeded pass: the seed pass over the band's lattice, then the local pass."""
+        assert plan.seeding is not None
+        assert band.lattice is not None and step.seed_memory is not None
+        resources, lattice = plan.seeding.resources, band.lattice
+        seed_store: FeatureStore | ColumnSubset = store
+        if lattice.n_seeded < store.n_pixels:
+            seed_store = ColumnSubset(
+                store, lattice.columns, step.seed_memory.block_pixels
+            )
+        seed_plan = LoopPlan.create(plan.seeding.stage, seed_store, step.seed_memory)
+        seed_maps = self.correlator.run(
+            seed_store, seed_plan, weights=resources.weights
+        )
+        self.timeline.mark(f"stage{plan.index}:seeded")
+        work = seed_work(resources, lattice, seed_plan.hyps, seed_maps)
+        local_weights = self.correlator.local_weights(
+            loop_plan,
+            resources.local.rows,
+            resources.rows_key,
+            budget=self.local_weights_bytes,
+        )
+        return self.correlator.run_local(
+            store,
+            loop_plan,
+            work,
+            chunk_bytes=self.local_bytes,
+            local_weights=local_weights,
+        )
 
     def _featurize(
         self, plan: StagePlan, pixels: PixelSelection, step: PassPlan

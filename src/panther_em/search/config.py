@@ -49,6 +49,10 @@ class Tuning:
         Where the dense per-pixel state lives; defaults to the compute device.
     local_bytes : int
         Working-memory budget of one chunk of a local stage's tiles (512 MiB).
+    local_weights_bytes : int, optional
+        Byte budget of a local pass's prepared fp16 weights (2 GiB; ``None`` =
+        unbounded): within it an fp16 pass on a device with the fused kernels takes
+        the lean path, over it the reference path.
     """
 
     batch: BatchShape | None = None
@@ -63,6 +67,7 @@ class Tuning:
     prepared_budget: int | None = None
     ledger_device: torch.device | str | None = None
     local_bytes: int = 512 * MIB
+    local_weights_bytes: int | None = 2048 * MIB
 
 
 @dataclass(frozen=True)
