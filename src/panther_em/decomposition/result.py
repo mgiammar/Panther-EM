@@ -118,9 +118,9 @@ class DecompositionBase(ABC):
 
         Note
         ----
-        Optional tuple elements force callers to assert they are not ``None``.
-        Separate ``get_u``, ``get_s`` and ``get_vh`` methods would be more
-        interpretable and are planned for a follow-up refactor.
+        Optional tuple elements force callers to assert they are not ``None``;
+        separate ``get_u``, ``get_s`` and ``get_vh`` methods are tracked in
+        mgiammar/Panther-EM#9.
         """
 
     @abstractmethod
