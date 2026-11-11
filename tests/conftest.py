@@ -8,6 +8,7 @@ import torch
 
 from panther_em.coordinates.offset_polar import OffsetPolarTransform
 from panther_em.decomposition.result import DecompositionResult
+from panther_em.orientations import healpix_orientations
 
 
 def make_synthetic_result(
@@ -45,8 +46,6 @@ def make_synthetic_result(
     )
     angles: dict = {}
     if s2_nside is not None:
-        from panther_em.orientations import healpix_orientations
-
         phi, theta = healpix_orientations(s2_nside)
         angles = {"phi_values": phi, "theta_values": theta}
     elif with_angles:

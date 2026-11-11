@@ -36,10 +36,8 @@ import cmath
 import math
 import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    import numpy as np
+import numpy as np
 
 # --------------------------------------------------------------------------- #
 # Transform plan: mixed-radix decimation-in-time
@@ -395,8 +393,6 @@ def emit_header(
 
 
 def _check_plans(sizes: tuple[int, ...]) -> None:
-    import numpy as np
-
     rng = np.random.default_rng(0)
     for n in sizes:
         plan = make_plan(n)
@@ -417,8 +413,6 @@ def _check_plans(sizes: tuple[int, ...]) -> None:
 
 def lean_corr_reference(c: np.ndarray, n_psi: int) -> np.ndarray:
     """Numpy model of the kernel's maths (fold, residue twiddle, Hermitian pack)."""
-    import numpy as np
-
     f = len(c)
     r_count = n_psi // 64
     t_threads = r_count // 2
@@ -452,8 +446,6 @@ def lean_corr_reference(c: np.ndarray, n_psi: int) -> np.ndarray:
 
 
 def _check_lean_math() -> None:
-    import numpy as np
-
     rng = np.random.default_rng(1)
     cases = (
         (128, (16, 37, 64, 65)),

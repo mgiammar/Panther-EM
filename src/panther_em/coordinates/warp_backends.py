@@ -21,6 +21,7 @@ from torch.utils.dlpack import from_dlpack
 CUDA_AVAILABLE = torch.cuda.is_available()
 
 # Optional imports for GPU support
+# PEP 810: make this a `lazy import` once requires-python >= 3.15.
 try:
     import cupy as cp
     from cucim.skimage.transform import warp as cucim_warp

@@ -22,6 +22,10 @@ from typing import Any, Literal, overload
 
 import torch
 
+# PEP 810: make this a `lazy import` once requires-python >= 3.15: only the
+# JIT build of the fused kernel needs it.
+from torch.utils.cpp_extension import load
+
 from panther_em.search.correlation.kernels.packed import (
     decode_argmax_packed,
 )
@@ -51,8 +55,6 @@ def _try_compile() -> Any:
         return None
 
     try:
-        from torch.utils.cpp_extension import load
-
         major, minor = torch.cuda.get_device_capability()
         gencode = ["-gencode", f"arch=compute_{major}{minor},code=sm_{major}{minor}"]
 

@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+from scipy.ndimage import spline_filter1d
 
 from panther_em._precision import check_precision
 
@@ -255,7 +256,6 @@ class WarpAdjoint:
         x = x.to(torch.float64)
         if self.order <= 1:
             return x
-        from scipy.ndimage import spline_filter1d
 
         padded = torch.nn.functional.pad(x, (self.npad, self.npad)).numpy()
         out = spline_filter1d(padded, order=self.order, axis=-1, mode="grid-constant")

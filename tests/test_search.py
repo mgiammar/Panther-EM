@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import warnings
 import weakref
 from dataclasses import replace
@@ -708,9 +709,6 @@ def test_stage_planes_are_featurized_only_where_needed(template):
 
 def test_session_store_is_released_after_the_session(template):
     """The searcher's cached loops must not retain a finished session's blocks."""
-    import gc
-    import weakref
-
     searcher = Searcher(
         template,
         [Stage.create([(0, 0, 4, 5)], n_psi=16)],

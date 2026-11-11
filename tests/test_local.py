@@ -10,6 +10,7 @@ import pytest
 import torch
 from conftest import read_group, requires_cuda
 from test_search import EXEC, EXEC_JOINT, StubFeaturizer
+from torch_so3.hierarchical_s2_grid import HierarchicalS2Grid
 
 from panther_em.search.config import Tuning
 from panther_em.search.correlation import (
@@ -50,8 +51,6 @@ pytestmark = pytest.mark.filterwarnings(
 
 def _ring_reference(nside: int, pixels, rings: int) -> set[int]:
     """Pixels within ``rings`` hops of ``pixels`` (torch_so3's breadth-first search)."""
-    from torch_so3.hierarchical_s2_grid import HierarchicalS2Grid
-
     grid = HierarchicalS2Grid(nside, 1)
     return set(grid.neighbor_indices(np.asarray(pixels), level=0, rings=rings).tolist())
 

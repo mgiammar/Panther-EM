@@ -31,6 +31,9 @@ import json
 from typing import TYPE_CHECKING, Any
 
 import h5py
+
+# PEP 810: make the leopard_em imports `lazy import`s once requires-python >= 3.15
+# (~0.4 s, paid by every program though only export and search write for Leopard-EM).
 import leopard_em
 import torch
 from leopard_em.analysis.match_template_peaks import (

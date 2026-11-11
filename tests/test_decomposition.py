@@ -11,12 +11,15 @@ Covers:
 
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 import torch
+from scipy.ndimage import gaussian_filter
 
 from panther_em.coordinates.offset_polar import OffsetPolarTransform
 from panther_em.coordinates.warp_config import WarpConfig
+from panther_em.decomposition import PolarProjectionDecomposer
 from panther_em.decomposition.projections import (
     _compute_freq_crop,
     apply_fourier_filters,
@@ -283,8 +286,6 @@ class TestPipelineBlockOrder:
     """The pipeline crops the angular blocks around DC and records their energies."""
 
     def _case(self, filters):
-        from scipy.ndimage import gaussian_filter
-
         rng = np.random.default_rng(0)
         volume = torch.from_numpy(
             gaussian_filter(rng.standard_normal((16,) * 3), 1.5).astype(np.float32)
@@ -674,8 +675,6 @@ class TestDecompositionResultIO:
         """Files saved before the multi-volume axis existed lack the
         ``num_volumes`` attr and store a 4D ``U`` array; loading must default
         to ``num_volumes=1`` and reinsert the leading axis."""
-        import h5py
-
         result = _make_result(is_complex=False, num_volumes=1)
         path = tmp_path / "legacy_result.h5"
         result.save(path)
@@ -723,8 +722,6 @@ class TestDecompositionResultIO:
         assert DecompositionBase.load(tmp_path / "sparse.h5").warp_config == warp
 
     def test_legacy_file_without_warp_config_loads_the_default(self, tmp_path: Path):
-        import h5py
-
         result = _make_result(is_complex=False)
         result.warp_config = WarpConfig(order=1)
         path = tmp_path / "no_warp.h5"
@@ -864,8 +861,6 @@ class TestDenseAndSparseAreSiblings:
 
 
 def test_decomposer_warps_with_and_records_its_warp_config():
-    from panther_em.decomposition import PolarProjectionDecomposer
-
     rng = np.random.default_rng(0)
     volume = rng.standard_normal((16, 16, 16)).astype(np.float32)
     phi = np.array([0.0, 40.0, 80.0], dtype=np.float32)
@@ -890,8 +885,6 @@ def test_decomposer_warps_with_and_records_its_warp_config():
 @pytest.mark.parametrize("svd_method", ["dense", "low_rank"])
 def test_decomposer_eig_max_is_bounded_by_the_block_rank(svd_method):
     """Fewer rows than radii: eig_max defaults to, and may not exceed, the rows."""
-    from panther_em.decomposition import PolarProjectionDecomposer
-
     rng = np.random.default_rng(0)
     volume = rng.standard_normal((16, 16, 16)).astype(np.float32)
     phi = np.array([0.0, 40.0, 80.0], dtype=np.float32)

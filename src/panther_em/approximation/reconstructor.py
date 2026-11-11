@@ -31,6 +31,15 @@ import torch
 
 from panther_em.approximation.adjoint import WarpAdjoint, build_bases
 
+# Optional GPU backend (the cuda12 / cuda13 extras) of the separable warp.
+# PEP 810: make this a `lazy import` once requires-python >= 3.15.
+try:
+    import cupy
+    import cupyx.scipy.ndimage as ndi
+except ImportError:
+    cupy = None
+    ndi = None
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
@@ -305,10 +314,7 @@ class Reconstructor:
         tf = self.transform
         if self.device.type != "cuda" or self.warp.mode != "constant":
             return None
-        try:
-            import cupy
-            import cupyx.scipy.ndimage as ndi
-        except ImportError:
+        if cupy is None or ndi is None:
             return None
         dc = tf.device_coords(self.device)
         jac = dc["jacobian"]

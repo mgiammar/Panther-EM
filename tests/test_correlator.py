@@ -11,6 +11,8 @@ from panther_em.search.correlation import (
     Correlator,
     FeatureLayout,
     LoopPlan,
+    StageMaps,
+    merge_stage_maps,
 )
 from panther_em.search.correlation.contraction import BatchShape
 from panther_em.search.featurization import FeatureChunk, FeatureStore
@@ -318,8 +320,6 @@ def test_cuda_fused_eager_and_graph_match_reference(synthetic_result, precision)
 
 
 def test_merge_stage_maps_matches_the_joint_statistics():
-    from panther_em.search.correlation import StageMaps, merge_stage_maps
-
     gen = torch.Generator().manual_seed(3)
     n_planes, n_sel, n_psi, n_px = 3, 5, 4, 7
     corr = torch.randn(

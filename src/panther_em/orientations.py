@@ -18,6 +18,9 @@ import healpy as hp
 import numpy as np
 import torch
 
+# PEP 810: make this a `lazy import` once requires-python >= 3.15 (~0.4 s import).
+from torch_so3.hierarchical_s2_grid import HierarchicalS2Grid
+
 __all__ = [
     "healpix_ipix",
     "healpix_level_ids",
@@ -38,8 +41,6 @@ def healpix_orientations(nside: int) -> tuple[np.ndarray, np.ndarray]:
     Float32, in the argument order of ``PolarProjectionDecomposer``; orientation
     index == NESTED pixel id, which is what :func:`healpix_level_ids` relies on.
     """
-    from torch_so3.hierarchical_s2_grid import HierarchicalS2Grid
-
     theta, phi = HierarchicalS2Grid(nside, 1).get_level_orientations(0)
     return phi.astype(np.float32), theta.astype(np.float32)
 
@@ -78,8 +79,6 @@ def healpix_ipix(
     max_nside : int
         Largest ``nside`` tried (powers of two from 1).
     """
-    from torch_so3.hierarchical_s2_grid import HierarchicalS2Grid
-
     phi = _as_float64(phi_deg)
     theta = _as_float64(theta_deg)
     if phi.shape != theta.shape:

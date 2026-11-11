@@ -316,15 +316,13 @@ def test_encode_argmax_packed_orders_like_the_values():
 
 
 def test_build_failure_warns_once(monkeypatch):
-    import torch.utils.cpp_extension
-
     monkeypatch.setattr(fused_kernel_loader, "_warned_compile_failure", False)
     fused_kernel_loader._try_compile.cache_clear()
 
     def boom(*args, **kwargs):
         raise RuntimeError("simulated build failure")
 
-    monkeypatch.setattr(torch.utils.cpp_extension, "load", boom)
+    monkeypatch.setattr(fused_kernel_loader, "load", boom)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 9))
     with pytest.warns(UserWarning, match="kernel unavailable"):
