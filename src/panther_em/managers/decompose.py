@@ -29,16 +29,16 @@ class PolarGrid(Model):
 
     Parameters
     ----------
-    kind : {"offset", "spiral"}
-        :class:`~panther_em.coordinates.OffsetPolarTransform` or
-        :class:`~panther_em.coordinates.SpiralPolarTransform`.
+    kind : {"spiral", "offset"}
+        :class:`~panther_em.coordinates.SpiralPolarTransform` (default) or
+        :class:`~panther_em.coordinates.OffsetPolarTransform`.
     num_angle, num_radius : int
         Grid size; ``num_radius`` defaults to the transform's own choice.
     options : dict
         Further keywords of the transform's ``from_image`` (e.g. a spiral's ``c``).
     """
 
-    kind: Literal["offset", "spiral"] = "offset"
+    kind: Literal["offset", "spiral"] = "spiral"
     num_angle: int = Field(ge=2)
     num_radius: int | None = Field(default=None, ge=1)
     options: dict[str, Any] = Field(default_factory=dict)

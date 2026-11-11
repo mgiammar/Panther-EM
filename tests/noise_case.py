@@ -16,7 +16,7 @@ from scipy.ndimage import gaussian_filter
 from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
 from panther_em.approximation import compute_error_tables
-from panther_em.coordinates import OffsetPolarTransform
+from panther_em.coordinates import SpiralPolarTransform
 from panther_em.decomposition import PolarProjectionDecomposer
 from panther_em.filters import WhiteningFilter
 from panther_em.search.micrograph import Micrograph
@@ -52,7 +52,7 @@ def decompose(filters):
     volume = gaussian_filter(rng.standard_normal((BOX,) * 3), 2.0).astype(np.float32)
     phi = np.linspace(0.0, 300.0, 6, dtype=np.float32)
     theta = np.linspace(10.0, 80.0, 6, dtype=np.float32)
-    transform = OffsetPolarTransform.from_image(
+    transform = SpiralPolarTransform.from_image(
         image_shape=(BOX, BOX), num_angle=32, num_radius=12
     )
     result = PolarProjectionDecomposer(

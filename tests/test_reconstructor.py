@@ -176,8 +176,11 @@ def test_kernels_need_real_projections(synthetic_result):
 @requires_cuda
 def test_separable_build_matches_generic_on_a_side_stream(synthetic_result):
     """The CuPy fast path must agree with the generic warp, also when torch runs on a
-    non-default stream (its DLPack views and CuPy work are stream-ordered)."""
-    result = synthetic_result()
+    non-default stream (its DLPack views and CuPy work are stream-ordered).
+
+    Offset grid: the spiral's radial continuation through the origin mixes angle and
+    radius, so the separable fast path declines it."""
+    result = synthetic_result(transform_kind="offset")
     fast = Reconstructor(result, device="cuda")
     slow = Reconstructor(result, device="cuda")
     slow.__dict__["_separable"] = None  # force the generic path

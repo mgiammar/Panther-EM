@@ -17,7 +17,7 @@ import pytest
 import torch
 from scipy.ndimage import gaussian_filter
 
-from panther_em.coordinates.offset_polar import OffsetPolarTransform
+from panther_em.coordinates.spiral_polar import SpiralPolarTransform
 from panther_em.coordinates.warp_config import WarpConfig
 from panther_em.decomposition import PolarProjectionDecomposer
 from panther_em.decomposition.projections import (
@@ -67,7 +67,7 @@ def _make_result(is_complex: bool, num_volumes: int = NUM_VOL) -> DecompositionR
         rng.standard_normal((num_freq_blocks, EIG_MAX, NUM_R)).astype(np.float32)
         + 1j * rng.standard_normal((num_freq_blocks, EIG_MAX, NUM_R)).astype(np.float32)
     ).astype(np.complex64)
-    transform = OffsetPolarTransform.from_image(
+    transform = SpiralPolarTransform.from_image(
         image_shape=(64, 64),
         num_angle=NUM_ANG,
         num_radius=NUM_R,
@@ -290,7 +290,7 @@ class TestPipelineBlockOrder:
         volume = torch.from_numpy(
             gaussian_filter(rng.standard_normal((16,) * 3), 1.5).astype(np.float32)
         )
-        transform = OffsetPolarTransform.from_image(
+        transform = SpiralPolarTransform.from_image(
             image_shape=(16, 16), num_angle=16, num_radius=6
         )
         phi = torch.tensor([0.0, 40.0, 90.0, 150.0])
@@ -865,7 +865,7 @@ def test_decomposer_warps_with_and_records_its_warp_config():
     volume = rng.standard_normal((16, 16, 16)).astype(np.float32)
     phi = np.array([0.0, 40.0, 80.0], dtype=np.float32)
     theta = np.array([10.0, 30.0, 50.0], dtype=np.float32)
-    transform = OffsetPolarTransform.from_image(
+    transform = SpiralPolarTransform.from_image(
         image_shape=(16, 16), num_angle=16, num_radius=6
     )
 
@@ -889,7 +889,7 @@ def test_decomposer_eig_max_is_bounded_by_the_block_rank(svd_method):
     volume = rng.standard_normal((16, 16, 16)).astype(np.float32)
     phi = np.array([0.0, 40.0, 80.0], dtype=np.float32)
     theta = np.array([10.0, 30.0, 50.0], dtype=np.float32)
-    transform = OffsetPolarTransform.from_image(
+    transform = SpiralPolarTransform.from_image(
         image_shape=(16, 16), num_angle=16, num_radius=6
     )
     decomposer = PolarProjectionDecomposer(

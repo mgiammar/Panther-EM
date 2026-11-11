@@ -17,7 +17,7 @@ from panther_em.approximation.errors import (
     compute_error_tables,
     compute_errors,
 )
-from panther_em.coordinates import OffsetPolarTransform, WarpConfig
+from panther_em.coordinates import SpiralPolarTransform, WarpConfig
 from panther_em.decomposition import PolarProjectionDecomposer
 
 pytestmark = pytest.mark.filterwarnings(
@@ -167,7 +167,7 @@ def test_image_bins_are_shared_and_reused(whitening, decomposition, monkeypatch)
 def _decompose(filters=None, *, normalize=True, n_or=6):
     rng = np.random.default_rng(0)
     volume = gaussian_filter(rng.standard_normal((BOX,) * 3), 2.0).astype(np.float32)
-    transform = OffsetPolarTransform.from_image(
+    transform = SpiralPolarTransform.from_image(
         image_shape=(BOX, BOX), num_angle=32, num_radius=12
     )
     result = PolarProjectionDecomposer(

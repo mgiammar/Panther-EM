@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from panther_em.coordinates.offset_polar import OffsetPolarTransform
+from panther_em.coordinates import OffsetPolarTransform, SpiralPolarTransform
 from panther_em.decomposition.result import DecompositionResult
 from panther_em.orientations import healpix_orientations
 
@@ -23,11 +23,13 @@ def make_synthetic_result(
     seed: int = 0,
     with_angles: bool = True,
     s2_nside: int | None = None,
+    transform_kind: str = "spiral",
 ) -> DecompositionResult:
     """Random real-valued decomposition on a ``box x box`` template grid.
 
     ``s2_nside`` samples the orientations on that HEALPix grid (NESTED order, sets
     ``n_orientations = 12 * nside**2``); only the Euler angles are recorded.
+    ``transform_kind`` is ``"spiral"`` (the package default) or ``"offset"``.
     """
     rng = np.random.default_rng(seed)
     if s2_nside is not None:
@@ -41,7 +43,10 @@ def make_synthetic_result(
         rng.standard_normal((k_max, eig_max, n_radial))
         + 1j * rng.standard_normal((k_max, eig_max, n_radial))
     ).astype(np.complex64)
-    transform = OffsetPolarTransform.from_image(
+    cls = {"spiral": SpiralPolarTransform, "offset": OffsetPolarTransform}[
+        transform_kind
+    ]
+    transform = cls.from_image(
         image_shape=(box, box), num_angle=n_angular, num_radius=n_radial
     )
     angles: dict = {}

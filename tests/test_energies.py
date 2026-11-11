@@ -16,7 +16,7 @@ from panther_em.approximation import (
     truncation_error,
 )
 from panther_em.approximation.energies import parseval_weights
-from panther_em.coordinates import OffsetPolarTransform
+from panther_em.coordinates import SpiralPolarTransform
 from panther_em.decomposition import (
     DecompositionBase,
     DecompositionResult,
@@ -37,7 +37,7 @@ def fine():
     volume = gaussian_filter(rng.standard_normal((BOX,) * 3), 2.0).astype(np.float32)
     phi = np.linspace(0.0, 300.0, 64, dtype=np.float32)
     theta = np.linspace(10.0, 80.0, 64, dtype=np.float32)
-    transform = OffsetPolarTransform.from_image(
+    transform = SpiralPolarTransform.from_image(
         image_shape=(BOX, BOX), num_angle=128, num_radius=32
     )
     result = PolarProjectionDecomposer(
