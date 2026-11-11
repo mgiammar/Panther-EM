@@ -7,6 +7,7 @@ in process; the tests reuse its files and configs.
 from __future__ import annotations
 
 import importlib.util
+import json
 import shutil
 from pathlib import Path
 
@@ -189,6 +190,14 @@ def test_search_resumes(pipeline, tmp_path, monkeypatch):
     done = search.run(config)
     assert searched == ["m1"]
     assert sorted(done) == ["m0", "m1", "m2"]
+    # the summary breaks the micrograph's time down by pipeline step
+    record = json.loads((tmp_path / "search_summary.json").read_text())["m1"]
+    steps = ("prepare_s", "search_s", "save_result_s", "leopard_maps_s")
+    assert all(record[k] >= 0.0 for k in steps)
+    assert record["elapsed_s"] == pytest.approx(sum(record[k] for k in steps))
+    for stage in record["stages"]:
+        parts = stage["featurize_s"] + stage["execute_s"] + stage["other_s"]
+        assert parts == pytest.approx(stage["elapsed_s"])
     original = h5py.File(out / "m1_result.h5", "r")
     again = h5py.File(tmp_path / "m1_result.h5", "r")
     with original, again:

@@ -335,9 +335,17 @@ def _label_counts(labels: torch.Tensor) -> dict[str, int]:
     return {lab.name: int((labels == int(lab)).sum()) for lab in PixelLabel}
 
 
-def _summary(result: SearchResult, elapsed_s: float) -> dict:
+def _summary(result: SearchResult, timing: dict[str, float]) -> dict:
+    """Labels and wall-clock seconds of one micrograph.
+
+    ``timing`` holds the manager's steps (``prepare_s``: load, CTF and whitening, or
+    the micrograph cache; ``search_s``; ``save_result_s``; ``leopard_maps_s``); each
+    stage adds its own ``featurize_s``, ``execute_s`` (correlation) and ``other_s``
+    (planning, seeding, ledger write and decision).
+    """
     return {
-        "elapsed_s": elapsed_s,
+        "elapsed_s": sum(timing.values()),
+        **timing,
         "thresholds": [
             None if s.decision is None else float(s.decision.threshold)
             for s in result.stages
@@ -346,6 +354,10 @@ def _summary(result: SearchResult, elapsed_s: float) -> dict:
             {
                 "name": s.stage.name,
                 "n_pixels": int(s.n_pixels),
+                "elapsed_s": s.elapsed_s,
+                "featurize_s": s.featurize_s,
+                "execute_s": s.execute_s,
+                "other_s": max(s.elapsed_s - s.featurize_s - s.execute_s, 0.0),
                 **_label_counts(s.labels_after),
             }
             for s in result.stage_results
@@ -369,17 +381,29 @@ def run(config: SearchConfig) -> dict[str, Path]:
                 done[name] = path
                 continue
             state = state or _Run(config)
+            timing: dict[str, float] = {}
             t0 = time.perf_counter()
             micrograph = state.micrograph(entry)
             shape = (int(micrograph.image.shape[-2]), int(micrograph.image.shape[-1]))
+            t1 = time.perf_counter()
             result = state.searcher(shape).run(micrograph)
+            timing["prepare_s"] = t1 - t0
+            timing["search_s"] = time.perf_counter() - t1
 
-            def save(file: Path, result: SearchResult = result) -> None:
+            def save(
+                file: Path,
+                result: SearchResult = result,
+                timing: dict[str, float] = timing,
+            ) -> None:
+                t0 = time.perf_counter()
                 result.save(file)
+                t1 = time.perf_counter()
                 leopard.write_match_template_maps(file, result)
+                timing["save_result_s"] = t1 - t0
+                timing["leopard_maps_s"] = time.perf_counter() - t1
 
             done[name] = save_output(save, path, config, micrograph=name)
-            summary[name] = _summary(result, time.perf_counter() - t0)
+            summary[name] = _summary(result, timing)
             summary_path.write_text(json.dumps(summary, indent=1))
             del micrograph, result
     finally:
