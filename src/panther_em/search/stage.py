@@ -42,7 +42,7 @@ class Stage:
     """One stage of the search: which features, over which hypotheses, decided how.
 
     Build with :meth:`create`, which accepts loose inputs; the constructor only
-    validates already-normalised fields.
+    validates already-normalized fields.
 
     Parameters
     ----------
@@ -119,7 +119,7 @@ class Stage:
         )
 
     def __post_init__(self) -> None:
-        """Validate (never coerce); :meth:`create` normalises loose inputs."""
+        """Validate (never coerce); :meth:`create` normalizes loose inputs."""
         rects = self.rectangles
         if not isinstance(rects, tuple) or not rects:
             raise ValueError(
@@ -227,7 +227,7 @@ class Stage:
 
 
 def stage_to_json(stage: Stage) -> dict:
-    """JSON-serialisable description of a stage (for result files)."""
+    """JSON-serializable description of a stage (for result files)."""
     orientations: object
     if stage.orientations is None or isinstance(stage.orientations, int):
         orientations = stage.orientations

@@ -172,10 +172,11 @@ def apply_fourier_filters(
     )
 
     # Pathing for complex vs real valued resultant projections
+    filtered: torch.Tensor
     if _is_complex:
         projections_fft = torch.fft.fft2(projections)
         projections_fft = projections_fft[None, ...] * fourier_filters[:, None, :, :]
-        filtered: torch.Tensor = torch.fft.ifft2(projections_fft)
+        filtered = torch.fft.ifft2(projections_fft)
     else:
         projections_fft = torch.fft.rfft2(projections)
         projections_fft = projections_fft[None, ...] * fourier_filters[:, None, :, :]
@@ -464,7 +465,7 @@ def do_pipelined_projection_and_transforms(
     fourier_filters : torch.Tensor | None
         `(f, h, w // 2 + 1)` Fourier-space filters, or None for identity.
     transformer : CoordinateTransform
-        Pre-initialised coordinate transform on the same device as ``volume``.
+        Pre-initialized coordinate transform on the same device as ``volume``.
         Provides the polar-space geometry (``polar_shape``) and the
         ``to_transform_space`` warp method.
     warp : WarpConfig
@@ -482,7 +483,7 @@ def do_pipelined_projection_and_transforms(
         Whether to show a tqdm progress bar. Default is True.
     k_max : int | None
         Maximum angular frequency index to store. Only the ``k_max`` lowest-index
-        blocks (real-valued projections) or the ``2 * k_max`` blocks centred on DC
+        blocks (real-valued projections) or the ``2 * k_max`` blocks centered on DC
         (complex-valued) are written to the output buffer. None stores all blocks.
         Default is None.
     storage_backend : {"on_device", "cpu", "mmap"}

@@ -1,12 +1,4 @@
-"""The fused kernel's packed ``(value, index)`` maximum and its decoding.
-
-The register-resident kernel keeps each pixel's running best as one int64:
-the float value made order-preserving in the high 32 bits (so an unsigned
-``atomicMax`` finds the maximum) and the flat ``(hypothesis, psi)`` index in the low
-32 bits (mirroring ``float_to_sortable_u32`` / ``pack_val_idx`` in
-``fused_irfft_and_stats_kernel.cuh``). Both the statistics and the kernel loader
-decode it, so it lives here.
-"""
+"""The fused kernel's packed ``(value, index)`` int64 maximum and its decoding."""
 
 from __future__ import annotations
 

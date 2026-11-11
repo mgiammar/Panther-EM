@@ -1,10 +1,10 @@
-r"""Symmetry-exploiting SVD-2DTM search including in-plane rotations.
+"""Symmetry-exploiting SVD-2DTM search including in-plane rotations.
 
 The search reconstructs, for every image pixel, the cross-correlation with every
 template hypothesis (defocus plane x Fourier filter x orientation x in-plane angle)
 from a low-rank decomposition of the polar-coordinate projections, and reduces it to
 per-pixel statistics (maximum, its hypothesis, mean, variance, z-score) without ever
-materialising the full correlogram.
+materializing the full correlogram.
 
 Objects, by lifetime
 --------------------
@@ -19,12 +19,12 @@ Objects, by lifetime
 * **Per template and feature selection** (:mod:`panther_em.approximation`):
   :class:`~panther_em.approximation.PerSpatialFrequencyErrorTable`, the ring
   profiles of the reconstruction, residual and signal of every template row, which the
-  coloured-noise :class:`~.threshold.ThresholdTest` reads.
+  colored-noise :class:`~.threshold.ThresholdTest` reads.
 * **Per search** (:mod:`.stage`, :mod:`.decision`, :mod:`.searcher`): a list of
   :class:`Stage` s (feature rectangles, precision, ``n_psi``, orientation sampling or
   a local neighborhood, CTF planes) each ending in a :class:`Decision` (threshold,
   optional threshold test, whether it accepts, absorb radius). :class:`Searcher`
-  binds a template to its stages and owns the resources that amortise across image
+  binds a template to its stages and owns the resources that amortize across image
   sets (the featurizations; :class:`~.correlation.Correlator`: prepared weights,
   captured hypothesis loops, the stream). :class:`ExecutionConfig` (:mod:`.config`)
   sets how the stages run: a few everyday choices and a :class:`Tuning` of
@@ -63,13 +63,9 @@ The two search types
 
        Searcher(template, [Stage.create([(0, 0, 128, 64)], decision=Decision(7.8))])
 
-2. **Two stages**: a low-rank stage over a coarser HEALPix orientation level and one
-   CTF plane rejects most pixels under the coloured-noise threshold test and leaves
-   the rest ambiguous; the survivors are re-scored at high rank over every
-   orientation and plane, where the test rejects and the threshold accepts. With
-   ``local_rings=N`` instead, the second stage scores each survivor only over the
-   orientations within ``N`` HEALPix rings of the first stage's best one; its mean
-   and variance still cover every orientation (closed-form moments)::
+2. **Two stages**: a cheap first stage at low rank, possibly over a coarser HEALPix
+   level and fewer CTF planes, rejects the background pixels without wrongly
+   rejecting true particles; the survivors are re-scored by a full second stage::
 
        cal = Calibration(alpha=5e-3, zeta=0.95, eps_rho=0.1, b_factor=40.0)
        Searcher(
@@ -92,11 +88,8 @@ The two search types
            n_defocus=D,
        )
 
-   Each stage featurizes only the planes it uses, so the first stage pays the
-   featurization of one plane. A HEALPix level needs a template whose Euler
-   angles are HEALPix pixel centers
-   (:func:`~panther_em.orientations.healpix_orientations` generates them); explicit
-   orientation ids work for any template.
+   How the stages are built (local second stages, orientation levels, planes) is
+   documented on :class:`Stage`.
 
 The pipeline around a search
 ----------------------------

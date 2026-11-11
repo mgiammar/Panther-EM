@@ -109,38 +109,33 @@ def main() -> int:
     rows = 0
     header = f"{'sm':5s} {'regs':>4s} {'cap':>4s} {'spill(st/ld)':>13s}"
     print(f"{header}  kernel")
-    if True:
-        for mangled, sm, body in ENTRY_RE.findall(log):
-            name = _demangle(mangled)
-            lean = LEAN_RE.search(name)
-            if lean is None and not args.all:
-                continue
-            regs_m = re.search(r"Used (\d+) registers", body)
-            spill_m = re.search(
-                r"(\d+) bytes spill stores, (\d+) bytes spill loads", body
-            )
-            regs = int(regs_m.group(1)) if regs_m else -1
-            spill = (
-                (int(spill_m.group(1)), int(spill_m.group(2))) if spill_m else (0, 0)
-            )
-            cap = ""
-            flag = ""
-            if lean is not None:
-                fmax, r = int(lean.group(1)), int(lean.group(2))
-                cap_n = _register_cap(_min_blocks_per_sm(fmax, r))
-                cap = str(cap_n)
-                if regs > cap_n:
-                    flag = "  OVER CAP"
+    for mangled, sm, body in ENTRY_RE.findall(log):
+        name = _demangle(mangled)
+        lean = LEAN_RE.search(name)
+        if lean is None and not args.all:
+            continue
+        regs_m = re.search(r"Used (\d+) registers", body)
+        spill_m = re.search(r"(\d+) bytes spill stores, (\d+) bytes spill loads", body)
+        regs = int(regs_m.group(1)) if regs_m else -1
+        spill = (int(spill_m.group(1)), int(spill_m.group(2))) if spill_m else (0, 0)
+        cap = ""
+        flag = ""
+        if lean is not None:
+            fmax, r = int(lean.group(1)), int(lean.group(2))
+            cap_n = _register_cap(_min_blocks_per_sm(fmax, r))
+            cap = str(cap_n)
+            if regs > cap_n:
+                flag = "  OVER CAP"
+                failures += 1
+            if any(spill):
+                flag += "  spill"
+                if sum(spill) > SPILL_TOLERANCE:
+                    flag += " OVER TOLERANCE"
                     failures += 1
-                if any(spill):
-                    flag += "  spill"
-                    if sum(spill) > SPILL_TOLERANCE:
-                        flag += " OVER TOLERANCE"
-                        failures += 1
-            rows += 1
-            spill_s = f"{spill[0]:6d}/{spill[1]:<6d}"
-            cells = f"sm_{sm:3s} {regs:4d} {cap:>4s} {spill_s}"
-            print(f"{cells}  {name[:100]}{flag}")
+        rows += 1
+        spill_s = f"{spill[0]:6d}/{spill[1]:<6d}"
+        cells = f"sm_{sm:3s} {regs:4d} {cap:>4s} {spill_s}"
+        print(f"{cells}  {name[:100]}{flag}")
     if rows == 0:
         print(
             "no ptxas output captured: the extensions were already built; rerun with "

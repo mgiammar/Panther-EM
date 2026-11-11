@@ -22,7 +22,7 @@ BOX = (16, 16)
 BAND = (0.35, 0.05)
 
 
-def coloured(shape, seed, scale=1.0):
+def colored(shape, seed, scale=1.0):
     """Gaussian noise under a smooth low-pass envelope (a non-flat spectrum)."""
     x = torch.randn(shape, generator=torch.Generator().manual_seed(seed))
     r = fftfreq_grid(image_shape=shape, rfft=True, fftshift=False, norm=True)
@@ -31,7 +31,7 @@ def coloured(shape, seed, scale=1.0):
 
 
 def micrographs():
-    return [(f"m{i}", coloured(SHAPE, 10 + i, s)) for i, s in enumerate((1, 0.7, 1.4))]
+    return [(f"m{i}", colored(SHAPE, 10 + i, s)) for i, s in enumerate((1, 0.7, 1.4))]
 
 
 @pytest.fixture(scope="module")
@@ -45,7 +45,7 @@ def test_single_micrograph_filter_is_torch_fourier_filters():
     """One micrograph: ``W_avg`` is torch_fourier_filter's whitening filter of it,
     its correction is 1, and the template filter adds the band."""
     # a large mean: whitening_filter keeps the DC term (1 / huge ~ 0), we zero it
-    x = coloured(SHAPE, 3) + 1.0e4
+    x = colored(SHAPE, 3) + 1.0e4
     single = WhiteningFilter.from_images(
         [("x", x)], band_cutoff=BAND[0], band_falloff=BAND[1], max_freq=0.5
     )
@@ -88,14 +88,14 @@ def test_corrections_relate_each_micrograph_to_the_average(whitening):
 
 def test_from_images_needs_named_pairs():
     with pytest.raises(TypeError):
-        WhiteningFilter.from_images([coloured(SHAPE, 0)], band_cutoff=0.3)
+        WhiteningFilter.from_images([colored(SHAPE, 0)], band_cutoff=0.3)
     with pytest.raises(TypeError):  # a (2, W) tensor must not unpack as a pair
         WhiteningFilter.from_images([torch.randn(2, 8)], band_cutoff=0.3)
     with pytest.raises(ValueError):
         WhiteningFilter.from_images([], band_cutoff=0.3)
     with pytest.raises(ValueError):
         WhiteningFilter.from_images(
-            [("a", coloured(SHAPE, 0)), ("a", coloured(SHAPE, 1))], band_cutoff=0.3
+            [("a", colored(SHAPE, 0)), ("a", colored(SHAPE, 1))], band_cutoff=0.3
         )
 
 

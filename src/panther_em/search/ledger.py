@@ -19,12 +19,6 @@ if TYPE_CHECKING:
 class PixelLedger:
     """Dense ``(n_pixels,)`` per-pixel state, written once per stage.
 
-    Statistics are *per stage* (a different rank is a different estimator), so the
-    last stage to search a pixel overwrites its values; ``last_stage`` says which.
-    Hypothesis ids are stored as **global** ids (see :mod:`.hypotheses`). ``score``
-    is the threshold test's distance ``D`` of the last decision that tested the
-    pixel (NaN where none did).
-
     Parameters
     ----------
     geometry : SearchGeometry

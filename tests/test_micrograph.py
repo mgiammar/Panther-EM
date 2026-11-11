@@ -30,7 +30,7 @@ PIXEL_SIZE = 1.5
 FREQ = frequency_axis(calculate_num_freq_bins((2 * BOX, 2 * BOX)))  # the tables' axis
 
 
-def coloured(shape, seed, scale=1.0):
+def colored(shape, seed, scale=1.0):
     """Gaussian noise under a smooth low-pass envelope (a non-flat spectrum)."""
     x = torch.randn(shape, generator=torch.Generator().manual_seed(seed))
     r = fftfreq_grid(image_shape=shape, rfft=True, fftshift=False, norm=True)
@@ -39,7 +39,7 @@ def coloured(shape, seed, scale=1.0):
 
 
 def micrographs():
-    raws = [coloured(SHAPE, 10 + i, s) for i, s in enumerate((1, 0.7, 1.4))]
+    raws = [colored(SHAPE, 10 + i, s) for i, s in enumerate((1, 0.7, 1.4))]
     raws[2][:48, :48] *= 3.0  # one bright quadrant: a non-uniform noise level
     return [(f"m{i}", raw) for i, raw in enumerate(raws)]
 

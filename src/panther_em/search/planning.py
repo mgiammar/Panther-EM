@@ -209,7 +209,7 @@ def plan_memory(
     space : HypothesisSpace
         The searcher's hypothesis space.
     template_ids, defocus_ids : torch.Tensor, optional
-        The pass's hypothesis restriction (``None`` = all), already normalised by
+        The pass's hypothesis restriction (``None`` = all), already normalized by
         ``Stage.hypothesis_ids``.
     tuning : Tuning, optional
         Explicit batch / block sizes, the L2 target, the block budget and whether

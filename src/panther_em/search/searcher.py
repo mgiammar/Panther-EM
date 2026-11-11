@@ -36,7 +36,7 @@ planned by :mod:`.planning`, run by :mod:`.runner` (featurization, then
     result.save("search.h5")
 
 A :class:`Searcher` is bound to one template and one list of stages and owns the
-execution resources that amortise across image sets (one featurization per
+execution resources that amortize across image sets (one featurization per
 rectangle and engine, holding its kernels or adjoint bases; prepared weights and
 captured hypothesis loops on the correlator); it checks every stage's error table
 against the template (warp, box, rows, rectangles, decomposition filter). A

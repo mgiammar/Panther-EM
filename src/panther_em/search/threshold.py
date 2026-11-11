@@ -1,4 +1,4 @@
-"""The threshold test of the coloured-noise model.
+"""The threshold test of the colored-noise model.
 
 A low-rank search sees only the kept part ``m~`` of every template; the exact
 correlation adds the missed part ``delta``. From a pixel's maximum correlation, its
@@ -17,6 +17,9 @@ the prediction lies:
 noise and signal curves weighted by the template's error tables
 (:class:`~panther_em.approximation.PerSpatialFrequencyErrorTable`); the rule itself
 (:meth:`ThresholdTest.distance`) is a function of per-pixel values only.
+
+The statistical model is provisional: it will likely change as validation and
+experiments continue.
 """
 
 from __future__ import annotations

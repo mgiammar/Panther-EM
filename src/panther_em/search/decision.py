@@ -2,7 +2,7 @@
 
 Every stage may end with a :class:`Decision`. With a
 :class:`~.threshold.ThresholdTest` it REJECTS the pixels whose exact correlation,
-predicted from the stage's maps under the coloured-noise model of the micrograph
+predicted from the stage's maps under the colored-noise model of the micrograph
 (:class:`~.micrograph.Micrograph`), cannot reach the threshold; survivors are ACCEPTED
 where the stage's own z-score exceeds the threshold -- when ``accept`` is set, the
 final stage -- and AMBIGUOUS otherwise. Without a test the rule is the plain
@@ -57,7 +57,7 @@ class Decision:
     threshold : float
         z-score detection threshold ``T``.
     test : ThresholdTest, optional
-        Rejects pixels under the coloured-noise model; ``None`` rejects below the
+        Rejects pixels under the colored-noise model; ``None`` rejects below the
         threshold itself.
     accept : bool, optional
         Label survivors with ``zscore > threshold`` ACCEPTED (the final stage);

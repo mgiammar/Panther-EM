@@ -1,4 +1,4 @@
-"""The coloured-noise threshold test end to end on synthetic data, via the programs.
+"""The colored-noise threshold test end to end on synthetic data, via the programs.
 
 A random smooth volume and three synthetic micrographs (one carries a particle) go
 through the five programs of :mod:`panther_em.managers`, as YAML-driven runs would
@@ -117,7 +117,7 @@ def ctf_planes(shape: tuple[int, int]) -> torch.Tensor:
     return build_ctf_planes(shape, [1e4 * d for d in DEFOCUS_UM], pixel_size=PIXEL_SIZE)
 
 
-def coloured_noise(shape: tuple[int, int], scale: float, seed: int) -> torch.Tensor:
+def colored_noise(shape: tuple[int, int], scale: float, seed: int) -> torch.Tensor:
     """Noise whose amplitude falls as ``1 / (1 + 8 f)``, at ``scale`` per pixel."""
     gen = torch.Generator().manual_seed(seed)
     white = torch.randn(shape, generator=gen)
@@ -149,7 +149,7 @@ def raw_micrographs(
     """Step 1: the pre-processed real-space micrographs, one at a time."""
     shape = (MICROGRAPH, MICROGRAPH)
     for i, (name, scale) in enumerate(zip(NAMES, (1.0, 0.7, 1.4), strict=True)):
-        image = coloured_noise(shape, scale, seed=noise_seed + i)
+        image = colored_noise(shape, scale, seed=noise_seed + i)
         if name == PARTICLE["micrograph"]:
             image = image + 4.0 * particle_image(volume, shape)
         yield name, image

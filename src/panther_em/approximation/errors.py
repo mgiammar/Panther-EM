@@ -176,7 +176,7 @@ class PerSpatialFrequencyErrorTable:
         return int(self.support.shape[0]), int(self.support.shape[1])
 
     def summary(self) -> dict:
-        """JSON-serialisable description (for result files)."""
+        """JSON-serializable description (for result files)."""
         return {
             "n_templates": self.n_templates,
             "n_bins": self.n_bins,

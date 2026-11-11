@@ -10,10 +10,6 @@ from typing import Any
 class WarpConfig:
     """Interpolation settings of a polar <-> Cartesian warp.
 
-    One instance names the warp of a decomposition: the decomposer warps projections
-    onto the polar grid with it, and every consumer of the decomposition (kernels,
-    their adjoint, reconstructions, error tables) warps polar images back with it.
-
     Attributes
     ----------
     order : int

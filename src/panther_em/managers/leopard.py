@@ -13,16 +13,16 @@ here.
 * :func:`particle_table` and :func:`write_particle_stack` build the
   ``ParticleStackHDF5`` that Leopard-EM's refinement reads.
 
-Scales: Leopard-EM normalizes its correlations to a unit noise standard deviation;
-Panther-EM's are on the scale of the template's norm (hundreds). ``mip``,
-``correlation_average`` and ``correlation_variance`` (a standard deviation) are
-therefore divided by the micrograph's :func:`correlation_scale`, the median standard
-deviation of its correlations, which puts its background near Leopard-EM's (mean 0,
-standard deviation 1; on xenon_216 the 2DTM run's maps are 0.0054 times ours with
-correlation 0.99). ``scaled_mip`` is Panther-EM's z-score, which no scale changes.
-Leopard-EM's refinement chooses each particle's pose by the maximum of
-``(cc - correlation_average) / correlation_variance``, so these maps must be on its
-scale: unscaled they pull refined positions to the edge of the shift window.
+Scales: Leopard-EM's refinement scores each pose by ``z = (cc - mu) / sigma``, where
+``cc`` is its own freshly computed correlation (unit-variance background) and
+``mu``, ``sigma`` are read from the exported ``correlation_average`` and
+``correlation_variance`` (a standard deviation) maps. Panther-EM's correlations carry
+an extra factor ``c`` (the template norm, ~185 on xenon_216), so unscaled maps give
+``z = cc / (c sigma) - mu / sigma``: the correlation term is suppressed by ``c`` and
+the argmax over the shift window follows ``mu / sigma``, pulling refined positions to
+the window's edge. ``mip``, ``correlation_average`` and ``correlation_variance`` are
+therefore divided by :func:`correlation_scale`, the median ``sigma``, which restores
+``mu ~ 0`` and ``sigma ~ 1``. ``scaled_mip`` is a z-score and needs no scale.
 """
 
 from __future__ import annotations

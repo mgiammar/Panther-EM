@@ -3,8 +3,8 @@
 Covers:
 - _compute_freq_crop: index math for k_max cropping (real and complex modes)
 - precompute_volume_dft: shape, padding, edge-value handling
-- apply_fourier_filters: output shape and identity behaviour
-- the pipeline's block order (complex: centred on DC) and recorded block energies
+- apply_fourier_filters: output shape and identity behavior
+- the pipeline's block order (complex: centered on DC) and recorded block energies
 - DecompositionResult: shape validation, index helpers, get_component, get_top_n
 - DecompositionResult save/load round-trip
 """
@@ -323,7 +323,7 @@ class TestPipelineBlockOrder:
         ]
         return out, singles
 
-    def test_complex_blocks_centred_on_dc(self):
+    def test_complex_blocks_centered_on_dc(self):
         """Complex projections: the blocks [-3, 3) of each orientation, in order."""
         ramp = torch.exp(1j * torch.linspace(0.0, 1.0, 16))
         filters = (torch.ones(1, 16, 16) * ramp).to(torch.complex64)

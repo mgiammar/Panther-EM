@@ -278,7 +278,7 @@ class SearchGeometry:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(image, row, col)`` top-left box origins of flat pixel indices.
 
-        Center mode: pixel ``b`` is the box centred on image ``b``.
+        Center mode: pixel ``b`` is the box centered on image ``b``.
         """
         flat = flat.to(torch.long)
         if self.mode == "center":

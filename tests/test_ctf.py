@@ -8,7 +8,7 @@ from torch_ctf import calculate_ctf_2d
 from panther_em.filters import ctf_planes
 
 
-def test_ctf_planes_match_torch_ctf_in_micrometres():
+def test_ctf_planes_match_torch_ctf_in_micrometers():
     planes = ctf_planes(
         (32, 48),
         [10000.0, 15000.0, 20000.0],

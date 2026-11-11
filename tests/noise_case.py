@@ -1,6 +1,6 @@
 """A small noise-model case shared by tests.
 
-Three coloured micrographs, their whitening filter, a Gaussian-blob volume
+Three colored micrographs, their whitening filter, a Gaussian-blob volume
 decomposed under ``W_avg * band`` (the template every table and search of the case
 uses), its error tables and a prepared micrograph.
 """
@@ -28,7 +28,7 @@ BAND = (0.35, 0.05)
 PIXEL_SIZE = 1.5
 
 
-def coloured(shape, seed, scale=1.0):
+def colored(shape, seed, scale=1.0):
     """Gaussian noise under a smooth low-pass envelope (a non-flat spectrum)."""
     x = torch.randn(shape, generator=torch.Generator().manual_seed(seed))
     r = fftfreq_grid(image_shape=shape, rfft=True, fftshift=False, norm=True)
@@ -37,7 +37,7 @@ def coloured(shape, seed, scale=1.0):
 
 
 def micrographs():
-    return [(f"m{i}", coloured(SHAPE, 10 + i, s)) for i, s in enumerate((1, 0.7, 1.4))]
+    return [(f"m{i}", colored(SHAPE, 10 + i, s)) for i, s in enumerate((1, 0.7, 1.4))]
 
 
 def ctf_planes(shape=SHAPE, n=3):

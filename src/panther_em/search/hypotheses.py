@@ -233,16 +233,16 @@ class HypothesisSet:
         ):
             if ids is None:
                 continue
-            normalised = _sorted_unique_ids(ids, upper, name)
+            normalized = _sorted_unique_ids(ids, upper, name)
             if (
-                normalised is None
+                normalized is None
                 or ids.device.type != "cpu"
                 or ids.dtype is not torch.long
-                or not torch.equal(ids, normalised)
+                or not torch.equal(ids, normalized)
             ):
                 raise ValueError(
                     f"{name} must be a sorted, unique CPU int64 tensor; build the set "
-                    "with HypothesisSet.create() to normalise raw ids"
+                    "with HypothesisSet.create() to normalize raw ids"
                 )
         limit = 1 << self.packed_index_bits
         if self.n_virtual * self.n_psi >= limit:

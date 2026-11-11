@@ -61,7 +61,7 @@ class BatchShape:
 
 
 def _weights_fp16_4m(w_conj: torch.Tensor) -> torch.Tensor:
-    r"""Interleave a pre-conjugated ``(N, num_k, num_m)`` block for the fp16 4M GEMM.
+    """Interleave a pre-conjugated ``(N, num_k, num_m)`` block for the fp16 4M GEMM.
 
     The complex product ``C = Y @ w`` (``w`` already conjugated) is computed as ONE
     real GEMM per ``k``: ``[Yr | Yi] (P, 2 num_m) @ B (2 num_m, 2N)`` with the columns

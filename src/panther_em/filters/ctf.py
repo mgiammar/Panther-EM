@@ -42,7 +42,7 @@ def ctf_planes(
     voltage : float
         Acceleration voltage in kV.
     spherical_aberration : float
-        Millimetres.
+        Millimeters.
     amplitude_contrast : float
         Fraction in ``[0, 1]``.
     phase_shift : float
@@ -52,7 +52,7 @@ def ctf_planes(
     """
     values = torch.as_tensor(defocus, dtype=torch.float32, device=device).reshape(-1)
     ctf = calculate_ctf_2d(
-        defocus=values * 1e-4,  # torch-ctf takes micrometres
+        defocus=values * 1e-4,  # torch-ctf takes micrometers
         astigmatism=astigmatism * 1e-4,
         astigmatism_angle=astigmatism_angle,
         voltage=voltage,

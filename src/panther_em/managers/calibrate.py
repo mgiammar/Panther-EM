@@ -75,7 +75,7 @@ class CalibrateConfig(ProgramConfig):
     device: str = "cpu"
 
     @model_validator(mode="after")
-    def _something_to_do(self) -> CalibrateConfig:
+    def _require_tables_or_suggestions(self) -> CalibrateConfig:
         if not self.tables and not self.suggest:
             raise ValueError("give tables, suggest targets or both")
         if any(not rects for rects in self.tables.values()):

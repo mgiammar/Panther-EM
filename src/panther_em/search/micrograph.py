@@ -35,7 +35,7 @@ IN_BAND = 1e-3
 
 
 def disk_mean(values: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
-    """Mean of ``values (H, W)`` over the support disk centred at every pixel."""
+    """Mean of ``values (H, W)`` over the support disk centered at every pixel."""
     h, w = int(values.shape[-2]), int(values.shape[-1])
     k_h, k_w = int(support.shape[0]), int(support.shape[1])
     full = (h + k_h - 1, w + k_w - 1)

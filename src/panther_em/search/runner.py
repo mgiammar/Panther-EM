@@ -58,7 +58,7 @@ class Timeline:
     device : DeviceInfo
         The compute device (its allocated bytes are recorded on CUDA).
     trace : bool, optional
-        Synchronise the device at every mark, so the deltas are device times.
+        Synchronize the device at every mark, so the deltas are device times.
     """
 
     def __init__(self, device: DeviceInfo, *, trace: bool = False) -> None:

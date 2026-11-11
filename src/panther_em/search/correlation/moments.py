@@ -1,4 +1,4 @@
-r"""Closed-form per-pixel moments over a pass's whole hypothesis set.
+"""Closed-form per-pixel moments over a pass's whole hypothesis set.
 
 The hypothesis loop's moment sums over ``(plane, template, psi)`` are, by Parseval,
 quadratic forms of the pixel's features. With ``C_dnk = sum_m Y_dkm conj(W_nkm)``

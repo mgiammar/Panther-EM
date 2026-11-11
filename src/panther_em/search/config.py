@@ -92,7 +92,7 @@ class ExecutionConfig:
     show_progress : bool
         Print per-stage progress bars.
     trace : bool
-        Synchronise the device at every session mark (``SearchSession.marks``) so
+        Synchronize the device at every session mark (``SearchSession.marks``) so
         the marks' wall-clock deltas are per-phase device times.
     tuning : Tuning
         Overrides of the planner's and the engines' choices.

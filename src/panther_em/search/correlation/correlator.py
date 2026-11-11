@@ -1,10 +1,33 @@
-"""The correlator: what outlives a pass, and the run over a store's blocks.
+"""Correlating a feature store against a pass's hypotheses into per-pixel maps.
 
-:class:`Correlator` owns the prepared-weight cache, the cache of built (captured)
-loops, the closed-form moment forms, the compute stream and the graph pool;
-:meth:`Correlator.run` correlates every block of a store against a pass's
-hypotheses into :class:`StageMaps`, :meth:`Correlator.run_local` every column
-against its own neighborhood (:mod:`.local`).
+For each block of pixel features in a
+:class:`~panther_em.search.featurization.store.FeatureStore`, a correlation is one
+contraction (CGEMM) of the features with the prepared weights of a batch of
+hypotheses (``(plane, template)`` pairs), giving an angular-frequency spectrum,
+followed by one reduction: the inverse real FFT over the in-plane angle ``psi`` and
+the running maximum, its hypothesis and the moments, accumulated into
+:class:`~panther_em.search.correlation.maps.StageMaps`. The full correlogram is never
+stored.
+
+:class:`Correlator` is created once per
+:class:`~panther_em.search.searcher.Searcher` and reused across passes, stages and
+micrographs, so everything that is costly to build lives on it:
+
+* the prepared weights (:meth:`Correlator.prepared`): each engine's B operand of a
+  ``(k, m)`` run and hypothesis batch. They do not depend on the image, so they are
+  shared by every plane, stage and micrograph, under a byte-budgeted LRU cache;
+* the hypothesis loops (:meth:`Correlator.loop_for`): built once per
+  :class:`~panther_em.search.correlation.loop.LoopPlan` signature and, on CUDA,
+  captured as graphs in a shared pool;
+* the closed-form moment forms used by local passes, and the compute stream.
+
+There are two entry points:
+
+* :meth:`Correlator.run` correlates every pixel column of the store against all of
+  the pass's hypotheses (dense stages);
+* :meth:`Correlator.run_local` correlates each column only against the
+  orientations in its own neighborhood (:mod:`.local`), with mean and variance
+  over the full hypothesis set from the closed-form moments.
 """
 
 from __future__ import annotations

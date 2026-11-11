@@ -65,7 +65,7 @@ def precision_name(precision: str) -> str:
 
 
 def bspline(order: int, x: torch.Tensor) -> torch.Tensor:
-    """Centred cardinal B-spline of degree ``order`` (support ``(order + 1) / 2``)."""
+    """Centered cardinal B-spline of degree ``order`` (support ``(order + 1) / 2``)."""
     out = torch.zeros_like(x)
     for k in range(order + 2):
         term = (x + (order + 1) / 2 - k).clamp(min=0.0) ** order
@@ -171,7 +171,7 @@ class WarpAdjoint:
 
     @property
     def device(self) -> torch.device:
-        """Where the scatter lives."""
+        """Resident torch.device for the scatter."""
         return self.scatter.device
 
     @classmethod

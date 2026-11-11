@@ -92,7 +92,7 @@ class DecompositionBase(ABC):
     block_energy: np.ndarray | None
     normalized_projections: bool | None
 
-    # Private state, initialised by the subclasses.
+    # Private state, initialized by the subclasses.
     _top_n_cache: dict[tuple[int, bool], np.ndarray]
     _h5_file: h5py.File | None
 
@@ -145,7 +145,7 @@ class DecompositionBase(ABC):
         """Read an HDF5 file of this layout (called by :meth:`load`)."""
 
     # ------------------------------------------------------------------
-    # Shared behaviour
+    # Shared behavior
     # ------------------------------------------------------------------
 
     def _validate_metadata(self) -> None:
@@ -359,7 +359,7 @@ class DecompositionBase(ABC):
             grp.create_dataset("jacobian", data=jac)
 
     def save_top_n(self, path: str | Path, top_k: int) -> None:
-        r"""Save only the ``top_k`` most significant components to HDF5.
+        """Save only the ``top_k`` most significant components to HDF5.
 
         Convenience wrapper for ``self.to_sparse(top_k).save(path)``.
 
@@ -1314,7 +1314,7 @@ class SparseDecompositionResult(DecompositionBase):
         Parameters
         ----------
         path : str | Path
-            Destination path.  Extension is normalised to ``.h5``.
+            Destination path.  Extension is normalized to ``.h5``.
         """
         path = Path(path)
         if path.suffix not in {".h5", ".hdf5"}:

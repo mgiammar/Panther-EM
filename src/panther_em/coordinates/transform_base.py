@@ -179,7 +179,7 @@ def reconstruct_transform(
     Returns
     -------
     CoordinateTransform
-        A fully initialised transform instance.
+        A fully initialized transform instance.
 
     Raises
     ------
@@ -255,7 +255,7 @@ class CoordinateTransform(ABC):
     periodic_axis: int | None = None
 
     def __init__(self) -> None:
-        """Initialise the base-class coordinate cache."""
+        """Initialize the base-class coordinate cache."""
         # Numpy arrays storing the pre-computed coordinate grids.
         self._transform_coords: np.ndarray | None = None
         self._cartesian_coords: np.ndarray | None = None
@@ -389,7 +389,8 @@ class CoordinateTransform(ABC):
         Parameters
         ----------
         device : {"numpy"} or torch.device
-            ``"numpy"`` for CPU or a ``torch.device("cuda:N")`` for GPU.
+            ``"numpy"`` for NumPy arrays, or a torch device for CPU or GPU torch
+            tensors.
 
         Returns
         -------
@@ -407,12 +408,6 @@ class CoordinateTransform(ABC):
                 "jacobian": ensure_device(jac, device) if jac is not None else None,
             }
         return self._device_cache[key]
-
-    def _get_device_coords(
-        self, device: Literal["numpy"] | torch.device
-    ) -> dict[str, Any]:
-        """Backwards-compatible alias of :meth:`device_coords`."""
-        return self.device_coords(device)
 
     # ------------------------------------------------------------------ #
     # Cache management
