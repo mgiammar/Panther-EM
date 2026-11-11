@@ -6,8 +6,7 @@
   the real GEMM output is bit-identical to a complex spectrum).
 * :class:`Spectrum` -- the GEMM output, always the kernels' native contiguous
   ``(F, P, N)``.
-* :class:`Precision` / :class:`BatchShape` -- the contraction's precision and its
-  ``(pixels, hypotheses)`` batch.
+* :class:`BatchShape` -- the contraction's ``(pixels, hypotheses)`` batch.
 
 The store the engines' blocks live in is
 :class:`~panther_em.search.featurization.store.FeatureStore`.
@@ -15,36 +14,17 @@ The store the engines' blocks live in is
 
 from __future__ import annotations
 
-import enum
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 
+from panther_em._precision import Precision, check_precision
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from panther_em.search.correlation.layout import KRun
-
-
-class Precision(str, enum.Enum):
-    """Numeric precision of the feature/weight contraction."""
-
-    FP32 = "fp32"
-    TF32 = "tf32"
-    FP16 = "fp16"
-
-    @classmethod
-    def coerce(cls, value: Precision | str) -> Precision:
-        """Accept either an enum member or its string value."""
-        if isinstance(value, Precision):
-            return value
-        try:
-            return cls(str(value).lower())
-        except ValueError as exc:
-            raise ValueError(
-                f"unknown precision {value!r}; expected one of {[p.value for p in cls]}"
-            ) from exc
 
 
 @dataclass(frozen=True)
@@ -188,12 +168,10 @@ class ComplexGemmEngine:
     block_dtype = torch.complex64
     spectrum_dtype = torch.complex64
 
-    def __init__(self, precision: Precision | str = Precision.FP32) -> None:
-        precision = Precision.coerce(precision)
-        if precision not in (Precision.FP32, Precision.TF32):
-            raise ValueError(
-                f"ComplexGemmEngine handles fp32/tf32, not {precision.value}"
-            )
+    def __init__(self, precision: str = "fp32") -> None:
+        precision = check_precision(precision)
+        if precision not in ("fp32", "tf32"):
+            raise ValueError(f"ComplexGemmEngine handles fp32/tf32, not {precision}")
         self.precision: Precision = precision
 
     def block_shape(
@@ -243,7 +221,7 @@ class ComplexGemmEngine:
         a = a_parts[0] if len(a_parts) == 1 else torch.cat(list(a_parts), dim=-1)
         b = b_parts[0] if len(b_parts) == 1 else torch.cat(list(b_parts), dim=1)
         slab = out.native[run.k_start : run.k_stop]
-        if self.precision is Precision.TF32 and a.is_cuda:
+        if self.precision == "tf32" and a.is_cuda:
             prev = torch.backends.cuda.matmul.allow_tf32
             torch.backends.cuda.matmul.allow_tf32 = True
             try:
@@ -257,7 +235,7 @@ class ComplexGemmEngine:
 class Fp16GemmEngine:
     """fp16 tensor-core "4M" contraction; complex32 spectrum."""
 
-    precision: Precision = Precision.FP16
+    precision: Precision = "fp16"
     block_dtype = torch.float16
     spectrum_dtype = torch.complex32
 
@@ -319,9 +297,9 @@ class Fp16GemmEngine:
 ContractionEngine = ComplexGemmEngine | Fp16GemmEngine
 
 
-def make_engine(precision: Precision | str) -> ContractionEngine:
+def make_engine(precision: str) -> ContractionEngine:
     """The engine for a precision."""
-    precision = Precision.coerce(precision)
-    if precision is Precision.FP16:
+    precision = check_precision(precision)
+    if precision == "fp16":
         return Fp16GemmEngine()
     return ComplexGemmEngine(precision)

@@ -62,7 +62,6 @@ import torch
 from panther_em.orientations import healpix_ipix
 from panther_em.search.config import ExecutionConfig
 from panther_em.search.correlation import Correlator
-from panther_em.search.correlation.contraction import Precision
 from panther_em.search.decision import PixelLabel
 from panther_em.search.featurization import make_featurization
 from panther_em.search.hypotheses import HypothesisSpace, LocalHypotheses
@@ -196,7 +195,7 @@ class Searcher:
                         f"stage {i}: rectangle {(k0, m0, ke, me)} exceeds the stored "
                         f"(k_max={k_max}, eig_max={eig_max}) feature space"
                     )
-            if stage.precision is Precision.FP16 and not self.device_info.is_cuda:
+            if stage.precision == "fp16" and not self.device_info.is_cuda:
                 raise ValueError(f"stage {i}: fp16 needs a CUDA device")
             template_ids, defocus_ids = stage.hypothesis_ids(self.space, self.ipix)
             if (

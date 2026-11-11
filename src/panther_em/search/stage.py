@@ -18,9 +18,9 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+from panther_em._precision import PRECISIONS, Precision, check_precision
 from panther_em.decomposition.rectangles import as_rectangle
 from panther_em.orientations import healpix_level_ids
-from panther_em.search.correlation.contraction import Precision
 from panther_em.search.correlation.layout import (
     FeatureLayout,
     rectangles_disjoint,
@@ -72,7 +72,7 @@ class Stage:
     """
 
     rectangles: tuple[Rectangle, ...]
-    precision: Precision = Precision.FP32
+    precision: Precision = "fp32"
     n_psi: int = 256
     orientations: int | torch.Tensor | None = None
     planes: tuple[int, ...] | None = None
@@ -85,7 +85,7 @@ class Stage:
         cls,
         rectangles: Rectangle | Sequence[Rectangle],
         *,
-        precision: Precision | str = Precision.FP32,
+        precision: str = "fp32",
         n_psi: int = 256,
         orientations: int | Sequence[int] | torch.Tensor | None = None,
         planes: Sequence[int] | None = None,
@@ -109,7 +109,7 @@ class Stage:
             )
         return cls(
             rectangles=rects,
-            precision=Precision.coerce(precision),
+            precision=check_precision(precision),
             n_psi=int(n_psi),
             orientations=orientations,
             planes=None if planes is None else tuple(sorted({int(p) for p in planes})),
@@ -133,8 +133,10 @@ class Stage:
                 "rectangles within a stage must be pairwise cell-disjoint or the "
                 "contraction would double count"
             )
-        if not isinstance(self.precision, Precision):
-            raise ValueError("precision must be a Precision; see Stage.create()")
+        if self.precision not in PRECISIONS:
+            raise ValueError(
+                f"precision must be one of {PRECISIONS}; see Stage.create()"
+            )
         if self.k_stop > self.n_psi // 2 + 1:
             raise ValueError(
                 f"k_stop ({self.k_stop}) exceeds n_psi // 2 + 1 "
@@ -249,7 +251,7 @@ def stage_to_json(stage: Stage) -> dict:
         }
     return {
         "rectangles": [list(r) for r in stage.rectangles],
-        "precision": stage.precision.value,
+        "precision": stage.precision,
         "n_psi": stage.n_psi,
         "orientations": orientations,
         "planes": None if stage.planes is None else list(stage.planes),

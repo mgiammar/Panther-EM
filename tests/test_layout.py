@@ -190,7 +190,7 @@ def test_complex_engine_pixel_sub_batch_is_a_view():
 
 def test_make_engine_and_spectrum_validation():
     assert isinstance(make_engine("fp16"), Fp16GemmEngine)
-    assert make_engine("tf32").precision.value == "tf32"
+    assert make_engine("tf32").precision == "tf32"
     with pytest.raises(ValueError):
         ComplexGemmEngine("fp16")
     with pytest.raises(ValueError):

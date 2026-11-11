@@ -18,7 +18,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from panther_em.approximation.reconstructor import Reconstructor
-    from panther_em.search.correlation.contraction import Precision
     from panther_em.search.featurization.base import BaseImageFeaturization
     from panther_em.search.featurization.direct_featurization import (
         ContractionName,
@@ -58,7 +57,7 @@ def make_featurization(
     *,
     cell_chunk: int = DEFAULT_CELL_CHUNK,
     batch: int = DEFAULT_BATCH,
-    precision: Precision | str = DEFAULT_PRECISION,
+    precision: str = DEFAULT_PRECISION,
     contraction: ContractionName = "adjoint",
 ) -> BaseImageFeaturization:
     """The ``mode`` featurization of ``rect``."""

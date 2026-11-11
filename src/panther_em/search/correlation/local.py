@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from panther_em.search.correlation.contraction import Precision
 from panther_em.search.correlation.maps import StageMaps
 from panther_em.search.correlation.moments import (
     block_moments,
@@ -231,7 +230,7 @@ def correlate_local(
                     k_idx[None, :, None, None],
                     p_idx[:, None, None, :],
                 ]
-                if group.precision is Precision.FP16:
+                if group.precision == "fp16":
                     m = int(x.shape[-1]) // 2
                     x = torch.complex(x[..., :m].float(), x[..., m:].float())
                 a_parts.append(x)

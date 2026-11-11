@@ -21,6 +21,7 @@ from typing import Any, ClassVar, Literal
 import torch
 from pydantic import Field, model_validator
 
+from panther_em._precision import Precision
 from panther_em.approximation import PerSpatialFrequencyErrorTable
 from panther_em.filters import WhiteningFilter, ctf_planes
 from panther_em.managers import leopard
@@ -101,7 +102,7 @@ class StageSpec(Model):
 
     rectangles: list[Rectangle] = Field(min_length=1)
     table: str | None = None  # the ``tables`` tag of the threshold test
-    precision: Literal["fp16", "tf32", "fp32"] = "fp32"
+    precision: Precision = "fp32"
     n_psi: int = Field(default=256, ge=1)
     orientations: int | list[int] | None = None
     planes: list[int] | None = None

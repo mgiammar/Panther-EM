@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     import torch
 
+    from panther_em._precision import Precision
     from panther_em.search.correlation.contraction import BatchShape
     from panther_em.search.featurization.direct_featurization import (
         ContractionName,
@@ -100,7 +101,7 @@ class ExecutionConfig:
 
     featurize_mode: Literal["auto", "fft", "direct"] = "auto"
     direct_contraction: ContractionName = "adjoint"
-    direct_precision: Literal["fp16", "tf32", "fp32"] = "fp16"
+    direct_precision: Precision = "fp16"
     device_store_fraction: float = 0.5
     show_progress: bool = False
     trace: bool = False

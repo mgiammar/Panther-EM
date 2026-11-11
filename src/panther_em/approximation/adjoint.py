@@ -23,7 +23,6 @@ GEMM, 5e-4) the speed of the ``2 r x kH kW`` planar GEMM and needs no planar blo
 from __future__ import annotations
 
 import contextlib
-import enum
 import math
 import warnings
 from dataclasses import dataclass, field
@@ -31,6 +30,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+
+from panther_em._precision import check_precision
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
@@ -47,21 +48,6 @@ spline prefilter, for interpolation orders above 1."""
 SELF_CHECK_TOL = 1e-5
 """Tolerance of the build-time check that the transform's radial continuation of an
 angularly monochromatic image is the outer product the adjoint assumes."""
-
-
-def precision_name(precision: str) -> str:
-    """``"fp32"``, ``"tf32"`` or ``"fp16"`` of a precision name or ``str`` enum member.
-
-    Takes the search's ``Precision`` (a ``str`` enum) without importing it, so this
-    package stays below the search.
-    """
-    value = precision.value if isinstance(precision, enum.Enum) else precision
-    name = str(value).lower()
-    if name not in ("fp32", "tf32", "fp16"):
-        raise ValueError(
-            f"unknown precision {precision!r}; expected fp32, tf32 or fp16"
-        )
-    return name
 
 
 def bspline(order: int, x: torch.Tensor) -> torch.Tensor:
@@ -305,7 +291,7 @@ class WarpAdjoint:
         relative on the features); anything else runs in fp32.
         """
         n = int(boxes.shape[0])
-        half = precision_name(precision) == "fp16" and self.device.type == "cuda"
+        half = check_precision(precision) == "fp16" and self.device.type == "cuda"
         if half:
             if self._half is None:
                 with _quiet_sparse():
@@ -357,7 +343,7 @@ class AdjointBases:
             fp16: the angular GEMM on fp16 tensor cores (fp32 accumulation); tf32 or
             fp16: the radial contraction in tf32. fp32: CUDA cores throughout.
         """
-        name = precision_name(precision)
+        name = check_precision(precision)
         r2 = int(self.radial_re.shape[-1])
         n = int(polar.shape[1]) // r2
         cuda = polar.is_cuda

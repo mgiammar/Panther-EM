@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
-from panther_em.search.correlation.contraction import Precision
+from panther_em._precision import Precision, check_precision
 from panther_em.search.featurization.base import (
     BaseImageFeaturization,
     FeatureChunk,
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 ContractionName = Literal["adjoint", "planar"]
 
-DEFAULT_PRECISION = Precision.FP16
+DEFAULT_PRECISION: Precision = "fp16"
 DEFAULT_BATCH = 1024  # Positions per chunk
 
 ADJOINT_CHUNK = 64  # Boxes per chunk, adjoint contraction (scattered, 2 MiB at 512^2)
@@ -49,7 +49,7 @@ PLANAR_CHUNK_BYTES = 2**30
 
 def _operand_dtype(precision: Precision, device: torch.device) -> torch.dtype:
     """fp16 for ``FP16`` on CUDA, else fp32."""
-    if precision is Precision.FP16 and device.type == "cuda":
+    if precision == "fp16" and device.type == "cuda":
         return torch.float16
     return torch.float32
 
@@ -60,7 +60,7 @@ def _matmul(a: torch.Tensor, b: torch.Tensor, precision: Precision) -> torch.Ten
         return torch.mm(a, b, out_dtype=torch.float32)
 
     previous = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = precision is Precision.TF32 and a.is_cuda
+    torch.backends.cuda.matmul.allow_tf32 = precision == "tf32" and a.is_cuda
 
     try:
         return (a @ b).to(torch.float32)
@@ -104,11 +104,11 @@ class BoxContraction(ABC):
         self,
         reconstructor: Reconstructor,
         rect: Rectangle,
-        precision: Precision | str = DEFAULT_PRECISION,
+        precision: str = DEFAULT_PRECISION,
     ) -> None:
         self.reconstructor = reconstructor
         self.rect: Rectangle = rect
-        self.precision = Precision.coerce(precision)
+        self.precision = check_precision(precision)
 
     @property
     def n_cells(self) -> int:
@@ -137,7 +137,7 @@ class AdjointContraction(BoxContraction):
         self,
         reconstructor: Reconstructor,
         rect: Rectangle,
-        precision: Precision | str = DEFAULT_PRECISION,
+        precision: str = DEFAULT_PRECISION,
     ) -> None:
         super().__init__(reconstructor, rect, precision)
         adjoint = reconstructor.adjoint
@@ -237,7 +237,7 @@ class PlanarContraction(BoxContraction):
 def box_contraction(
     reconstructor: Reconstructor,
     rect: Rectangle,
-    precision: Precision | str = DEFAULT_PRECISION,
+    precision: str = DEFAULT_PRECISION,
     contraction: ContractionName = "adjoint",
 ) -> BoxContraction:
     """The adjoint contraction, or the planar one if asked or the adjoint is missing."""
@@ -279,7 +279,7 @@ class DirectFeaturization(BaseImageFeaturization):
         rect: Sequence[int],
         *,
         batch: int = DEFAULT_BATCH,
-        precision: Precision | str = DEFAULT_PRECISION,
+        precision: str = DEFAULT_PRECISION,
         contraction: ContractionName = "adjoint",
     ) -> None:
         super().__init__(reconstructor, rect)

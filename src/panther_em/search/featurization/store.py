@@ -20,8 +20,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from panther_em._precision import Precision, check_precision
 from panther_em.decomposition.rectangles import as_rectangle
-from panther_em.search.correlation.contraction import Precision, make_engine
+from panther_em.search.correlation.contraction import make_engine
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -121,7 +122,7 @@ class FeatureStore:
     def __init__(
         self,
         rectangles: Sequence[Sequence[int]],
-        precision: Precision | str,
+        precision: str,
         planes: Sequence[int],
         n_pixels: int,
         block_pixels: int,
@@ -138,7 +139,7 @@ class FeatureStore:
         if n_pixels < 0 or block_pixels < 1:
             raise ValueError("n_pixels must be >= 0 and block_pixels >= 1")
         self.planes = ids
-        self.precision = Precision.coerce(precision)
+        self.precision = check_precision(precision)
         self.n_pixels = int(n_pixels)
         self.block_pixels = int(block_pixels)
         self.device = torch.device(device)
@@ -187,11 +188,11 @@ class FeatureStore:
         raise KeyError(f"no group of rectangle {key}")
 
     def groups_covering(
-        self, rect: Sequence[int], precision: Precision | str, planes: Sequence[int]
+        self, rect: Sequence[int], precision: str, planes: Sequence[int]
     ) -> list[tuple[ColumnGroup, int]]:
         """``(group, local plane index)`` for each of ``planes``, in request order."""
-        if Precision.coerce(precision) is not self.precision:
-            raise KeyError(f"the store holds {self.precision.value} features")
+        if check_precision(precision) != self.precision:
+            raise KeyError(f"the store holds {self.precision} features")
         group = self.group(rect)
         missing = [int(p) for p in planes if int(p) not in self.planes]
         if missing:

@@ -26,8 +26,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from panther_em.search.correlation.contraction import Precision
-
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
@@ -47,7 +45,7 @@ def real_weight_columns(
     ``(Re Y_0, Im Y_0, Re Y_1, ...)`` for the complex engines.
     """
     wr, wi = w.real.to(torch.float32), w.imag.to(torch.float32)
-    if engine.precision is Precision.FP16:
+    if engine.precision == "fp16":
         a = torch.cat([wr, wi], dim=-1)
         b = torch.cat([-wi, wr], dim=-1)
     else:
@@ -59,7 +57,7 @@ def real_weight_columns(
 
 def real_operand(a: torch.Tensor, engine: ContractionEngine) -> torch.Tensor:
     """The float32 ``(num_k, P, inner)`` real rows of a GEMM A operand (any engine)."""
-    if engine.precision is Precision.FP16:
+    if engine.precision == "fp16":
         return a.to(torch.float32)
     return torch.view_as_real(a).reshape(a.shape[0], a.shape[1], -1).to(torch.float32)
 

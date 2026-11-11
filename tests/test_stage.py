@@ -6,7 +6,6 @@ import pytest
 import torch
 from noise_case import noise_case
 
-from panther_em.search.correlation.contraction import Precision
 from panther_em.search.decision import Decision
 from panther_em.search.stage import Stage, stage_from_json, stage_to_json
 from panther_em.search.threshold import Calibration, ThresholdTest
@@ -19,7 +18,7 @@ pytestmark = pytest.mark.filterwarnings(
 
 def test_stage_create_and_validation():
     stage = Stage.create([(0, 0, 8, 4), (8, 0, 4, 4)], precision="fp16", n_psi=32)
-    assert stage.precision is Precision.FP16 and stage.k_stop == 12
+    assert stage.precision == "fp16" and stage.k_stop == 12
     assert stage.num_features == 48 and stage.layout().num_features == 48
     single = Stage.create((0, 0, 4, 4), planes=[2, 0, 2], orientations=[5, 1])
     assert single.rectangles == ((0, 0, 4, 4),) and single.planes == (0, 2)
@@ -43,7 +42,7 @@ def test_stage_create_and_validation():
     with pytest.raises(ValueError, match="create"):
         Stage([(0, 0, 4, 4)])  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="create"):
-        Stage(((0, 0, 4, 4),), precision="fp16")  # type: ignore[arg-type]
+        Stage(((0, 0, 4, 4),), precision="FP16")  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         Stage(((0, 0, 4, 4),), planes=(2, 0))
 
@@ -76,7 +75,7 @@ def test_stage_json_round_trip():
     }
     assert data["decision"]["test"]["table"]["rectangles"] == [[0, 0, 2, 3]]
     back = stage_from_json(data)
-    assert back.rectangles == stage.rectangles and back.precision is Precision.TF32
+    assert back.rectangles == stage.rectangles and back.precision == "tf32"
     assert back.orientations == 1 and back.planes == (1, 3) and back.name == "coarse"
     assert back.decision is not None and back.decision.threshold == 7.8
     # the test itself is not restored (its table lives in its own file)

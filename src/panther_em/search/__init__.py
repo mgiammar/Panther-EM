@@ -132,8 +132,8 @@ Example
     result.save("search.h5")
 """
 
+from panther_em._precision import Precision, check_precision
 from panther_em.search.config import ExecutionConfig, Tuning
-from panther_em.search.correlation.contraction import Precision
 from panther_em.search.decision import Decision, PixelLabel
 from panther_em.search.hypotheses import HypothesisSpace
 from panther_em.search.images import SearchImages
@@ -167,5 +167,6 @@ __all__ = [
     "Template",
     "ThresholdTest",
     "Tuning",
+    "check_precision",
     "zscore_threshold",
 ]

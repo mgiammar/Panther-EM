@@ -1,11 +1,12 @@
-"""Value types: SearchImages, SearchGeometry, PixelSelection, Precision."""
+"""Value types: SearchImages, SearchGeometry, PixelSelection, precision."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
-from panther_em.search.correlation.contraction import BatchShape, Precision
+from panther_em._precision import check_precision
+from panther_em.search.correlation.contraction import BatchShape
 from panther_em.search.images import (
     PixelSelection,
     SearchGeometry,
@@ -14,10 +15,10 @@ from panther_em.search.images import (
 
 
 def test_precision_coerce():
-    assert Precision.coerce("fp16") is Precision.FP16
-    assert Precision.coerce(Precision.TF32) is Precision.TF32
+    assert check_precision("fp16") == "fp16"
+    assert check_precision("tf32") == "tf32"
     with pytest.raises(ValueError):
-        Precision.coerce("fp8")
+        check_precision("fp8")
 
 
 def test_batch_shape_validation():

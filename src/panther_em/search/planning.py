@@ -38,10 +38,7 @@ if TYPE_CHECKING:
 
     import numpy as np
 
-    from panther_em.search.correlation.contraction import (
-        ContractionEngine,
-        Precision,
-    )
+    from panther_em.search.correlation.contraction import ContractionEngine
     from panther_em.search.featurization import Mode
     from panther_em.search.hypotheses import HypothesisSpace, LocalHypotheses
     from panther_em.search.images import SearchGeometry
@@ -129,7 +126,7 @@ def hyp_batch_multiple(n_psi: int) -> int:
 
 
 def feature_bytes_per_pixel(
-    groups: Iterable[tuple[tuple[int, int, int, int], Precision | str, int]],
+    groups: Iterable[tuple[tuple[int, int, int, int], str, int]],
 ) -> int:
     """Bytes one pixel's features occupy across ``(rect, precision, n_planes)``."""
     total = 0
