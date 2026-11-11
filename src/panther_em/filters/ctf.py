@@ -36,7 +36,11 @@ def ctf_planes(
     pixel_size : float
         Angstroms per pixel.
     astigmatism : float
-        ``(defocus_u - defocus_v) / 2`` in Angstroms, shared by every plane.
+        ``(defocus_u - defocus_v) / 2`` in Angstroms, shared by every plane. A
+        negative value is the same CTF as its magnitude at ``astigmatism_angle + 90``.
+        Leopard-EM's ``calculate_ctf_filter_stack`` takes ``|defocus_u - defocus_v| /
+        2`` at the unrotated angle, so the two agree only when
+        ``defocus_u >= defocus_v``.
     astigmatism_angle : float
         Degrees; 0 places ``defocus_u`` along the y-axis.
     voltage : float
@@ -51,6 +55,8 @@ def ctf_planes(
         Where the planes are built. Default CPU.
     """
     values = torch.as_tensor(defocus, dtype=torch.float32, device=device).reshape(-1)
+    if astigmatism < 0:  # torch-ctf needs a non-negative astigmatism: the same CTF
+        astigmatism, astigmatism_angle = -astigmatism, astigmatism_angle + 90.0
     ctf = calculate_ctf_2d(
         defocus=values * 1e-4,  # torch-ctf takes micrometers
         astigmatism=astigmatism * 1e-4,
