@@ -66,7 +66,7 @@ radial step along it::
 
 Radial boundaries of the inverse warp
 --------------------------------------
-The first ring sits at ``t = dt`` so the Cartesian pixels nearest the centre map to
+The first ring sits at ``t = dt`` so the Cartesian pixels nearest the center map to
 ``radius_idx`` in ``[-1, 0)``, outside the polar image. Before the polar -> Cartesian
 warp, :meth:`SpiralPolarTransform.pad_radial_axis` extends both axes.
 """
@@ -618,7 +618,7 @@ class SpiralPolarTransform(CoordinateTransform):
             Number of angular samples (spiral arms). Defaults to
             ``round((h * w / num_radius) / spacing_ratio_relative_to_cartesian)``.
         center : tuple[float, float] | None, optional
-            ``(row, col)`` centre. Defaults to image centre.
+            ``(row, col)`` center. Defaults to image center.
         radius : float | None, optional
             Maximum radius in pixels. Defaults to ``height / 2``.
         c : float, optional

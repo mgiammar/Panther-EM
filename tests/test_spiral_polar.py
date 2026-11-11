@@ -45,8 +45,8 @@ def radius_map() -> np.ndarray:
     return np.hypot(yy - CENTER[0], xx - CENTER[1])
 
 
-def off_centre_gaussian(dy: float = 2.3, dx: float = -1.7, sigma: float = 3.0):
-    """Compact blob near the origin; has odd angular modes about the centre."""
+def off_center_gaussian(dy: float = 2.3, dx: float = -1.7, sigma: float = 3.0):
+    """Compact blob near the origin; has odd angular modes about the center."""
     yy, xx = np.indices(SHAPE)
     return np.exp(
         -((yy - CENTER[0] - dy) ** 2 + (xx - CENTER[1] - dx) ** 2) / (2 * sigma**2)
@@ -100,16 +100,16 @@ class TestOriginContinuation:
 class TestRadialBoundaries:
     @pytest.mark.parametrize(
         "image",
-        [np.ones(SHAPE), off_centre_gaussian()],
-        ids=["constant", "off_centre_gaussian"],
+        [np.ones(SHAPE), off_center_gaussian()],
+        ids=["constant", "off_center_gaussian"],
     )
-    def test_centre_round_trip(self, image):
+    def test_center_round_trip(self, image):
         r = radius_map()
         transform = make_transform()
         padded = np.abs(round_trip(transform, image) - image)[r < 3]
         unpadded = np.abs(round_trip(transform, image, pad_radial_axis=False) - image)
         assert padded.max() < 1e-4
-        # Without the continuation the centre drops toward the zero padding
+        # Without the continuation the center drops toward the zero padding
         assert unpadded[r < 3].max() > 0.05
 
     def test_interior_round_trip_of_constant(self):
@@ -124,7 +124,7 @@ class TestRadialBoundaries:
 
     def test_batched_and_complex(self):
         transform = make_transform()
-        polar = transform.to_transform_space(off_centre_gaussian())
+        polar = transform.to_transform_space(off_center_gaussian())
         single = transform.to_cartesian(polar)
         batched = transform.to_cartesian(np.stack([polar, 2 * polar]))
         np.testing.assert_allclose(batched[0], single)
@@ -147,7 +147,7 @@ class TestGridTransformDelegation:
     def test_matches_source_transform(self):
         transform = make_transform()
         grid = GridTransform.from_transform(transform)
-        polar = transform.to_transform_space(off_centre_gaussian())
+        polar = transform.to_transform_space(off_center_gaussian())
         np.testing.assert_array_equal(
             grid.to_cartesian(polar), transform.to_cartesian(polar)
         )
@@ -162,7 +162,7 @@ class TestGridTransformDelegation:
             cartesian_shape=transform.cartesian_shape,
         )
         assert grid.source_transform is None
-        polar = transform.to_transform_space(off_centre_gaussian())
+        polar = transform.to_transform_space(off_center_gaussian())
         np.testing.assert_array_equal(
             grid.to_cartesian(polar),
             transform.to_cartesian(polar, pad_radial_axis=False),

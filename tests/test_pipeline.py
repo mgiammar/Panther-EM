@@ -48,7 +48,7 @@ def test_threshold_test_pipeline_runs_end_to_end(tmp_path):
     }
     assert tables["coarse"].rectangles == ((0, 0, 6, 4),)
     assert tables["full"].n_templates == 12  # the nside-1 HEALPix grid
-    # stage 1 scores each pixel over a 1-ring neighbourhood, not all 12 orientations
+    # stage 1 scores each pixel over a 1-ring neighborhood, not all 12 orientations
     assert 1 < summary["local_orientations"][1] < 12
     for table in tables.values():
         table.check(template.reconstructor)

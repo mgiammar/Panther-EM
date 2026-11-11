@@ -304,7 +304,7 @@ class StandardPolarTransform(CoordinateTransform):
         num_radius : int | None, optional
             Number of radial samples. Defaults to ``ceil(radius)``.
         center : tuple[float, float] | None, optional
-            ``(row, col)`` centre. Defaults to image centre.
+            ``(row, col)`` center. Defaults to image center.
         radius : float | None, optional
             Maximum radius in pixels. Defaults to ``height / 2``.
 

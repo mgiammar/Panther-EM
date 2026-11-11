@@ -220,7 +220,7 @@ class ThresholdTest:
         threshold : float
             The z-score threshold ``T``.
         level : torch.Tensor
-            ``(P,)`` local noise level ``ell`` at each pixel's box centre.
+            ``(P,)`` local noise level ``ell`` at each pixel's box center.
         plane, row : torch.Tensor
             ``(P,)`` int64 CTF plane and template row of each pixel's maximum.
         mip, mean, variance : torch.Tensor

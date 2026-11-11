@@ -82,7 +82,7 @@ class PixelLedger:
     ) -> None:
         """Record a stage's maps at ``pixel_index`` (same order as the maps).
 
-        Written pixels are labelled AMBIGUOUS and their score is cleared; the stage's
+        Written pixels are labeled AMBIGUOUS and their score is cleared; the stage's
         decision relabels (and scores) them.
         """
         idx = pixel_index.to(self.device, torch.long)

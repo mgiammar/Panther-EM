@@ -82,7 +82,7 @@ NAMES = ("m0", "m1", "m2")
 #
 # NOTE ON THIS SEED. tests/test_pipeline.py asserts that the two empty micrographs, m1
 # and m2, accept no pixel. The threshold T is set for ~1 expected false detection per
-# search, so "zero accepted" on one fixed realisation is a statistical outcome, not a
+# search, so "zero accepted" on one fixed realization is a statistical outcome, not a
 # guarantee. Any change to simulation-related code (volume projection, template,
 # whitening, error tables, kernels, the order of random draws) re-rolls which pixels
 # cross T and can flip that assertion without any real regression.

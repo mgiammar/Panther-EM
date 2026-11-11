@@ -64,7 +64,7 @@ class Decision:
         ``False`` leaves every survivor AMBIGUOUS for the next stage. Defaults to
         True.
     absorb_radius : int, optional
-        After labelling, AMBIGUOUS pixels within this Euclidean radius of an ACCEPTED
+        After labeling, AMBIGUOUS pixels within this Euclidean radius of an ACCEPTED
         pixel become ABSORBED (grid mode only). ``0`` disables the step.
     """
 
@@ -132,7 +132,7 @@ class Decision:
     ) -> torch.Tensor:
         """The test's distance ``D`` at ``pixel_index`` (NaN where nothing was found).
 
-        Gathers the ledger's maps, the level at each pixel's box centre and the
+        Gathers the ledger's maps, the level at each pixel's box center and the
         ``(plane, template row)`` of its maximum, and hands them to the test.
         """
         if self.test is None:
