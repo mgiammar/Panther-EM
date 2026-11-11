@@ -146,7 +146,6 @@ from panther_em.search.threshold import (
     Calibration,
     NoiseScales,
     ThresholdTest,
-    zeta_quantile,
     zscore_threshold,
 )
 
@@ -168,6 +167,5 @@ __all__ = [
     "Template",
     "ThresholdTest",
     "Tuning",
-    "zeta_quantile",
     "zscore_threshold",
 ]

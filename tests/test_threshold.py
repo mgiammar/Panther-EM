@@ -11,7 +11,6 @@ from panther_em.search.threshold import (
     Calibration,
     NoiseScales,
     ThresholdTest,
-    zeta_quantile,
     zscore_threshold,
 )
 
@@ -203,9 +202,3 @@ def test_threshold_helpers():
     )
     with pytest.raises(ValueError):
         zscore_threshold(0, 10)
-    ratio = torch.linspace(0.5, 1.5, 101)
-    assert zeta_quantile(ratio, torch.ones(101), 0.1) == pytest.approx(0.6)
-    with pytest.raises(ValueError):
-        zeta_quantile(ratio, torch.ones(101), 1.0)
-    with pytest.raises(ValueError, match="finite"):
-        zeta_quantile(torch.full((3,), float("nan")), torch.ones(3), 0.5)

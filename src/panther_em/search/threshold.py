@@ -54,9 +54,9 @@ class Calibration:
         Tolerated probability of discarding a pixel whose exact correlation would
         have crossed the threshold. Defaults to ``5e-3``.
     zeta : float
-        ``zeta_beta <= 1``: the lower quantile of ``sigma / sigma_hat`` measured on a
-        reference search (:func:`zeta_quantile`); it lowers the threshold to
-        ``mu + T zeta sigma_hat``. Defaults to 1 (no lowering).
+        Threshold-lowering factor in ``(0, 1]``: the test compares against
+        ``mu + T zeta sigma_hat``, so ``zeta < 1`` keeps more pixels for the next
+        stage. Defaults to 1 (no lowering).
     eps_rho : float
         Relative uncertainty of the signal loss ``rho``. Defaults to ``0.1``.
     b_factor : float
@@ -268,21 +268,3 @@ def zscore_threshold(n_pixels: int, n_hypotheses: int) -> float:
     if tests < 1.0:
         raise ValueError("n_pixels and n_hypotheses must be positive")
     return float(-ndtri(1.0 / tests))
-
-
-def zeta_quantile(
-    sigma_exact: torch.Tensor, sigma_hat: torch.Tensor, beta: float
-) -> float:
-    """``zeta_beta``: the lower ``beta``-quantile of ``sigma / sigma_hat``.
-
-    Measured on a reference (exact) search; the fraction ``beta`` of pixels whose
-    exact ``sigma`` falls below ``zeta_beta * sigma_hat`` is the tolerated failure of
-    the sigma bound.
-    """
-    if not 0.0 < beta < 1.0:
-        raise ValueError("beta must lie in (0, 1)")
-    ratio = (sigma_exact.to(torch.float64) / sigma_hat.to(torch.float64)).reshape(-1)
-    ratio = ratio[torch.isfinite(ratio)]
-    if ratio.numel() == 0:
-        raise ValueError("no finite sigma ratios")
-    return float(torch.quantile(ratio, beta))
