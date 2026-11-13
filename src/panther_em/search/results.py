@@ -18,7 +18,7 @@ import h5py
 import numpy as np
 import torch
 
-from panther_em._hdf5 import check_format, write_format
+from panther_em._hdf5 import check_format, create_dataset, write_format
 from panther_em.search.correlation.maps import StageMaps
 from panther_em.search.hypotheses import HypothesisSpace
 from panther_em.search.images import SearchGeometry
@@ -267,7 +267,7 @@ class SearchResult:
         with h5py.File(path, "w") as f:
             write_format(f, "search_result")
             for name, array in self.to_numpy().items():
-                f.create_dataset(name, data=array)
+                create_dataset(f, name, array)
             g = self.geometry
             f.attrs["geometry"] = json.dumps(
                 {
@@ -288,7 +288,7 @@ class SearchResult:
             for name in ("phi_deg", "theta_deg", "defocus_values"):
                 t = getattr(self.space, name)
                 if t is not None:
-                    f.create_dataset(name, data=t.detach().cpu().numpy())
+                    create_dataset(f, name, t.detach().cpu().numpy())
             f.attrs["n_psi_of_stage"] = json.dumps(list(self.n_psi_of_stage))
             f.attrs["stages"] = json.dumps([stage_to_json(s) for s in self.stages])
             f.attrs["elapsed_s"] = float(self.elapsed_s)
@@ -296,21 +296,19 @@ class SearchResult:
                 root = f.create_group("stages")
                 for r in self.stage_results:
                     grp = root.create_group(f"stage{r.stage_index}")
-                    grp.create_dataset("pixel_index", data=r.pixel_index.cpu().numpy())
+                    create_dataset(grp, "pixel_index", r.pixel_index.cpu().numpy())
                     for name in STAGE_MAP_NAMES:
                         source = (
                             r.best_index
                             if name == "best_index"
                             else getattr(r.maps, name)
                         )
-                        grp.create_dataset(name, data=source.detach().cpu().numpy())
-                    grp.create_dataset(
-                        "best_virtual", data=r.maps.best_virtual.detach().cpu().numpy()
+                        create_dataset(grp, name, source.detach().cpu().numpy())
+                    create_dataset(
+                        grp, "best_virtual", r.maps.best_virtual.detach().cpu().numpy()
                     )
-                    grp.create_dataset(
-                        "labels_after", data=r.labels_after.cpu().numpy()
-                    )
-                    grp.create_dataset("score", data=r.score.detach().cpu().numpy())
+                    create_dataset(grp, "labels_after", r.labels_after.cpu().numpy())
+                    create_dataset(grp, "score", r.score.detach().cpu().numpy())
                     grp.attrs["n_pixels"] = r.n_pixels
                     grp.attrs["n_evaluated"] = int(r.maps.n_evaluated)
                     grp.attrs["n_ambiguous_after"] = int(r.n_ambiguous_after)

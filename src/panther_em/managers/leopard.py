@@ -55,6 +55,7 @@ from leopard_em.pydantic_models.results.match_template_result import (
     _TENSOR_NAMES,
 )
 
+from panther_em._hdf5 import create_dataset
 from panther_em.search import PixelLabel
 
 if TYPE_CHECKING:
@@ -139,9 +140,7 @@ def write_match_template_maps(path: str | Path, result: SearchResult) -> None:
             del f[HDF5_TENSORS_GROUP]
         group = f.create_group(HDF5_TENSORS_GROUP)
         for name in _TENSOR_NAMES:
-            group.create_dataset(
-                name, data=maps[name].numpy(), compression="gzip", compression_opts=4
-            )
+            create_dataset(group, name, maps[name].numpy())
 
 
 # --------------------------------------------------------------------------- #

@@ -7,6 +7,7 @@ import warnings
 import weakref
 from dataclasses import replace
 
+import h5py
 import pytest
 import torch
 from noise_case import BOX, noise_case
@@ -532,6 +533,9 @@ def test_search_result_round_trip_and_masked_pixels(template, tmp_path):
 
     path = tmp_path / "result.h5"
     res.save(path)
+    with h5py.File(path, "r") as f:  # integer maps compressed, float maps raw
+        assert f["label"].compression == f["stages/stage0/pixel_index"].compression
+        assert f["label"].compression == "gzip" and f["mip"].compression is None
     loaded = SearchResult.load(path)
     for name in MAP_NAMES:
         torch.testing.assert_close(
