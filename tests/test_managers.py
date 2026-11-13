@@ -10,6 +10,7 @@ import gzip
 import importlib.util
 import json
 import shutil
+import threading
 from pathlib import Path
 
 import h5py
@@ -198,9 +199,18 @@ def test_search_resumes(pipeline, tmp_path, monkeypatch):
     assert sorted(done) == ["m0", "m1", "m2"]
     # the summary breaks the micrograph's time down by pipeline step
     record = json.loads((tmp_path / "search_summary.json").read_text())["m1"]
-    steps = ("prepare_s", "search_s", "handoff_s", "save_result_s", "leopard_maps_s")
+    steps = (
+        "read_s",
+        "prepare_s",
+        "search_s",
+        "handoff_s",
+        "save_result_s",
+        "leopard_maps_s",
+    )
     assert all(record[k] >= 0.0 for k in steps)
     assert record["elapsed_s"] == pytest.approx(sum(record[k] for k in steps))
+    # without prefetch the search waits for all of its read
+    assert record["read_wait_s"] >= record["read_s"]
     for stage in record["stages"]:
         parts = stage["featurize_s"] + stage["execute_s"] + stage["other_s"]
         assert parts == pytest.approx(stage["elapsed_s"])
@@ -354,6 +364,96 @@ def test_search_write_error_surfaces_after_pending_writes(
     ]
     summary = json.loads((tmp_path / "search_summary.json").read_text())
     assert sorted(summary) == ["m0", "m2"]
+
+
+@pytest.mark.parametrize("cached", [False, True], ids=["fresh", "cached"])
+def test_search_prefetch_matches_serial(pipeline, tmp_path, cached):
+    """Reading ahead changes no result, prepared afresh or from the cache."""
+    runs = {}
+    for prefetch in (0, 1, 2):
+        out = tmp_path / str(prefetch)
+        out.mkdir()
+        config, _ = masked_search(pipeline, out)
+        config = config.model_copy(
+            update={"prefetch": prefetch, "overwrite": not cached}
+        )
+        done = search.run(config)
+        assert sorted(done) == ["m0", "m2"]
+        runs[prefetch] = (out, json.loads((out / "search_summary.json").read_text()))
+    serial_dir, serial = runs[0]
+    for prefetch in (1, 2):
+        out, summary = runs[prefetch]
+        assert sorted(summary) == sorted(serial) == ["m0", "m1", "m2"]
+        for key in ("n_searchable", "skipped"):  # m1 is fully masked
+            assert summary["m1"][key] == serial["m1"][key]
+        for name in ("m0", "m2"):
+            for key in ("n_searchable", "thresholds", "final"):
+                assert summary[name][key] == serial[name][key], (prefetch, name, key)
+            want = SearchResult.load(serial_dir / f"{name}_result.h5")
+            got = SearchResult.load(out / f"{name}_result.h5")
+            assert torch.equal(got.label, want.label)
+            assert torch.equal(got.last_stage, want.last_stage)
+            torch.testing.assert_close(
+                got.mip, want.mip, rtol=0, atol=0, equal_nan=True
+            )
+
+
+def test_search_prefetch_reads_during_the_search(pipeline, tmp_path, monkeypatch):
+    """With ``prefetch``, the next micrograph is read on the reader thread while the
+    current one is searched."""
+    _, out = pipeline
+    config = SearchConfig.from_yaml(out / "search.yaml")
+    for name in ("m0", "m1", "m2"):
+        shutil.copy(out / f"{name}_micrograph.h5", tmp_path / f"{name}_micrograph.h5")
+    config = config.model_copy(update={"output_dir": tmp_path, "prefetch": 1})
+
+    events = {name: threading.Event() for name in ("m0", "m1", "m2")}
+    threads = {}
+    read = search._read
+
+    def recorded_read(config, entry):
+        loaded = read(config, entry)
+        threads[entry.key] = threading.current_thread().name
+        events[entry.key].set()
+        return loaded
+
+    order = ["m0", "m1", "m2"]
+    run = Searcher.run
+
+    def waits_for_next_read(self, micrograph, **kw):
+        following = order[order.index(micrograph.name) + 1 :]
+        if following:  # the next micrograph is read before this search ends
+            assert events[following[0]].wait(timeout=30)
+        return run(self, micrograph, **kw)
+
+    monkeypatch.setattr(search, "_read", recorded_read)
+    monkeypatch.setattr(Searcher, "run", waits_for_next_read)
+    assert sorted(search.run(config)) == order
+    assert sorted(threads) == order
+    assert all(name.startswith("reader") for name in threads.values())
+
+
+def test_search_prefetch_read_error_surfaces_in_turn(pipeline, tmp_path):
+    """A micrograph that fails to read raises when its turn comes: the micrographs
+    before it are searched and written, the ones after it are not."""
+    _, out = pipeline
+    config = SearchConfig.from_yaml(out / "search.yaml")
+    m0, m1, m2 = config.micrographs
+    entries = [m0, m1.model_copy(update={"path": tmp_path / "missing.mrc"}), m2]
+    config = config.model_copy(
+        update={
+            "output_dir": tmp_path,
+            "micrographs": entries,
+            "prefetch": 2,
+            "cache_micrographs": False,
+        }
+    )
+    with pytest.raises(FileNotFoundError, match="missing"):
+        search.run(config)
+    assert [p.name for p in tmp_path.glob("*_result.h5")] == ["m0_result.h5"]
+    assert not list(tmp_path.glob("*_micrograph.h5"))  # caching is opt-in
+    summary = json.loads((tmp_path / "search_summary.json").read_text())
+    assert sorted(summary) == ["m0"]
 
 
 def test_export_stack(pipeline):

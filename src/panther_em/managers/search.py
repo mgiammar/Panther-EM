@@ -9,7 +9,8 @@ loaded from the cache) and searched, and the
 micrograph whose result exists is skipped, so an interrupted run resumes where it
 stopped. A micrograph's ``mask`` restricts the search to the positions whose box
 center it covers (one whose mask leaves none is not searched). Results are written
-on a background thread while the next micrograph is searched (``pending_writes``).
+on a background thread while the next micrograph is searched (``pending_writes``),
+and the next micrographs can be read on another (``prefetch``).
 ``search_summary.json`` collects each micrograph's label counts.
 """
 
@@ -19,6 +20,7 @@ import json
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -152,7 +154,8 @@ class SearchConfig(ProgramConfig):
     output_dir : Path
         Where results (and cached micrographs) go.
     cache_micrographs : bool
-        Save each prepared micrograph (``<name>_micrograph.h5``) and reuse it.
+        Save each prepared micrograph (``<name>_micrograph.h5``) and reuse it, which
+        with modeled CTF planes is large. Default False.
     overwrite : bool
         Search (and prepare) again micrographs that already have results.
     keep_stage_results : bool
@@ -160,6 +163,10 @@ class SearchConfig(ProgramConfig):
     pending_writes : int
         When >=1, the next micrograph is searched while the previous result is written.
         When 0, results are written before starting the next search. Default 1.
+    prefetch : int
+        Micrographs read ahead on a background thread while the current one is searched.
+        Each holds its image in host memory Default 0 meaning each micrograph is read
+        when its search starts.
     device : str
         Compute device. Default ``"cpu"``.
     """
@@ -178,10 +185,11 @@ class SearchConfig(ProgramConfig):
     execution: dict[str, Any] = Field(default_factory=dict)
     noise_table: str | None = None
     output_dir: Path
-    cache_micrographs: bool = True
+    cache_micrographs: bool = False
     overwrite: bool = False
     keep_stage_results: bool = True
     pending_writes: int = Field(default=1, ge=0)
+    prefetch: int = Field(default=0, ge=0)
     device: str = "cpu"
 
     @model_validator(mode="after")
@@ -222,6 +230,31 @@ def execution_config(spec: dict[str, Any]) -> ExecutionConfig:
     if tuning.get("batch") is not None:
         tuning["batch"] = BatchShape(*tuning["batch"])
     return ExecutionConfig(**fields, tuning=Tuning(**tuning))
+
+
+@dataclass(frozen=True)
+class _Loaded:
+    """A micrograph's host data: its cached :class:`Micrograph` (CPU) or raw image."""
+
+    entry: MicrographEntry
+    data: Micrograph | torch.Tensor
+    mask: torch.Tensor | None
+
+
+def _read(config: SearchConfig, entry: MicrographEntry) -> _Loaded:
+    """Read ``entry``'s cached micrograph, or its MRC, and its mask (host only)."""
+    cached = config.micrograph_path(entry.key)
+    data: Micrograph | torch.Tensor
+    if config.cache_micrographs and cached.exists() and not config.overwrite:
+        data = Micrograph.load(cached)
+        shape = data.image_shape
+    else:
+        data = read_micrograph(entry.path)
+        if config.invert_contrast:
+            data = -data
+        shape = (int(data.shape[0]), int(data.shape[1]))
+    mask = None if entry.mask is None else read_mask(entry.mask, shape)
+    return _Loaded(entry, data, mask)
 
 
 class _Run:
@@ -282,9 +315,11 @@ class _Run:
             return None
         n_pixels = self.n_searchable(micrograph)
         return [
-            self.threshold(spec, n_pixels)
-            if spec.decision.threshold == "auto"
-            else None
+            (
+                self.threshold(spec, n_pixels)
+                if spec.decision.threshold == "auto"
+                else None
+            )
             for spec in self.config.stages
         ]
 
@@ -327,22 +362,14 @@ class _Run:
             )
         return self.searchers[shape]
 
-    def micrograph(self, entry: MicrographEntry) -> Micrograph:
-        """The prepared micrograph of ``entry`` (from the cache when allowed)."""
-        config, name = self.config, entry.key
-        cached = config.micrograph_path(name)
-        if config.cache_micrographs and cached.exists() and not config.overwrite:
-            micrograph = Micrograph.load(cached, self.device)
-            mask = None
-            if entry.mask is not None:
-                mask = read_mask(entry.mask, micrograph.image_shape)
-            return micrograph.with_mask(mask)
-        raw = read_micrograph(entry.path, self.device)
-        mask = None
-        if entry.mask is not None:
-            mask = read_mask(entry.mask, (int(raw.shape[0]), int(raw.shape[1])))
-        if config.invert_contrast:
-            raw = -raw
+    def prepare(self, loaded: _Loaded) -> Micrograph:
+        """The searched micrograph of a :func:`_read` (device work and the cache)."""
+        config, entry = self.config, loaded.entry
+
+        if isinstance(loaded.data, Micrograph):
+            return loaded.data.to(self.device).with_mask(loaded.mask)
+
+        raw = loaded.data.to(self.device)
         optics = config.optics
         mean = (entry.defocus_u + entry.defocus_v) / 2
         ctf = ctf_planes(
@@ -359,16 +386,27 @@ class _Run:
         )
         micrograph = Micrograph.prepare(
             raw,
-            name,
+            entry.key,
             self.whitening,
             ctf,
             self.tables[config.noise_tag],
             pixel_size=optics.pixel_size,
-            mask=mask,
+            mask=loaded.mask,
         )
+
         if config.cache_micrographs:
-            save_output(micrograph.save, cached, config, micrograph=name)
+            save_output(
+                micrograph.save,
+                config.micrograph_path(entry.key),
+                config,
+                micrograph=entry.key,
+            )
+
         return micrograph
+
+    def micrograph(self, entry: MicrographEntry) -> Micrograph:
+        """The prepared micrograph of ``entry`` (from the cache when allowed)."""
+        return self.prepare(_read(self.config, entry))
 
     def release(self) -> None:
         for searcher in self.searchers.values():
@@ -388,18 +426,11 @@ def _summary(
 
     ``mask`` is the micrograph's mask file and ``n_searchable`` the positions it
     leaves (every position without a mask); ``final`` counts the rest ``MASKED``.
-
-    ``timing`` holds the manager's steps (``prepare_s``: load, CTF and whitening, or
-    the micrograph cache; ``search_s``; ``handoff_s``: Leopard-EM maps and the copy
-    to host; then, on the writer thread and overlapping the next search,
-    ``save_result_s`` and ``leopard_maps_s``); each stage adds its own
-    ``featurize_s``, ``execute_s`` (correlation) and ``other_s`` (planning, seeding,
-    ledger write and decision).
     """
     return {
         "mask": None if mask is None else str(mask),
         "n_searchable": int((result.label != int(PixelLabel.MASKED)).sum()),
-        "elapsed_s": sum(timing.values()),
+        "elapsed_s": sum(v for k, v in timing.items() if k != "read_wait_s"),
         **timing,
         "thresholds": [
             None if s.decision is None else float(s.decision.threshold)
@@ -451,8 +482,21 @@ def run(config: SearchConfig) -> dict[str, Path]:
     summary_path = out / "search_summary.json"
     summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
     done = {}
+    todo = []
+    for entry in config.micrographs:
+        path = config.result_path(entry.key)
+        if path.exists() and not config.overwrite:
+            done[entry.key] = path
+        else:
+            todo.append(entry)
     state = None
+    reads: dict[int, Future[tuple[_Loaded, float]]] = {}
     pending: deque[Future[tuple[str, Path, dict]]] = deque()
+
+    def timed_read(entry: MicrographEntry) -> tuple[_Loaded, float]:
+        t = time.perf_counter()
+        loaded = _read(config, entry)
+        return loaded, time.perf_counter() - t
 
     def finish(write: Future[tuple[str, Path, dict]]) -> None:
         name, path, record = write.result()
@@ -460,21 +504,33 @@ def run(config: SearchConfig) -> dict[str, Path]:
         summary[name] = record
         summary_path.write_text(json.dumps(summary, indent=1))
 
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="writer") as writer:
+    with (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="writer") as writer,
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="reader") as reader,
+    ):
+
+        def read_ahead(start: int) -> None:
+            """Read ``todo[start : start + prefetch]`` on the reader thread."""
+            for j in range(start, min(start + config.prefetch, len(todo))):
+                if j not in reads:
+                    reads[j] = reader.submit(timed_read, todo[j])
+
         try:
-            for entry in config.micrographs:
+            read_ahead(0)  # the first reads overlap building the template and tables
+            for i, entry in enumerate(todo):
                 name, path = entry.key, config.result_path(entry.key)
-                if path.exists() and not config.overwrite:
-                    done[name] = path
-                    continue
                 state = state or _Run(config)
                 timing: dict[str, float] = {}
                 t0 = time.perf_counter()
-                micrograph = state.micrograph(entry)
-                shape = (
-                    int(micrograph.image.shape[-2]),
-                    int(micrograph.image.shape[-1]),
+                read = reads.pop(i, None)
+                loaded, timing["read_s"] = (
+                    timed_read(entry) if read is None else read.result()
                 )
+                read_ahead(i + 1)  # read while this micrograph is searched
+                t1 = time.perf_counter()
+                micrograph = state.prepare(loaded)
+                del loaded
+                shape = micrograph.image_shape
                 if micrograph.mask is not None and state.n_searchable(micrograph) == 0:
                     summary[name] = {
                         "mask": str(entry.mask),
@@ -483,16 +539,17 @@ def run(config: SearchConfig) -> dict[str, Path]:
                     }
                     summary_path.write_text(json.dumps(summary, indent=1))
                     continue
-                t1 = time.perf_counter()
+                t2 = time.perf_counter()
                 result = state.searcher(shape).run(
                     micrograph, thresholds=state.thresholds(micrograph)
                 )
-                t2 = time.perf_counter()
+                t3 = time.perf_counter()
                 maps = leopard.match_template_maps(result)  # on the compute device
                 result = result.to("cpu")
-                timing["prepare_s"] = t1 - t0
-                timing["search_s"] = t2 - t1
-                timing["handoff_s"] = time.perf_counter() - t2
+                timing["read_wait_s"] = t1 - t0
+                timing["prepare_s"] = t2 - t1
+                timing["search_s"] = t3 - t2
+                timing["handoff_s"] = time.perf_counter() - t3
                 pending.append(
                     writer.submit(
                         _write, config, name, path, result, maps, timing, entry.mask
@@ -502,6 +559,8 @@ def run(config: SearchConfig) -> dict[str, Path]:
                 while len(pending) > config.pending_writes:
                     finish(pending.popleft())
         finally:
+            for read in reads.values():
+                read.cancel()
             if state is not None:
                 state.release()
             while pending:

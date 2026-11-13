@@ -268,6 +268,10 @@ class Micrograph:
         """A copy searched under ``mask`` (``(H, W)`` bool, moved to the CPU)."""
         return replace(self, mask=None if mask is None else mask.to("cpu"))
 
+    def to(self, device: torch.device | str) -> Micrograph:
+        """A copy with image and CTF planes on ``device`` (curves and mask stay)."""
+        return replace(self, image=self.image.to(device), ctf=self.ctf.to(device))
+
     # -- sizes -----------------------------------------------------------------
 
     @property
@@ -308,10 +312,10 @@ class Micrograph:
                 return torch.from_numpy(f[field][()])
 
             name = f.attrs["name"]
-            return cls(
+            micrograph = cls(
                 name=name.decode() if isinstance(name, bytes) else str(name),
-                image=read("image").to(device),
-                ctf=read("ctf").to(device),
+                image=read("image"),
+                ctf=read("ctf"),
                 frequencies=read("frequencies"),
                 noise=read("noise"),
                 signal=read("signal"),
@@ -319,6 +323,7 @@ class Micrograph:
                 pixel_size=float(f.attrs["pixel_size"]),
                 mask=read("mask") if "mask" in f else None,
             )
+        return micrograph.to(device)
 
 
 def _level_map(
