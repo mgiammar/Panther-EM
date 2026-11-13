@@ -236,6 +236,7 @@ def configs(out: Path, device: str, noise_seed: int) -> dict:
                 ),
             ],
             output_dir=out,
+            cache_micrographs=True,  # the evaluation reads the prepared micrographs
             device=device,
         ),
         "export": export.ExportConfig(

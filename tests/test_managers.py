@@ -451,6 +451,7 @@ def test_search_prefetch_read_error_surfaces_in_turn(pipeline, tmp_path):
     with pytest.raises(FileNotFoundError, match="missing"):
         search.run(config)
     assert [p.name for p in tmp_path.glob("*_result.h5")] == ["m0_result.h5"]
+    assert not list(tmp_path.glob("*_micrograph.h5"))  # caching is opt-in
     summary = json.loads((tmp_path / "search_summary.json").read_text())
     assert sorted(summary) == ["m0"]
 

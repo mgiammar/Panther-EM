@@ -154,7 +154,8 @@ class SearchConfig(ProgramConfig):
     output_dir : Path
         Where results (and cached micrographs) go.
     cache_micrographs : bool
-        Save each prepared micrograph (``<name>_micrograph.h5``) and reuse it.
+        Save each prepared micrograph (``<name>_micrograph.h5``) and reuse it, which
+        with modeled CTF planes is large. Default False.
     overwrite : bool
         Search (and prepare) again micrographs that already have results.
     keep_stage_results : bool
@@ -184,7 +185,7 @@ class SearchConfig(ProgramConfig):
     execution: dict[str, Any] = Field(default_factory=dict)
     noise_table: str | None = None
     output_dir: Path
-    cache_micrographs: bool = True
+    cache_micrographs: bool = False
     overwrite: bool = False
     keep_stage_results: bool = True
     pending_writes: int = Field(default=1, ge=0)
