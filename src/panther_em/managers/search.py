@@ -7,9 +7,10 @@ loaded from the cache) and searched, and the
 ``output_dir/<name>_result.h5``, which also holds Leopard-EM's match-template maps
 (:func:`~.leopard.write_match_template_maps`: the file is a Leopard-EM result too). A
 micrograph whose result exists is skipped, so an interrupted run resumes where it
-stopped. Results are written on a background thread while the next micrograph is
-searched (``pending_writes``). ``search_summary.json`` collects each
-micrograph's label counts.
+stopped. A micrograph's ``mask`` restricts the search to the positions whose box
+center it covers (one whose mask leaves none is not searched). Results are written
+on a background thread while the next micrograph is searched (``pending_writes``).
+``search_summary.json`` collects each micrograph's label counts.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from panther_em.managers._common import (
     Model,
     ProgramConfig,
     Rectangle,
+    read_mask,
     read_micrograph,
     save_output,
 )
@@ -42,6 +44,7 @@ from panther_em.search import (
     Micrograph,
     PixelLabel,
     Searcher,
+    SearchImages,
     SearchResult,
     Stage,
     Template,
@@ -50,6 +53,7 @@ from panther_em.search import (
     zscore_threshold,
 )
 from panther_em.search.correlation.contraction import BatchShape
+from panther_em.search.images import SearchGeometry
 
 
 class Optics(Model):
@@ -63,13 +67,14 @@ class Optics(Model):
 
 
 class MicrographEntry(Model):
-    """One micrograph: its MRC file and fitted CTF (defocus in Angstroms)."""
+    """One micrograph: its MRC file, fitted CTF (defocus in Angstroms) and mask."""
 
     path: Path
     name: str | None = None  # default: the file stem (the whitening filter's name)
     defocus_u: float
     defocus_v: float
     astigmatism_angle: float = 0.0  # degrees
+    mask: Path | None = None
 
     @property
     def key(self) -> str:
@@ -90,8 +95,9 @@ class DecisionSpec(Model):
     """A stage's :class:`~panther_em.search.Decision`.
 
     ``threshold="auto"`` is :func:`~panther_em.search.zscore_threshold` of the
-    micrograph's positions and the stage's hypotheses (one expected false detection
-    per micrograph). ``calibration`` adds the threshold test on the stage's table.
+    micrograph's searched positions (those its mask leaves) and the stage's
+    hypotheses (one expected false detection per micrograph). ``calibration`` adds
+    the threshold test on the stage's table.
     """
 
     threshold: float | Literal["auto"] = "auto"
@@ -243,11 +249,10 @@ class _Run:
         self.offsets = torch.tensor(config.defocus_offsets, dtype=torch.float32)
         self.searchers: dict[tuple[int, int], Searcher] = {}
 
-    def threshold(self, spec: StageSpec, shape: tuple[int, int]) -> float:
+    def threshold(self, spec: StageSpec, n_pixels: int) -> float:
+        """The stage's threshold for a micrograph of ``n_pixels`` searched positions."""
         if spec.decision.threshold != "auto":
             return float(spec.decision.threshold)
-        h, w = self.template.reconstructor.box_shape
-        n_pixels = (shape[0] - h + 1) * (shape[1] - w + 1)
         space = self.template.space
         n_hypotheses = (
             len(self.config.defocus_offsets)
@@ -256,6 +261,32 @@ class _Run:
             * spec.n_psi
         )
         return zscore_threshold(n_pixels, n_hypotheses)
+
+    def n_positions(self, shape: tuple[int, int]) -> int:
+        """Search positions of an unmasked micrograph of ``shape``."""
+        h, w = self.template.template_shape
+        return (shape[0] - h + 1) * (shape[1] - w + 1)
+
+    def n_searchable(self, micrograph: Micrograph) -> int:
+        """Search positions of ``micrograph`` under its mask."""
+        if micrograph.mask is None:
+            return self.n_positions(micrograph.image_shape)
+        geometry = SearchGeometry.from_images(
+            SearchImages.single(micrograph.image), self.template.template_shape
+        )
+        return int(geometry.grid_mask(micrograph.mask).sum())
+
+    def thresholds(self, micrograph: Micrograph) -> list[float | None] | None:
+        """Per-stage thresholds of a masked micrograph (``None``: the searcher's)."""
+        if micrograph.mask is None:
+            return None
+        n_pixels = self.n_searchable(micrograph)
+        return [
+            self.threshold(spec, n_pixels)
+            if spec.decision.threshold == "auto"
+            else None
+            for spec in self.config.stages
+        ]
 
     def searcher(self, shape: tuple[int, int]) -> Searcher:
         """The searcher of micrographs of ``shape`` (thresholds depend on it)."""
@@ -278,7 +309,7 @@ class _Run:
                         planes=spec.planes,
                         local_rings=spec.local_rings,
                         decision=Decision(
-                            self.threshold(spec, shape),
+                            self.threshold(spec, self.n_positions(shape)),
                             test,
                             accept=d.accept,
                             absorb_radius=d.absorb_radius,
@@ -301,8 +332,15 @@ class _Run:
         config, name = self.config, entry.key
         cached = config.micrograph_path(name)
         if config.cache_micrographs and cached.exists() and not config.overwrite:
-            return Micrograph.load(cached, self.device)
+            micrograph = Micrograph.load(cached, self.device)
+            mask = None
+            if entry.mask is not None:
+                mask = read_mask(entry.mask, micrograph.image_shape)
+            return micrograph.with_mask(mask)
         raw = read_micrograph(entry.path, self.device)
+        mask = None
+        if entry.mask is not None:
+            mask = read_mask(entry.mask, (int(raw.shape[0]), int(raw.shape[1])))
         if config.invert_contrast:
             raw = -raw
         optics = config.optics
@@ -326,6 +364,7 @@ class _Run:
             ctf,
             self.tables[config.noise_tag],
             pixel_size=optics.pixel_size,
+            mask=mask,
         )
         if config.cache_micrographs:
             save_output(micrograph.save, cached, config, micrograph=name)
@@ -342,8 +381,13 @@ def _label_counts(labels: torch.Tensor) -> dict[str, int]:
     return {lab.name: int((labels == int(lab)).sum()) for lab in PixelLabel}
 
 
-def _summary(result: SearchResult, timing: dict[str, float]) -> dict:
+def _summary(
+    result: SearchResult, timing: dict[str, float], mask: Path | None = None
+) -> dict:
     """Labels and wall-clock seconds of one micrograph.
+
+    ``mask`` is the micrograph's mask file and ``n_searchable`` the positions it
+    leaves (every position without a mask); ``final`` counts the rest ``MASKED``.
 
     ``timing`` holds the manager's steps (``prepare_s``: load, CTF and whitening, or
     the micrograph cache; ``search_s``; ``handoff_s``: Leopard-EM maps and the copy
@@ -353,6 +397,8 @@ def _summary(result: SearchResult, timing: dict[str, float]) -> dict:
     ledger write and decision).
     """
     return {
+        "mask": None if mask is None else str(mask),
+        "n_searchable": int((result.label != int(PixelLabel.MASKED)).sum()),
         "elapsed_s": sum(timing.values()),
         **timing,
         "thresholds": [
@@ -382,6 +428,7 @@ def _write(
     result: SearchResult,
     maps: dict[str, torch.Tensor],
     timing: dict[str, float],
+    mask: Path | None = None,
 ) -> tuple[str, Path, dict]:
     """Write ``result`` and its Leopard-EM ``maps`` to ``path`` (writer thread)."""
 
@@ -394,7 +441,7 @@ def _write(
         timing["leopard_maps_s"] = time.perf_counter() - t1
 
     save_output(save, path, config, micrograph=name)
-    return name, path, _summary(result, timing)
+    return name, path, _summary(result, timing, mask)
 
 
 def run(config: SearchConfig) -> dict[str, Path]:
@@ -428,8 +475,18 @@ def run(config: SearchConfig) -> dict[str, Path]:
                     int(micrograph.image.shape[-2]),
                     int(micrograph.image.shape[-1]),
                 )
+                if micrograph.mask is not None and state.n_searchable(micrograph) == 0:
+                    summary[name] = {
+                        "mask": str(entry.mask),
+                        "n_searchable": 0,
+                        "skipped": "the mask leaves no position to search",
+                    }
+                    summary_path.write_text(json.dumps(summary, indent=1))
+                    continue
                 t1 = time.perf_counter()
-                result = state.searcher(shape).run(micrograph)
+                result = state.searcher(shape).run(
+                    micrograph, thresholds=state.thresholds(micrograph)
+                )
                 t2 = time.perf_counter()
                 maps = leopard.match_template_maps(result)  # on the compute device
                 result = result.to("cpu")
@@ -437,7 +494,9 @@ def run(config: SearchConfig) -> dict[str, Path]:
                 timing["search_s"] = t2 - t1
                 timing["handoff_s"] = time.perf_counter() - t2
                 pending.append(
-                    writer.submit(_write, config, name, path, result, maps, timing)
+                    writer.submit(
+                        _write, config, name, path, result, maps, timing, entry.mask
+                    )
                 )
                 del micrograph, result, maps
                 while len(pending) > config.pending_writes:

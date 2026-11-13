@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import functools
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -274,14 +275,18 @@ class Searcher:
         pixels: PixelSelection,
         geometry: SearchGeometry,
         seeds: torch.Tensor | None = None,
+        *,
+        stage: Stage | None = None,
     ) -> StagePlan:
         """Plan stage ``index`` over ``pixels`` against the device's free memory now.
 
         A local stage needs ``seeds``: each pixel's previous best orientation.
+        ``stage`` replaces ``stages[index]`` (a session's copy with another decision
+        threshold).
         """
         return plan_stage(
             index,
-            self.stages[index],
+            self.stages[index] if stage is None else stage,
             pixels,
             geometry,
             space=self.space,
@@ -293,13 +298,45 @@ class Searcher:
             seeds=seeds,
         )
 
-    def session(self, images: Micrograph | SearchImages) -> SearchSession:
-        """A session over one image set (iterate it for per-stage results)."""
-        return SearchSession(self, images)
+    def with_thresholds(
+        self, thresholds: Sequence[float | None] | None
+    ) -> tuple[Stage, ...]:
+        """The stages with their decision thresholds replaced."""
+        if thresholds is None:
+            return self.stages
+        if len(thresholds) != len(self.stages):
+            raise ValueError(
+                f"{len(thresholds)} thresholds for {len(self.stages)} stages"
+            )
+        stages = []
+        for i, (stage, threshold) in enumerate(
+            zip(self.stages, thresholds, strict=True)
+        ):
+            if threshold is not None:
+                if stage.decision is None:
+                    raise ValueError(f"stage {i}: no decision to set a threshold on")
+                decision = replace(stage.decision, threshold=float(threshold))
+                stage = replace(stage, decision=decision)
+            stages.append(stage)
+        return tuple(stages)
 
-    def run(self, images: Micrograph | SearchImages) -> SearchResult:
+    def session(
+        self,
+        images: Micrograph | SearchImages,
+        *,
+        thresholds: Sequence[float | None] | None = None,
+    ) -> SearchSession:
+        """A session over one image set (iterate it for per-stage results)."""
+        return SearchSession(self, images, thresholds=thresholds)
+
+    def run(
+        self,
+        images: Micrograph | SearchImages,
+        *,
+        thresholds: Sequence[float | None] | None = None,
+    ) -> SearchResult:
         """Run every stage over one micrograph (or a plain image stack)."""
-        return self.session(images).run_all()
+        return self.session(images, thresholds=thresholds).run_all()
 
     def run_many(
         self, micrographs: Iterable[Micrograph | SearchImages]
@@ -329,11 +366,16 @@ class SearchSession:
         One micrograph with its noise model (searched as its whitened image under its
         CTF planes, at the positions its ``mask`` allows), or a plain stack for stages
         without a threshold test.
+    thresholds : sequence of float or None, optional
+        Per-stage decision thresholds for this image set (see
+        :meth:`Searcher.with_thresholds`).
 
     Attributes
     ----------
     images : SearchImages
         What the stages search.
+    stages : tuple[Stage, ...]
+        The searcher's stages under this session's thresholds.
     noise : Micrograph or None
         The micrograph's noise model, read by the threshold tests.
     ledger : PixelLedger
@@ -348,7 +390,14 @@ class SearchSession:
         ``(name, time, allocated_bytes)`` marks of every phase (:attr:`marks`).
     """
 
-    def __init__(self, searcher: Searcher, images: Micrograph | SearchImages) -> None:
+    def __init__(
+        self,
+        searcher: Searcher,
+        images: Micrograph | SearchImages,
+        *,
+        thresholds: Sequence[float | None] | None = None,
+    ) -> None:
+        self.stages = searcher.with_thresholds(thresholds)
         noise: Micrograph | None = None
         if isinstance(images, Micrograph):
             noise = images
@@ -431,10 +480,12 @@ class SearchSession:
         self.runner.release()  # the previous stage's features: not counted as in use
         seeds = (
             self._seed_orientations(self.pixels)
-            if self.searcher.stages[index].is_local
+            if self.stages[index].is_local
             else None
         )
-        plan = self.searcher.plan(index, self.pixels, self.geometry, seeds)
+        plan = self.searcher.plan(
+            index, self.pixels, self.geometry, seeds, stage=self.stages[index]
+        )
         run = self.runner.run(plan)
         pixel_index = plan.pixel_index
         self.ledger.write(run.maps, pixel_index, index, plan.hyps)
@@ -482,7 +533,7 @@ class SearchSession:
 
     def __iter__(self) -> Iterator[StageResult]:
         """Run the remaining stages one at a time (stops when no pixel is left)."""
-        stages = self.searcher.stages
+        stages = self.stages
         while self.stage_index < len(stages) and not self._finished:
             if len(self.pixels) == 0:
                 break
@@ -504,7 +555,7 @@ class SearchSession:
         return SearchResult.from_ledger(
             self.ledger,
             self.searcher.space,
-            self.searcher.stages,
+            self.stages,
             stage_results=self.stage_results,
             elapsed_s=self.elapsed_s,
         )

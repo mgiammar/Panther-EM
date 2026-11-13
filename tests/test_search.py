@@ -547,6 +547,48 @@ def test_center_mode_orientation_subset_and_run_many(template):
     assert len(searcher.correlator.loops) == 1  # the loop was reused across image sets
 
 
+def test_session_thresholds_override_the_stages_decisions(template):
+    stages = [
+        Stage.create([(0, 0, 2, 2)], n_psi=16, decision=Decision(1e9, accept=False)),
+        Stage.create([(0, 0, 3, 3)], n_psi=16, decision=Decision(1e9)),
+    ]
+    searcher = Searcher(
+        template, stages, execution=EXEC, featurization=StubFeaturizer()
+    )
+    images = SearchImages.single(torch.zeros(30, 30))
+
+    # the searcher's thresholds reject every pixel in stage 0
+    res = searcher.run(images)
+    assert (res.label == int(PixelLabel.REJECTED)).all()
+    assert [s.decision.threshold for s in res.stages] == [1e9, 1e9]
+
+    # this session's: stage 0 keeps every pixel, stage 1 accepts them
+    session = searcher.session(images, thresholds=[-1e9, -1e9])
+    assert [s.decision.threshold for s in session.stages] == [-1e9, -1e9]
+    res = session.run_all()
+    assert (res.label == int(PixelLabel.ACCEPTED)).all()
+    assert (res.last_stage == 1).all()
+    assert [s.decision.threshold for s in res.stages] == [-1e9, -1e9]
+    assert [s.decision.threshold for s in searcher.stages] == [1e9, 1e9]
+
+    # None keeps a stage's threshold
+    kept = searcher.with_thresholds([None, -1e9])
+    assert kept[0] is stages[0] and kept[1].decision.threshold == -1e9
+    assert kept[1].rectangles == stages[1].rectangles
+    assert searcher.with_thresholds(None) is searcher.stages
+
+    with pytest.raises(ValueError, match="2 stages"):
+        searcher.session(images, thresholds=[1.0])
+    undecided = Searcher(
+        template,
+        [Stage.create([(0, 0, 2, 2)], n_psi=16)],
+        execution=EXEC,
+        featurization=StubFeaturizer(),
+    )
+    with pytest.raises(ValueError, match="no decision"):
+        undecided.run(images, thresholds=[1.0])
+
+
 def test_search_result_round_trip_and_masked_pixels(template, tmp_path):
     stub = StubFeaturizer()
     mask = torch.zeros(11, 11, dtype=torch.bool)

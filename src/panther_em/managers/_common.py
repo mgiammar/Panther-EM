@@ -121,6 +121,28 @@ def read_micrograph(
     return (image - image.mean()).to(device)
 
 
+def read_mask(path: str | Path, shape: tuple[int, int]) -> torch.Tensor:
+    """A micrograph's ``shape`` bool CPU mask: nonzero where a particle may lie.
+
+    Read from an MRC (``.mrc``) or NumPy (``.npy``) file of the micrograph's shape.
+    """
+    path = Path(path)
+    if path.suffix == ".npy":
+        data = np.load(path, allow_pickle=False)
+    elif path.suffix == ".mrc":
+        data = np.asarray(mrcfile.read(str(path)))
+    else:
+        raise ValueError(f"'{path}': a mask is read from a .mrc or .npy file")
+    if data.ndim == 3 and data.shape[0] == 1:
+        data = data[0]
+    if tuple(data.shape) != tuple(shape):
+        raise ValueError(
+            f"'{path}': mask shape {tuple(data.shape)} is not the micrograph's "
+            f"{tuple(shape)}"
+        )
+    return torch.from_numpy(np.asarray(data != 0))
+
+
 def read_volume(path: str | Path) -> np.ndarray:
     """A cubic 3-D MRC volume as float32."""
     data = np.asarray(mrcfile.read(str(path)), dtype=np.float32)
