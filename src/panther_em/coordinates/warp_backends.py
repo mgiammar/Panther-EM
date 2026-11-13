@@ -15,11 +15,13 @@ from typing import Any, Literal
 import numpy as np
 import torch
 from skimage.transform import warp as skimage_warp
+from torch.utils.dlpack import from_dlpack
 
 # Check for CUDA availability
 CUDA_AVAILABLE = torch.cuda.is_available()
 
 # Optional imports for GPU support
+# PEP 810: make this a `lazy import` once requires-python >= 3.15.
 try:
     import cupy as cp
     from cucim.skimage.transform import warp as cucim_warp
@@ -28,7 +30,7 @@ try:
 except ImportError:
     CUCIM_AVAILABLE = False
     cp = None
-    cucim_warp = None
+    cucim_warp = None  # type: ignore[assignment]
 
 # GPU support requires both CUDA and cuCIM
 GPU_TRANSFORM_AVAILABLE = CUDA_AVAILABLE and CUCIM_AVAILABLE
@@ -76,7 +78,7 @@ def warp_numpy(
     np.ndarray
         Warped image.
     """
-    return skimage_warp(
+    warped: np.ndarray = skimage_warp(  # type: ignore[no-untyped-call]
         image,
         coords,
         output_shape=output_shape,
@@ -86,6 +88,7 @@ def warp_numpy(
         clip=clip,
         **kwargs,
     )
+    return warped
 
 
 # ============================================================================
@@ -171,13 +174,24 @@ def warp_torch_cuda(
 
     # Ensure current CUDA device matches tensor device for DLPack interop.
     # Use context manager to avoid changing global state permanently.
+    # cuCIM's vendored map_coordinates interpolates in the image's precision but
+    # keeps the coordinates in theirs: with float64 coordinates on a float32 image the
+    # spline footprint starts at floor(float32(c)) while the weights use c, so a
+    # coordinate within float32 rounding below an integer (values above ~600) gets a
+    # stencil shifted by one sample. Warp in float64 and cast back.
+    source = image.detach()
+    out_dtype = None
+    if source.dtype == torch.float32 and coords.dtype == torch.float64:
+        source = source.to(torch.float64)
+        out_dtype = torch.float32
+
     with torch.cuda.device(device):
         # Convert PyTorch tensors to CuPy arrays (zero-copy via DLPack)
-        image_cp = cp.from_dlpack(image.detach())
+        image_cp = cp.from_dlpack(source)
         coords_cp = cp.from_dlpack(coords.detach())
 
         # Perform warp on GPU using cuCIM
-        warped_cp = cucim_warp(
+        warped_cp = cucim_warp(  # type: ignore[no-untyped-call]
             image_cp,
             coords_cp,
             output_shape=output_shape,
@@ -189,7 +203,9 @@ def warp_torch_cuda(
         )
 
     # Convert back to PyTorch tensor (zero-copy via DLPack)
-    warped_torch = torch.from_dlpack(warped_cp)
+    warped_torch = from_dlpack(warped_cp)
+    if out_dtype is not None:
+        warped_torch = warped_torch.to(out_dtype)
 
     # Ensure output is on the correct device
     if warped_torch.device != device:

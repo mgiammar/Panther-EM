@@ -32,7 +32,7 @@ Derived constants
 ::
 
     t_max = 0.5 * (1 + 2 * c)
-    dt    = t_max / n_r
+    dt = t_max / n_r
 
 ``dt`` is the step size of a uniform parameter ``t`` from which physical radii are
 derived.
@@ -66,11 +66,12 @@ radial step along it::
 
 Radial boundaries of the inverse warp
 --------------------------------------
-The first ring sits at ``t = dt`` so the Cartesian pixels nearest the centre map to
+The first ring sits at ``t = dt`` so the Cartesian pixels nearest the center map to
 ``radius_idx`` in ``[-1, 0)``, outside the polar image. Before the polar -> Cartesian
-warp, :meth:`SpiralPolarTransform._pad_radial_axis` extends both axes.
+warp, :meth:`SpiralPolarTransform.pad_radial_axis` extends both axes.
 """
 
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -126,7 +127,7 @@ def _spiral_geometry(
     return dt, twist_rate
 
 
-def _radius_from_t(t: np.ndarray, max_radius: float, c: float) -> np.ndarray:
+def _radius_from_t(t: np.ndarray | float, max_radius: float, c: float) -> np.ndarray:
     """Physical radius ``r(t) = max_radius * (sqrt(c**2 + 2t) - c)``."""
     return max_radius * (np.sqrt(c**2 + 2 * t) - c)
 
@@ -424,7 +425,7 @@ def jacobian_correction_spiral_polar(
 RADIAL_PAD = 10
 
 
-def _lagrange_weights(nodes: np.ndarray, x: float) -> np.ndarray:
+def _lagrange_weights(nodes: np.ndarray, x: np.ndarray | float) -> np.ndarray:
     """Weights of the Lagrange polynomial through ``nodes``, evaluated at ``x``."""
     weights = np.ones(len(nodes))
     for j, node in enumerate(nodes):
@@ -617,7 +618,7 @@ class SpiralPolarTransform(CoordinateTransform):
             Number of angular samples (spiral arms). Defaults to
             ``round((h * w / num_radius) / spacing_ratio_relative_to_cartesian)``.
         center : tuple[float, float] | None, optional
-            ``(row, col)`` centre. Defaults to image centre.
+            ``(row, col)`` center. Defaults to image center.
         radius : float | None, optional
             Maximum radius in pixels. Defaults to ``height / 2``.
         c : float, optional
@@ -783,7 +784,27 @@ class SpiralPolarTransform(CoordinateTransform):
             )
         return self._continuation_cache[key]
 
-    def _pad_radial_axis(
+    def radial_continuation(
+        self, ks: Sequence[int], device: torch.device | str
+    ) -> torch.Tensor:
+        """``(len(ks), rows, n_nodes)`` complex64 continuation operators ``E_k``."""
+        untwist, nodes, weights, phases = self._continuation_tensors(
+            torch.device("cpu")
+        )
+        k_idx = torch.as_tensor(list(ks), dtype=torch.long)
+        rows, n_nodes = nodes.shape[0], untwist.shape[1]
+        out = torch.zeros((k_idx.numel(), rows, n_nodes), dtype=torch.complex128)
+
+        for j in range(nodes.shape[1]):
+            node = nodes[:, j]  # (rows,)
+            term = (
+                weights[None, :, j] * untwist[k_idx][:, node] * phases[k_idx]
+            )  # (K, rows)
+            out[:, torch.arange(rows), node] += term
+
+        return out.to(torch.complex64).to(device)
+
+    def pad_radial_axis(
         self, image: np.ndarray | torch.Tensor
     ) -> tuple[np.ndarray | torch.Tensor, int]:
         """Continue the radial axis through the origin and mirror it past ``radius``.
@@ -799,7 +820,7 @@ class SpiralPolarTransform(CoordinateTransform):
             The padded image and the number of rows prepended.
         """
         is_numpy = isinstance(image, np.ndarray)
-        f = torch.from_numpy(image) if is_numpy else image
+        f = torch.from_numpy(image) if isinstance(image, np.ndarray) else image
         untwist, nodes, weights, phases = self._continuation_tensors(f.device)
 
         rings = torch.fft.rfft(f[:, : untwist.shape[1]].double(), dim=0) * untwist
@@ -811,7 +832,7 @@ class SpiralPolarTransform(CoordinateTransform):
         padded = torch.cat([inner, f, outer], dim=1)
         return (padded.numpy() if is_numpy else padded), inner.shape[1]
 
-    def _outer_radius_index(self) -> float:
+    def outer_radius_index(self) -> float:
         """``radius_idx`` of ``r = radius``: the last ring (plus rounding slack)."""
         return self.num_radius - 1 + 1e-6
 

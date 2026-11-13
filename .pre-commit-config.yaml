@@ -3,6 +3,7 @@
 # 1. auto fixing pull requests
 # 2. auto updating the pre-commit configuration
 ci:
+  skip: [mypy]  # needs the project environment, which pre-commit.ci does not have
   autoupdate_schedule: monthly
   autofix_commit_msg: "style(pre-commit.ci): auto fixes [...]"
   autoupdate_commit_msg: "ci(pre-commit.ci): autoupdate"
@@ -30,13 +31,13 @@ repos:
       - id: ruff-check
         args: [--fix]  # may also add '--unsafe-fixes'
       - id: ruff-format
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.18.1
+  - repo: local
     hooks:
       - id: mypy
+        name: mypy
+        entry: uv run --no-sync mypy
+        language: system
+        types: [python]
         files: "^src/"
-        # # you have to add the things you want to type check against here
-        # additional_dependencies:
-        #   - numpy
+        require_serial: true
 

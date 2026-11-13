@@ -9,6 +9,7 @@ Covers:
 
 import numpy as np
 import pytest
+import torch
 
 from panther_em.coordinates.offset_polar import (
     OffsetPolarTransform,
@@ -373,6 +374,31 @@ class TestOffsetPolarTransformWarp:
         polar_ep = t.to_transform_space(img, preserve_energy=True, order=1)
         # They should differ (Jacobian is not identically 1)
         assert not np.allclose(polar_no_ep, polar_ep)
+
+
+class TestArrayTypeIsPreserved:
+    """numpy in gives numpy out, and a CPU tensor in gives a CPU tensor out."""
+
+    @pytest.mark.parametrize("batch", [(), (3,)], ids=["single", "batched"])
+    @pytest.mark.parametrize("dtype", [np.float32, np.float64, np.complex64])
+    @pytest.mark.parametrize("method", ["to_transform_space", "to_cartesian"])
+    def test_cpu_tensor_round_trip(self, method, dtype, batch):
+        t = make_transform()
+        shape = IMAGE_SHAPE if method == "to_transform_space" else t.polar_shape
+        rng = np.random.default_rng(0)
+        image = rng.standard_normal((*batch, *shape))
+        if np.issubdtype(dtype, np.complexfloating):
+            image = image + 1j * rng.standard_normal(image.shape)
+        image = image.astype(dtype)
+
+        warp = getattr(t, method)
+        expected = warp(image, preserve_energy=False, order=1)
+        result = warp(torch.from_numpy(image), preserve_energy=False, order=1)
+
+        assert isinstance(expected, np.ndarray)
+        assert isinstance(result, torch.Tensor)
+        assert result.device.type == "cpu"
+        np.testing.assert_array_equal(result.numpy(), expected)
 
 
 # ===========================================================================

@@ -1,0 +1,516 @@
+"""Hypothesis space of the search: defocus x Fourier filter x orientation.
+
+The in-plane angle ``psi`` is never enumerated -- it is recovered by the inverse FFT
+over angular frequency inside the statistics kernels -- so it is not part of the space
+here, only of the *decoding* of a best index.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import cached_property
+from typing import TYPE_CHECKING
+
+import numpy as np
+import torch
+
+from panther_em.orientations import ring_neighborhoods, unique_rows
+
+if TYPE_CHECKING:
+    from panther_em.decomposition.result import DecompositionBase
+
+
+@dataclass(frozen=True, eq=False)
+class HypothesisSpace:
+    """The full ``(defocus, Fourier filter, orientation)`` space.
+
+    Parameters
+    ----------
+    n_defocus, n_filters, n_orientations : int
+        Axis sizes ``D``, ``FF``, ``O``.
+    phi_deg, theta_deg : torch.Tensor, optional
+        ``(O,)`` out-of-plane Euler angles (degrees) from the decomposition.
+    defocus_values : torch.Tensor, optional
+        ``(D,)`` caller-supplied labels for the filter planes (e.g. relative defocus
+        in Angstrom).
+    """
+
+    n_defocus: int
+    n_filters: int
+    n_orientations: int
+    phi_deg: torch.Tensor | None = None
+    theta_deg: torch.Tensor | None = None
+    defocus_values: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        """Validate axis sizes and table shapes."""
+        for name in ("n_defocus", "n_filters", "n_orientations"):
+            if int(getattr(self, name)) < 1:
+                raise ValueError(f"{name} must be >= 1")
+        for name, n in (
+            ("phi_deg", self.n_orientations),
+            ("theta_deg", self.n_orientations),
+            ("defocus_values", self.n_defocus),
+        ):
+            t = getattr(self, name)
+            if t is not None and tuple(t.shape) != (n,):
+                raise ValueError(f"{name} must have shape ({n},), got {tuple(t.shape)}")
+
+    @classmethod
+    def from_result(
+        cls,
+        result: DecompositionBase,
+        n_defocus: int = 1,
+        defocus_values: torch.Tensor | None = None,
+    ) -> HypothesisSpace:
+        """Build the space from a decomposition's filter/orientation axes."""
+        phi = result.phi_values
+        theta = result.theta_values
+        return cls(
+            n_defocus=int(n_defocus),
+            n_filters=int(result.num_fourier_filters),
+            n_orientations=int(result.num_orientations),
+            phi_deg=None if phi is None else torch.as_tensor(phi, dtype=torch.float32),
+            theta_deg=(
+                None if theta is None else torch.as_tensor(theta, dtype=torch.float32)
+            ),
+            defocus_values=(
+                None
+                if defocus_values is None
+                else torch.as_tensor(defocus_values, dtype=torch.float32)
+            ),
+        )
+
+    @property
+    def n_templates(self) -> int:
+        """``FF * O``: template rows of the weight matrix."""
+        return self.n_filters * self.n_orientations
+
+    def decode(
+        self, global_id: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(defocus, filter, orientation)`` of global ids; ``-1`` stays ``-1``."""
+        g = torch.as_tensor(global_id, dtype=torch.long)
+        valid = g >= 0
+        safe = torch.where(valid, g, torch.zeros_like(g))
+        o = safe % self.n_orientations
+        rest = safe // self.n_orientations
+        f = rest % self.n_filters
+        d = rest // self.n_filters
+        neg = torch.full_like(g, -1)
+        return (
+            torch.where(valid, d, neg),
+            torch.where(valid, f, neg),
+            torch.where(valid, o, neg),
+        )
+
+
+def _sorted_unique_ids(
+    ids: torch.Tensor | None, upper: int, name: str
+) -> torch.Tensor | None:
+    if ids is None:
+        return None
+    t = torch.as_tensor(ids, dtype=torch.long).cpu().reshape(-1)
+    if t.numel() == 0:
+        raise ValueError(f"{name} must not be empty")
+    if int(t.min()) < 0 or int(t.max()) >= upper:
+        raise ValueError(
+            f"{name} must lie in [0, {upper}), got range "
+            f"[{int(t.min())}, {int(t.max())}]"
+        )
+    if not bool(torch.all(t[1:] > t[:-1])):
+        t = torch.unique(t)  # sorted + unique
+    return t
+
+
+def template_rows_for(
+    space: HypothesisSpace,
+    orientation_ids: torch.Tensor,
+    filter_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Template rows ``f * O + o`` of the orientations x filters (default: all)."""
+    o = torch.as_tensor(orientation_ids, dtype=torch.long).reshape(-1)
+    f = (
+        torch.arange(space.n_filters)
+        if filter_ids is None
+        else torch.as_tensor(filter_ids, dtype=torch.long).reshape(-1)
+    )
+    return (f[:, None] * space.n_orientations + o[None, :]).reshape(-1)
+
+
+@dataclass(frozen=True)
+class HypBatch:
+    """One contiguous batch of virtual hypothesis ids for one defocus plane.
+
+    Attributes
+    ----------
+    d_local : int
+        Position of the defocus plane within the stage's selected planes.
+    j0, j1 : int
+        Half-open range of selected-template positions.
+    virtual_offset : int
+        ``d_local * N_sel + j0``: the batch's first virtual id, handed to the
+        statistics kernels as the hypothesis offset of the batch.
+    """
+
+    d_local: int
+    j0: int
+    j1: int
+    virtual_offset: int
+
+    @property
+    def size(self) -> int:
+        """Hypotheses in the batch."""
+        return self.j1 - self.j0
+
+
+@dataclass(frozen=True, eq=False)
+class HypothesisSet:
+    """One stage's hypotheses, enumerated into kernel-ready batches.
+
+    Virtual ids run ``d_local * N_sel + j`` over the selected defocus planes (outer)
+    and selected template rows (inner); :meth:`decode` maps them back to global ids
+    ``d * FF * O + template``.
+
+    Parameters
+    ----------
+    space : HypothesisSpace
+        The full space.
+    template_ids : torch.Tensor, optional
+        Rows of the ``FF * O`` weight matrix to search (``None`` = all); kept
+        sorted-unique on the CPU.
+    defocus_ids : torch.Tensor, optional
+        Defocus planes to search (``None`` = all); sorted-unique on the CPU.
+    hyp_batch : int
+        Hypotheses per contraction.
+    n_psi : int
+        In-plane samples recovered per hypothesis.
+    packed_index_bits : int, optional
+        Width of the fused kernel's packed ``(hypothesis, psi)`` index. Every
+        ``(virtual id, psi)`` of the stage must fit it, so
+        ``n_virtual * n_psi < 2 ** packed_index_bits`` (8.4M hypotheses at
+        ``n_psi = 512`` for the default 32); split the CTF planes across stages
+        when a stage would exceed it. Defaults to 32.
+    """
+
+    space: HypothesisSpace
+    template_ids: torch.Tensor | None
+    defocus_ids: torch.Tensor | None
+    hyp_batch: int
+    n_psi: int
+    packed_index_bits: int = 32
+
+    @classmethod
+    def create(
+        cls,
+        space: HypothesisSpace,
+        template_ids: torch.Tensor | None = None,
+        defocus_ids: torch.Tensor | None = None,
+        *,
+        hyp_batch: int,
+        n_psi: int,
+        packed_index_bits: int = 32,
+    ) -> HypothesisSet:
+        """Build a set from raw ids: any int tensor, any device, unsorted, repeated."""
+        return cls(
+            space,
+            _sorted_unique_ids(template_ids, space.n_templates, "template_ids"),
+            _sorted_unique_ids(defocus_ids, space.n_defocus, "defocus_ids"),
+            int(hyp_batch),
+            int(n_psi),
+            int(packed_index_bits),
+        )
+
+    def __post_init__(self) -> None:
+        """Validate (never coerce): ids sorted-unique CPU int64, budget respected."""
+        if self.hyp_batch < 1:
+            raise ValueError("hyp_batch must be >= 1")
+        if self.n_psi < 2:
+            raise ValueError("n_psi must be >= 2")
+        for name, ids, upper in (
+            ("template_ids", self.template_ids, self.space.n_templates),
+            ("defocus_ids", self.defocus_ids, self.space.n_defocus),
+        ):
+            if ids is None:
+                continue
+            normalized = _sorted_unique_ids(ids, upper, name)
+            if (
+                normalized is None
+                or ids.device.type != "cpu"
+                or ids.dtype is not torch.long
+                or not torch.equal(ids, normalized)
+            ):
+                raise ValueError(
+                    f"{name} must be a sorted, unique CPU int64 tensor; build the set "
+                    "with HypothesisSet.create() to normalize raw ids"
+                )
+        limit = 1 << self.packed_index_bits
+        if self.n_virtual * self.n_psi >= limit:
+            raise ValueError(
+                f"{self.n_virtual} hypotheses x {self.n_psi} in-plane angles exceed "
+                f"the kernel's {self.packed_index_bits}-bit packed index; split the "
+                "CTF planes (or the orientations) across stages"
+            )
+
+    @cached_property
+    def batches(self) -> tuple[HypBatch, ...]:
+        """Kernel-ready batches: selected planes outer, template rows inner."""
+        n_sel = self.n_selected
+        return tuple(
+            HypBatch(d_local, j0, min(j0 + self.hyp_batch, n_sel), d_local * n_sel + j0)
+            for d_local in range(self.n_defocus_selected)
+            for j0 in range(0, n_sel, self.hyp_batch)
+        )
+
+    # -- sizes ---------------------------------------------------------------
+
+    @property
+    def n_selected(self) -> int:
+        """Selected template rows ``N_sel``."""
+        return (
+            self.space.n_templates
+            if self.template_ids is None
+            else int(self.template_ids.numel())
+        )
+
+    @property
+    def n_defocus_selected(self) -> int:
+        """Selected defocus planes ``D_sel``."""
+        return (
+            self.space.n_defocus
+            if self.defocus_ids is None
+            else int(self.defocus_ids.numel())
+        )
+
+    @property
+    def n_virtual(self) -> int:
+        """``D_sel * N_sel``: hypotheses the kernels enumerate."""
+        return self.n_defocus_selected * self.n_selected
+
+    @property
+    def n_evaluated(self) -> int:
+        """``(hypothesis, psi)`` pairs per pixel: ``n_virtual * n_psi``."""
+        return self.n_virtual * self.n_psi
+
+    @property
+    def is_contiguous(self) -> bool:
+        """Whether the selected templates are the full ``FF * O`` range."""
+        return self.template_ids is None
+
+    @property
+    def template_signature(self) -> tuple:
+        """Hashable identity of the selected template rows (plane independent).
+
+        Prepared weights and captured hypothesis loops depend on which rows are
+        searched and how they are batched, not on which defocus planes: single-plane
+        passes of a plane-by-plane stage share them.
+        """
+        t = (
+            None
+            if self.template_ids is None
+            else (
+                int(self.template_ids.numel()),
+                int(self.template_ids[0]),
+                int(self.template_ids[-1]),
+                hash(self.template_ids.numpy().tobytes()),
+            )
+        )
+        return (self.space.n_filters, self.space.n_orientations, t)
+
+    @property
+    def signature(self) -> tuple:
+        """Hashable identity for caches (graphs, prepared weights)."""
+        d = None if self.defocus_ids is None else tuple(self.defocus_ids.tolist())
+        return (
+            self.space.n_defocus,
+            *self.template_signature,
+            d,
+            self.hyp_batch,
+            self.n_psi,
+        )
+
+    # -- decoding ------------------------------------------------------------
+
+    def template_rows(self, device: torch.device | str = "cpu") -> torch.Tensor:
+        """``(N_sel,)`` rows of the ``FF * O`` weight matrix used by this plan."""
+        if self.template_ids is None:
+            return torch.arange(self.space.n_templates, device=device)
+        return self.template_ids.to(device)
+
+    def defocus_planes(self) -> tuple[int, ...]:
+        """Global defocus plane indices, in ``d_local`` order."""
+        if self.defocus_ids is None:
+            return tuple(range(self.space.n_defocus))
+        return tuple(int(x) for x in self.defocus_ids.tolist())
+
+    def decode(self, best_virtual: torch.Tensor) -> torch.Tensor:
+        """Map virtual ids to global ids (``-1`` passes through); device ops only."""
+        v = torch.as_tensor(best_virtual, dtype=torch.long)
+        valid = v >= 0
+        safe = torch.where(valid, v, torch.zeros_like(v))
+        n_sel = self.n_selected
+        d_local = safe // n_sel
+        j = safe % n_sel
+        template = j if self.template_ids is None else self.template_ids.to(v.device)[j]
+        d = (
+            d_local
+            if self.defocus_ids is None
+            else self.defocus_ids.to(v.device)[d_local]
+        )
+        g = d * self.space.n_templates + template
+        return torch.where(valid, g, torch.full_like(v, -1))
+
+
+# --------------------------------------------------------------------------- #
+# Local neighborhoods on a HEALPix grid
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, eq=False)
+class LocalHypotheses:
+    """Per-seed orientation neighborhoods of a local stage on its HEALPix grid.
+
+    Attributes
+    ----------
+    cell_of : torch.Tensor
+        ``(O,)`` int64 base cell (group) of each orientation as a seed.
+    rows : torch.Tensor
+        ``(n_cells, W)`` int64 positions in the stage's selected template rows
+        (``HypothesisSet.template_rows()``) of each cell's neighborhood, padded by
+        repeating the first (a repeated hypothesis changes no maximum).
+    counts : torch.Tensor
+        ``(n_cells,)`` distinct template rows of each neighborhood (0 = no
+        orientation of the template lies in it).
+    level : int
+        The stage's HEALPix sampling level (0 = the template's grid).
+    base_level : int
+        Level of the cells seeds are grouped by.
+    rings : int
+        Neighbor rings around the base cell.
+    """
+
+    cell_of: torch.Tensor
+    rows: torch.Tensor
+    counts: torch.Tensor
+    level: int
+    base_level: int
+    rings: int
+
+    @property
+    def width(self) -> int:
+        """``W``: hypotheses per pixel and plane (padded)."""
+        return int(self.rows.shape[1])
+
+    @classmethod
+    def build(
+        cls,
+        space: HypothesisSpace,
+        nside: int,
+        ipix: np.ndarray,
+        *,
+        level: int,
+        seed_level: int,
+        rings: int,
+        template_ids: torch.Tensor | None,
+    ) -> LocalHypotheses:
+        """Neighborhoods of every base cell.
+
+        Parameters
+        ----------
+        space : HypothesisSpace
+            The searcher's space.
+        nside, ipix : int, numpy.ndarray
+            The template's HEALPix grid and its orientations' NESTED pixel ids
+            (:func:`~panther_em.orientations.healpix_ipix`).
+        level : int
+            The local stage's sampling level (its ``orientations``, 0 when ``None``).
+        seed_level : int
+            The sampling level of the stage that found the seeds.
+        rings : int
+            Neighbor rings on the stage's grid.
+        template_ids : torch.Tensor, optional
+            The stage's selected template rows (sorted; ``None`` = all).
+        """
+        if rings < 0 or level < 0 or seed_level < 0:
+            raise ValueError("rings and levels must be >= 0")
+
+        nside_l = int(nside) >> level
+
+        if nside_l < 1 or nside_l << level != int(nside):
+            raise ValueError(f"level {level} is beyond the nside-{nside} grid")
+
+        base = max(level, seed_level)
+
+        if int(nside) >> base < 1:
+            raise ValueError(
+                f"seed level {seed_level} is beyond the nside-{nside} grid"
+            )
+        ipix = np.asarray(ipix, dtype=np.int64)
+        inverse = np.full(12 * int(nside) ** 2, -1, dtype=np.int64)
+        inverse[ipix] = np.arange(ipix.size)
+
+        # every stage-grid pixel's ring neighborhood (padded)
+        ring = ring_neighborhoods(nside_l, rings)
+
+        # a base cell's stage-grid pixels, widened, restricted to the template's
+        children = 4 ** (base - level)
+        n_cells = 12 * (int(nside) >> base) ** 2
+        members = (np.arange(n_cells, dtype=np.int64)[:, None] * children) + np.arange(
+            children, dtype=np.int64
+        )
+        widened = ring[members].reshape(n_cells, -1)
+        orientation = inverse[widened << (2 * level)]
+        orientation, n_orient = unique_rows(orientation)
+
+        # every filter of each orientation, as positions in the stage's rows
+        o_count = space.n_orientations
+        filters = np.arange(space.n_filters, dtype=np.int64)
+        rows = (filters[None, :, None] * o_count + orientation[:, None, :]).reshape(
+            n_cells, -1
+        )
+
+        # the distinct entries first (each filter's block is padded), then padding
+        real = np.arange(orientation.shape[1])[None, :] < n_orient[:, None]
+        real = np.broadcast_to(real[:, None, :], (n_cells, filters.size, real.shape[1]))
+        order = np.argsort(~real.reshape(n_cells, -1), axis=1, kind="stable")
+        rows = np.take_along_axis(rows, order, axis=1)
+        counts = n_orient * space.n_filters
+        rows = np.where(
+            np.arange(rows.shape[1])[None, :] < counts[:, None], rows, rows[:, :1]
+        )
+
+        if template_ids is not None:
+            selected = template_ids.cpu().numpy()
+            pos = np.searchsorted(selected, rows).clip(max=selected.size - 1)
+            ok = selected[pos] == rows
+            if not bool(ok[counts > 0].all()):
+                raise ValueError(
+                    "a neighborhood orientation is missing from the stage's "
+                    "orientations (the stage must sample a whole HEALPix level)"
+                )
+            rows = pos
+
+        rows = np.where(counts[:, None] > 0, rows, 0)
+
+        return cls(
+            cell_of=torch.from_numpy(ipix >> (2 * base)),
+            rows=torch.from_numpy(np.ascontiguousarray(rows)),
+            counts=torch.from_numpy(counts),
+            level=int(level),
+            base_level=int(base),
+            rings=int(rings),
+        )
+
+    def groups(self, seeds: torch.Tensor) -> torch.Tensor:
+        """``(P,)`` base cell of each seed orientation (raises on empty)."""
+        seeds = torch.as_tensor(seeds, dtype=torch.long).cpu()
+
+        if seeds.numel() and int(seeds.min()) < 0:
+            raise ValueError("every pixel of a local stage needs a seed orientation")
+
+        cells = self.cell_of[seeds]
+
+        if cells.numel() and int(self.counts[cells].min()) == 0:
+            raise ValueError("a seed's neighborhood holds no orientation of the stage")
+
+        return cells

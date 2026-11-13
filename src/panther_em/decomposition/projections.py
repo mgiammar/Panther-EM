@@ -36,6 +36,7 @@ from torch_fourier_slice.volume_utils import (
 )
 
 from panther_em.coordinates.transform_base import CoordinateTransform
+from panther_em.coordinates.warp_config import WarpConfig
 
 
 def precompute_volume_dft(
@@ -117,7 +118,7 @@ def project_from_precomputed_dft(
     projections : torch.Tensor
         `(..., d, d)` real-space projections.
     """
-    projections = extract_central_slices_rfft_3d(
+    projections: torch.Tensor = extract_central_slices_rfft_3d(
         volume_rfft=dft,
         rotation_matrices=rotation_matrices,
         fftfreq_max=fftfreq_max,
@@ -171,14 +172,16 @@ def apply_fourier_filters(
     )
 
     # Pathing for complex vs real valued resultant projections
+    filtered: torch.Tensor
     if _is_complex:
         projections_fft = torch.fft.fft2(projections)
         projections_fft = projections_fft[None, ...] * fourier_filters[:, None, :, :]
-        return torch.fft.ifft2(projections_fft)
+        filtered = torch.fft.ifft2(projections_fft)
     else:
         projections_fft = torch.fft.rfft2(projections)
         projections_fft = projections_fft[None, ...] * fourier_filters[:, None, :, :]
-        return torch.fft.irfft2(projections_fft)
+        filtered = torch.fft.irfft2(projections_fft)
+    return filtered
 
 
 def process_batch(
@@ -190,8 +193,9 @@ def process_batch(
     psi: torch.Tensor,
     fourier_filters: torch.Tensor,
     transformer: CoordinateTransform,
-    warp_polar_kwargs: dict,
+    warp: WarpConfig,
     fftfreq_max: float = 0.5,
+    normalize_projections: bool = False,
 ) -> tuple[torch.Tensor, bool, int]:
     """Generate a batch of polar proj. from a DFT, FFT along angular dim.
 
@@ -211,10 +215,13 @@ def process_batch(
         shape is (f, h, w).
     transformer : CoordinateTransform
         Pre-initialized transformer for warping to polar coordinates.
-    warp_polar_kwargs : dict
-        Additional kwargs forwarded to ``transformer.to_transform_space``.
+    warp : WarpConfig
+        Interpolation settings of the warp onto the polar grid.
     fftfreq_max : float
         Maximum frequency in cycles per pixel for Fourier slicing. Default is 0.5.
+    normalize_projections : bool
+        If True, normalize projections to have mean zero and unit variance. Default is
+        False so projections are un-normalized.
 
     Returns
     -------
@@ -240,6 +247,10 @@ def process_batch(
 
     projections_filtered = apply_fourier_filters(projections, fourier_filters)
 
+    if normalize_projections:
+        var, mean = torch.var_mean(projections_filtered, dim=(-2, -1), keepdim=True)
+        projections_filtered = (projections_filtered - mean) / torch.sqrt(var + 1e-8)
+
     # to_transform_space expects a single batch dimension; flatten the two outer dims.
     num_defocus = fourier_filters.shape[0]
     batch_size = phi.shape[0]
@@ -251,7 +262,7 @@ def process_batch(
 
     projections_polar = transformer.to_transform_space(
         projections_filtered_view,
-        **warp_polar_kwargs,
+        **warp.polar_kwargs(),
     )
 
     # NOTE: Pathing here for handling both real- and complex-valued projections
@@ -432,16 +443,17 @@ def do_pipelined_projection_and_transforms(
     psi: torch.Tensor,
     fourier_filters: torch.Tensor | None,
     transformer: CoordinateTransform,
-    warp_polar_kwargs: dict,
+    warp: WarpConfig,
     projection_batch_size: int = 128,
     pad_factor: float = 2.0,
     fftfreq_max: float = 0.5,
+    normalize_projections: bool = False,
     show_progress: bool = True,
     k_max: int | None = None,
     storage_backend: Literal["on_device", "cpu", "mmap"] = "cpu",
     mmap_path: Path | str | None = None,
     device: str | torch.device | None = None,
-) -> tuple[torch.Tensor, bool, int]:
+) -> tuple[torch.Tensor, bool, int, torch.Tensor]:
     """Pipelined generation and transforms of projections in polar coordinates.
 
     Parameters
@@ -453,22 +465,25 @@ def do_pipelined_projection_and_transforms(
     fourier_filters : torch.Tensor | None
         `(f, h, w // 2 + 1)` Fourier-space filters, or None for identity.
     transformer : CoordinateTransform
-        Pre-initialised coordinate transform on the same device as ``volume``.
+        Pre-initialized coordinate transform on the same device as ``volume``.
         Provides the polar-space geometry (``polar_shape``) and the
         ``to_transform_space`` warp method.
-    warp_polar_kwargs : dict
-        Additional kwargs forwarded to ``transformer.to_transform_space``.
+    warp : WarpConfig
+        Interpolation settings of the warp onto the polar grid.
     projection_batch_size : int
         Orientations per GPU batch. Default is 128.
     pad_factor : float
         Volume padding factor for Fourier slicing. Default is 2.0.
     fftfreq_max : float
         Maximum frequency in cycles per pixel. Default is 0.5.
+    normalize_projections : bool
+        If True, normalize projections to have mean zero and unit variance. Default is
+        False so projections are un-normalized.
     show_progress : bool
         Whether to show a tqdm progress bar. Default is True.
     k_max : int | None
         Maximum angular frequency index to store. Only the ``k_max`` lowest-index
-        blocks (real-valued projections) or the ``2 * k_max`` blocks centred on DC
+        blocks (real-valued projections) or the ``2 * k_max`` blocks centered on DC
         (complex-valued) are written to the output buffer. None stores all blocks.
         Default is None.
     storage_backend : {"on_device", "cpu", "mmap"}
@@ -502,6 +517,11 @@ def do_pipelined_projection_and_transforms(
         Whether the projections are complex-valued.
     int
         The resolved ``k_max`` value actually used.
+    torch.Tensor
+        `(num_volumes, num_fourier_filters, num_projections, num_angular_mode)` float64
+        CPU energies (squared norm over the radius) of every angular-frequency block
+        before the ``k_max`` crop, in the stored block order (fft-shifted for complex
+        projections).
     """
     if storage_backend == "mmap" and mmap_path is None:
         raise ValueError("mmap_path must be provided when storage_backend='mmap'")
@@ -541,8 +561,9 @@ def do_pipelined_projection_and_transforms(
         psi=psi[:2],
         fourier_filters=fourier_filters,
         transformer=transformer,
-        warp_polar_kwargs=warp_polar_kwargs,
+        warp=warp,
         fftfreq_max=fftfreq_max,
+        normalize_projections=normalize_projections,
     )
 
     block_index_min, block_index_max, k_max_actual = _compute_freq_crop(
@@ -568,9 +589,15 @@ def do_pipelined_projection_and_transforms(
         output_tensor = torch.empty(buffer_shape, dtype=torch.complex64, device="cpu")
         buffer = _HostStagingBuffer(output_tensor, block_index_min, block_index_max)
     else:  # "mmap"
+        assert mmap_path is not None  # validated at the top of the function
         _mm = np.memmap(mmap_path, dtype=np.complex64, mode="w+", shape=buffer_shape)
         output_tensor = torch.from_numpy(_mm)
         buffer = _HostStagingBuffer(output_tensor, block_index_min, block_index_max)
+
+    block_energy = torch.zeros(
+        (num_volumes, num_filters, num_orientations, num_angular_mode),
+        dtype=torch.float64,
+    )
 
     pbar = None
     if show_progress:
@@ -605,12 +632,19 @@ def do_pipelined_projection_and_transforms(
                 psi=psi[slice_],
                 fourier_filters=fourier_filters,
                 transformer=transformer,
-                warp_polar_kwargs=warp_polar_kwargs,
+                warp=warp,
                 fftfreq_max=fftfreq_max,
+                normalize_projections=normalize_projections,
             )
 
             if is_complex:
-                result = torch.fft.fftshift(result, dim=-3)
+                result = torch.fft.fftshift(result, dim=-2)
+
+            # every block's energy before the crop (the truncation errors' reference)
+            energy = (result.real.square() + result.imag.square()).sum(
+                dim=-1, dtype=torch.float64
+            )
+            block_energy[vol_idx, :, slice_] = energy.cpu()
 
             buffer.write_batch(result, vol_idx, slice_)
             del result
@@ -624,4 +658,4 @@ def do_pipelined_projection_and_transforms(
         pbar.close()
 
     output = buffer.finalize()
-    return output, is_complex, k_max_actual
+    return output, is_complex, k_max_actual, block_energy

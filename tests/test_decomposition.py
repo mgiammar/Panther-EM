@@ -3,24 +3,32 @@
 Covers:
 - _compute_freq_crop: index math for k_max cropping (real and complex modes)
 - precompute_volume_dft: shape, padding, edge-value handling
-- apply_fourier_filters: output shape and identity behaviour
+- apply_fourier_filters: output shape and identity behavior
+- the pipeline's block order (complex: centered on DC) and recorded block energies
 - DecompositionResult: shape validation, index helpers, get_component, get_top_n
 - DecompositionResult save/load round-trip
 """
 
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 import torch
+from scipy.ndimage import gaussian_filter
 
-from panther_em.coordinates.offset_polar import OffsetPolarTransform
-from panther_em.decomposition.pipeline_projections import (
+from panther_em.coordinates.spiral_polar import SpiralPolarTransform
+from panther_em.coordinates.warp_config import WarpConfig
+from panther_em.decomposition import PolarProjectionDecomposer
+from panther_em.decomposition.projections import (
     _compute_freq_crop,
     apply_fourier_filters,
+    do_pipelined_projection_and_transforms,
     precompute_volume_dft,
+    process_batch,
 )
 from panther_em.decomposition.result import (
+    DecompositionBase,
     DecompositionResult,
     SparseDecompositionResult,
 )
@@ -59,7 +67,7 @@ def _make_result(is_complex: bool, num_volumes: int = NUM_VOL) -> DecompositionR
         rng.standard_normal((num_freq_blocks, EIG_MAX, NUM_R)).astype(np.float32)
         + 1j * rng.standard_normal((num_freq_blocks, EIG_MAX, NUM_R)).astype(np.float32)
     ).astype(np.complex64)
-    transform = OffsetPolarTransform.from_image(
+    transform = SpiralPolarTransform.from_image(
         image_shape=(64, 64),
         num_angle=NUM_ANG,
         num_radius=NUM_R,
@@ -272,6 +280,78 @@ class TestApplyFourierFilters:
 # ===========================================================================
 # DecompositionResult — construction and shape validation
 # ===========================================================================
+
+
+class TestPipelineBlockOrder:
+    """The pipeline crops the angular blocks around DC and records their energies."""
+
+    def _case(self, filters):
+        rng = np.random.default_rng(0)
+        volume = torch.from_numpy(
+            gaussian_filter(rng.standard_normal((16,) * 3), 1.5).astype(np.float32)
+        )
+        transform = SpiralPolarTransform.from_image(
+            image_shape=(16, 16), num_angle=16, num_radius=6
+        )
+        phi = torch.tensor([0.0, 40.0, 90.0, 150.0])
+        theta = torch.tensor([10.0, 30.0, 60.0, 80.0])
+        out = do_pipelined_projection_and_transforms(
+            volume[None],
+            phi,
+            theta,
+            torch.zeros(4),
+            filters,
+            transform,
+            WarpConfig(),
+            projection_batch_size=4,
+            k_max=3,
+            show_progress=False,
+        )
+        dft, edge, pad = precompute_volume_dft(volume)
+        singles = [
+            process_batch(
+                dft,
+                edge,
+                pad,
+                phi[i : i + 1],
+                theta[i : i + 1],
+                torch.zeros(1),
+                filters,
+                transform,
+                WarpConfig(),
+            )[0][0, 0]
+            for i in range(4)
+        ]
+        return out, singles
+
+    def test_complex_blocks_centered_on_dc(self):
+        """Complex projections: the blocks [-3, 3) of each orientation, in order."""
+        ramp = torch.exp(1j * torch.linspace(0.0, 1.0, 16))
+        filters = (torch.ones(1, 16, 16) * ramp).to(torch.complex64)
+        (out, is_complex, k_max, energy), singles = self._case(filters)
+        assert is_complex and k_max == 3 and out.shape == (1, 1, 4, 6, 6)
+        for i, single in enumerate(singles):
+            shifted = torch.fft.fftshift(single, dim=0)
+            torch.testing.assert_close(out[0, 0, i], shifted[8 - 3 : 8 + 3])
+            torch.testing.assert_close(
+                energy[0, 0, i],
+                shifted.abs().square().sum(-1).double(),
+                rtol=1e-5,
+                atol=0,
+            )
+
+    def test_real_energies_before_the_crop(self):
+        filters = torch.ones(1, 16, 9, dtype=torch.complex64)
+        (out, is_complex, _, energy), singles = self._case(filters)
+        assert not is_complex and energy.shape == (1, 1, 4, 9)
+        for i, single in enumerate(singles):
+            torch.testing.assert_close(out[0, 0, i], single[:3])
+            torch.testing.assert_close(
+                energy[0, 0, i],
+                single.abs().square().sum(-1).double(),
+                rtol=1e-5,
+                atol=0,
+            )
 
 
 class TestDecompositionResultConstruction:
@@ -595,8 +675,6 @@ class TestDecompositionResultIO:
         """Files saved before the multi-volume axis existed lack the
         ``num_volumes`` attr and store a 4D ``U`` array; loading must default
         to ``num_volumes=1`` and reinsert the leading axis."""
-        import h5py
-
         result = _make_result(is_complex=False, num_volumes=1)
         path = tmp_path / "legacy_result.h5"
         result.save(path)
@@ -609,10 +687,48 @@ class TestDecompositionResultIO:
             del f["U"]
             f.create_dataset("U", data=legacy_U)
 
-        loaded = DecompositionResult.load(path)
-        assert loaded.num_volumes == 1
-        assert loaded.U.shape == (1, NUM_FF, NUM_OR, K_MAX, EIG_MAX)
-        np.testing.assert_array_equal(loaded.U[0], result.U[0])
+        for mmap in (False, True):
+            with DecompositionResult.load(path, mmap=mmap) as loaded:
+                assert loaded.num_volumes == 1
+                assert loaded.U.shape == (1, NUM_FF, NUM_OR, K_MAX, EIG_MAX)
+                np.testing.assert_array_equal(loaded.U[0], result.U[0])
+
+        # the sparse layout's legacy U_data is 3D
+        sparse_path = tmp_path / "legacy_sparse.h5"
+        result.to_sparse(5).save(sparse_path)
+        with h5py.File(sparse_path, "r+") as f:
+            legacy_U = f["U"][()][0]
+            del f["U"]
+            f.create_dataset("U", data=legacy_U)
+        for mmap in (False, True):
+            with SparseDecompositionResult.load(sparse_path, mmap=mmap) as loaded:
+                assert loaded.num_volumes == 1
+                np.testing.assert_array_equal(
+                    loaded.to_dense().U, result.to_sparse(5).to_dense().U
+                )
+
+    def test_warp_config_round_trips_dense_and_sparse(self, tmp_path: Path):
+        warp = WarpConfig(order=3, mode="nearest", preserve_energy=False)
+        result = _make_result(is_complex=False)
+        assert result.warp_config == WarpConfig()
+        result.warp_config = warp
+        result.save(tmp_path / "dense.h5")
+        assert DecompositionResult.load(tmp_path / "dense.h5").warp_config == warp
+
+        sparse = result.to_sparse(5)
+        assert sparse.warp_config == warp
+        assert sparse.to_dense().warp_config == warp
+        sparse.save(tmp_path / "sparse.h5")
+        assert DecompositionBase.load(tmp_path / "sparse.h5").warp_config == warp
+
+    def test_legacy_file_without_warp_config_loads_the_default(self, tmp_path: Path):
+        result = _make_result(is_complex=False)
+        result.warp_config = WarpConfig(order=1)
+        path = tmp_path / "no_warp.h5"
+        result.save(path)
+        with h5py.File(path, "r+") as f:
+            del f.attrs["warp_config"]
+        assert DecompositionResult.load(path).warp_config == WarpConfig()
 
 
 # ===========================================================================
@@ -682,3 +798,104 @@ class TestMultiVolumeShapes:
 
         dense = loaded.to_dense()
         assert dense.U.shape[0] == NUM_VOL
+
+
+class TestDenseAndSparseAreSiblings:
+    """Dense and sparse results share DecompositionBase, not each other."""
+
+    def test_sparse_is_not_a_dense_result(self):
+        sparse = _make_result(is_complex=False).to_sparse(n=5)
+        assert isinstance(sparse, DecompositionBase)
+        assert not isinstance(sparse, DecompositionResult)
+        assert not hasattr(sparse, "U")  # absent, rather than a property that raises
+
+    def test_load_dispatches_on_the_is_sparse_flag(self, tmp_path: Path):
+        result = _make_result(is_complex=False)
+        result.save(tmp_path / "dense.h5")
+        result.to_sparse(n=5).save(tmp_path / "sparse.h5")
+
+        assert (
+            type(DecompositionBase.load(tmp_path / "dense.h5")) is DecompositionResult
+        )
+        loaded = DecompositionBase.load(tmp_path / "sparse.h5")
+        assert type(loaded) is SparseDecompositionResult
+
+    def test_concrete_load_rejects_the_other_kind(self, tmp_path: Path):
+        result = _make_result(is_complex=False)
+        result.save(tmp_path / "dense.h5")
+        result.to_sparse(n=5).save(tmp_path / "sparse.h5")
+
+        with pytest.raises(ValueError, match="contains a sparse result"):
+            DecompositionResult.load(tmp_path / "sparse.h5")
+        with pytest.raises(ValueError, match="contains a dense result"):
+            SparseDecompositionResult.load(tmp_path / "dense.h5")
+
+    def test_sparse_validates_metadata_like_dense(self):
+        result = _make_result(is_complex=False)
+        result.phi_values = np.zeros(NUM_OR + 1)
+        with pytest.raises(ValueError, match="phi_values shape"):
+            result.to_sparse(n=5)
+
+    def test_sparse_rejects_inconsistent_arrays(self):
+        sparse = _make_result(is_complex=False).to_sparse(n=5)
+        with pytest.raises(ValueError, match="inconsistent with selected_indices"):
+            SparseDecompositionResult.from_sparse_arrays(
+                U_data=sparse._U_data[..., :-1],
+                S_data=sparse._S_data,
+                Vh_data=sparse._Vh_data,
+                selected_indices=sparse._selected_indices,
+                k_max=sparse.k_max,
+                eig_max=sparse.eig_max,
+                is_complex_projection=sparse.is_complex_projection,
+                num_fourier_filters=sparse.num_fourier_filters,
+                num_orientations=sparse.num_orientations,
+                num_angular_components=sparse.num_angular_components,
+                num_radial_components=sparse.num_radial_components,
+                num_volumes=sparse.num_volumes,
+            )
+
+
+# ===========================================================================
+# PolarProjectionDecomposer — the recorded warp
+# ===========================================================================
+
+
+def test_decomposer_warps_with_and_records_its_warp_config():
+    rng = np.random.default_rng(0)
+    volume = rng.standard_normal((16, 16, 16)).astype(np.float32)
+    phi = np.array([0.0, 40.0, 80.0], dtype=np.float32)
+    theta = np.array([10.0, 30.0, 50.0], dtype=np.float32)
+    transform = SpiralPolarTransform.from_image(
+        image_shape=(16, 16), num_angle=16, num_radius=6
+    )
+
+    def run(warp):
+        return PolarProjectionDecomposer(
+            volume, phi, theta, coordinate_transform=transform, warp=warp
+        ).do_decomposition(eig_max=3)
+
+    default = run(None)
+    cubic = run(WarpConfig(order=3))
+    assert default.warp_config == WarpConfig()
+    assert cubic.warp_config == WarpConfig(order=3)
+    # the warp is applied, not only recorded
+    assert not np.allclose(default.S, cubic.S)
+
+
+@pytest.mark.parametrize("svd_method", ["dense", "low_rank"])
+def test_decomposer_eig_max_is_bounded_by_the_block_rank(svd_method):
+    """Fewer rows than radii: eig_max defaults to, and may not exceed, the rows."""
+    rng = np.random.default_rng(0)
+    volume = rng.standard_normal((16, 16, 16)).astype(np.float32)
+    phi = np.array([0.0, 40.0, 80.0], dtype=np.float32)
+    theta = np.array([10.0, 30.0, 50.0], dtype=np.float32)
+    transform = SpiralPolarTransform.from_image(
+        image_shape=(16, 16), num_angle=16, num_radius=6
+    )
+    decomposer = PolarProjectionDecomposer(
+        volume, phi, theta, coordinate_transform=transform
+    )
+    result = decomposer.do_decomposition(svd_method=svd_method)
+    assert result.eig_max == 3 and result.U.shape[-1] == 3
+    with pytest.raises(ValueError, match=r"eig_max must be in the range \[1, 3\]"):
+        decomposer.do_decomposition(eig_max=4, svd_method=svd_method)
