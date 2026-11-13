@@ -387,8 +387,8 @@ def build_bases(
         angular = torch.cat([angular[:, -w:], angular, angular[:, :w]], dim=1)
     fa = torch.complex(adjoint.prefilter(angular.real), adjoint.prefilter(angular.imag))
     indices = np.array([(k, m) for k in ks for m in ms], dtype=np.int64)
-    _, _, vh = reconstructor.result.get_svd_tensors(indices, "cpu")
-    c = vh.to(torch.complex128).reshape(kx, mx, -1)
+    vh = reconstructor.result.get_vh(indices[:, 0], indices[:, 1])
+    c = torch.as_tensor(vh).to(torch.complex128).reshape(kx, mx, -1)
     if adjoint.jacobian is not None:
         c = c / adjoint.jacobian
     c_pad = adjoint.pad_radial(c, ks)

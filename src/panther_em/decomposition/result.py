@@ -101,26 +101,37 @@ class DecompositionBase(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def get_component(
-        self,
-        k_idx: int | np.ndarray,
-        eig_idx: int | np.ndarray,
-        return_u: bool = True,
-        return_s: bool = True,
-        return_vh: bool = True,
-    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-        """Retrieve specific components of the SVD.
+    def get_u(self, k_idx: int | np.ndarray, eig_idx: int | np.ndarray) -> np.ndarray:
+        """Left singular vectors of the ``(k_idx, eig_idx)`` pairs.
 
-        Note
-        ----
-        Returns ``(U, S, Vh)`` for the requested ``(k_idx, eig_idx)`` pairs; elements
-        not selected by ``return_u``, ``return_s`` and ``return_vh`` are ``None``.
+        Parameters
+        ----------
+        k_idx : int | np.ndarray
+            Angular-frequency index or indices, shape ``(L,)``. Valid range is
+            ``[-k_max, k_max]``; for real-valued decompositions a negative ``k_idx``
+            gives the complex conjugate of the ``+k`` vectors.
+        eig_idx : int | np.ndarray
+            Radial eigenvalue index or indices, shape ``(L,)``.
 
-        Note
-        ----
-        Optional tuple elements force callers to assert they are not ``None``;
-        separate ``get_u``, ``get_s`` and ``get_vh`` methods are tracked in
-        mgiammar/Panther-EM#9.
+        Returns
+        -------
+        np.ndarray
+            Shape ``(V, FF, O, L)``; ``L == 1`` for scalar indices. Sparse results
+            give zeros for pairs outside the stored set.
+        """
+
+    @abstractmethod
+    def get_s(self, k_idx: int | np.ndarray, eig_idx: int | np.ndarray) -> np.ndarray:
+        """Singular values of the ``(k_idx, eig_idx)`` pairs, shape ``(L,)``.
+
+        Indexing follows :meth:`get_u`.
+        """
+
+    @abstractmethod
+    def get_vh(self, k_idx: int | np.ndarray, eig_idx: int | np.ndarray) -> np.ndarray:
+        """Right singular vectors of the ``(k_idx, eig_idx)`` pairs, shape ``(L, R)``.
+
+        Indexing and conjugation follow :meth:`get_u`.
         """
 
     @abstractmethod
@@ -447,6 +458,27 @@ class DecompositionBase(ABC):
             else (np.asarray(k_idx) < 0)
         )
 
+    def _resolve_pairs(
+        self, k_idx: int | np.ndarray, eig_idx: int | np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return ``(k_stored, eig_idx, conj_mask)`` as 1-D arrays for a query.
+
+        ``k_idx`` and ``eig_idx`` are broadcast against each other, so a scalar
+        ``k_idx`` with an array of ``eig_idx`` selects that row of pairs.
+        """
+        k_idx_arr, eig_arr = np.broadcast_arrays(
+            np.atleast_1d(k_idx), np.atleast_1d(eig_idx)
+        )
+        if k_idx_arr.ndim != 1:
+            raise ValueError(
+                f"k_idx and eig_idx must be scalars or 1-D, got shape {k_idx_arr.shape}"
+            )
+        return (
+            np.asarray(self.k_to_stored(k_idx_arr)),
+            eig_arr,
+            np.asarray(self.is_conjugate_mode(k_idx_arr)),
+        )
+
     def get_svd_tensors(
         self,
         indices: np.ndarray,
@@ -454,9 +486,9 @@ class DecompositionBase(ABC):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Get device-allocated SVD tensors for the given ``(k_idx, eig_idx)`` pairs.
 
-        Delegates to :meth:`get_component` so dense and sparse results both work
-        correctly via polymorphism, including automatic conjugation for negative
-        ``k_idx`` in real-valued decompositions.
+        Built on :meth:`get_u`, :meth:`get_s` and :meth:`get_vh`, so negative
+        ``k_idx`` are conjugated as there. Callers needing only one array should use
+        that getter directly; ``U`` is by far the largest read.
 
         Parameters
         ----------
@@ -476,11 +508,16 @@ class DecompositionBase(ABC):
         """
         k_idx = indices[:, 0]
         eig_idx = indices[:, 1]
-        U_np, S_np, Vh_np = self.get_component(k_idx, eig_idx)
         return (
-            torch.tensor(U_np, dtype=torch.complex64, device=device),
-            torch.tensor(S_np, dtype=torch.float32, device=device),
-            torch.tensor(Vh_np, dtype=torch.complex64, device=device),
+            torch.tensor(
+                self.get_u(k_idx, eig_idx), dtype=torch.complex64, device=device
+            ),
+            torch.tensor(
+                self.get_s(k_idx, eig_idx), dtype=torch.float32, device=device
+            ),
+            torch.tensor(
+                self.get_vh(k_idx, eig_idx), dtype=torch.complex64, device=device
+            ),
         )
 
 
@@ -863,66 +900,27 @@ class DecompositionResult(DecompositionBase):
 
         return self._top_n_cache[cache_key]
 
-    def get_component(
-        self,
-        k_idx: int | np.ndarray,  # shape (l,)
-        eig_idx: int | np.ndarray,  # shape (l,)
-        return_u: bool = True,
-        return_s: bool = True,
-        return_vh: bool = True,
-    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-        """Helper method for retrieving specific components of the SVD.
+    def get_u(self, k_idx: int | np.ndarray, eig_idx: int | np.ndarray) -> np.ndarray:
+        """Left singular vectors, shape ``(V, FF, O, L)``; see the base class."""
+        k_stored, eig_arr, conj_mask = self._resolve_pairs(k_idx, eig_idx)
+        u = _read_paired_last_two_axes(self.U, k_stored, eig_arr)
+        if conj_mask.any():
+            u[..., conj_mask] = u[..., conj_mask].conj()
+        return u
 
-        Parameters
-        ----------
-        k_idx : int | np.ndarray
-            Actual angular-frequency index or indices.  Valid range is
-            ``[0, k_max]`` for real-valued and ``[-k_max, k_max]`` for complex
-            decompositions.
-        eig_idx : int | np.ndarray
-            Eigenvalue index or indices.
-        return_u : bool, optional
-            Whether to return the left singular vectors. Default is True.
-        return_s : bool, optional
-            Whether to return the singular values. Default is True.
-        return_vh : bool, optional
-            Whether to return the right singular vectors. Default is True.
+    def get_s(self, k_idx: int | np.ndarray, eig_idx: int | np.ndarray) -> np.ndarray:
+        """Singular values, shape ``(L,)``; see the base class."""
+        k_stored, eig_arr, _ = self._resolve_pairs(k_idx, eig_idx)
+        s: np.ndarray = self.S[k_stored, eig_arr]
+        return s
 
-        Returns
-        -------
-        tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]
-            A tuple containing the requested components. Elements not selected by
-            (return_u, return_s, return_vh) will be None.
-        """
-        # Must be returning at least one component
-        if not (return_u or return_s or return_vh):
-            raise ValueError(
-                "At least one of return_u, return_s, return_vh must be True."
-            )
-
-        k_idx_arr = np.atleast_1d(k_idx)
-        k_stored = np.atleast_1d(self.k_to_stored(k_idx_arr))
-        eig_idx = np.atleast_1d(eig_idx)
-        conj_mask = np.atleast_1d(self.is_conjugate_mode(k_idx_arr))
-
-        u = None
-        s = None
-        vh = None
-
-        if return_u:
-            u = _read_paired_last_two_axes(self.U, k_stored, eig_idx)
-            if conj_mask.any():
-                u = u.copy()
-                u[..., conj_mask] = u[..., conj_mask].conj()
-        if return_s:
-            s = self.S[k_stored, eig_idx]
-        if return_vh:
-            vh = self.Vh[k_stored, eig_idx]
-            if conj_mask.any():
-                vh = vh.copy()
-                vh[conj_mask] = vh[conj_mask].conj()
-
-        return u, s, vh
+    def get_vh(self, k_idx: int | np.ndarray, eig_idx: int | np.ndarray) -> np.ndarray:
+        """Right singular vectors, shape ``(L, R)``; see the base class."""
+        k_stored, eig_arr, conj_mask = self._resolve_pairs(k_idx, eig_idx)
+        vh: np.ndarray = self.Vh[k_stored, eig_arr]  # fancy index: already a copy
+        if conj_mask.any():
+            vh[conj_mask] = vh[conj_mask].conj()
+        return vh
 
 
 class SparseDecompositionResult(DecompositionBase):
@@ -1172,87 +1170,61 @@ class SparseDecompositionResult(DecompositionBase):
     # Index helpers (override parent to work on compact arrays)
     # ------------------------------------------------------------------
 
-    def get_component(
-        self,
-        k_idx: int | np.ndarray,
-        eig_idx: int | np.ndarray,
-        return_u: bool = True,
-        return_s: bool = True,
-        return_vh: bool = True,
-    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-        """Retrieve specific SVD components from compact storage.
+    def _compact_lookup(
+        self, k_idx: int | np.ndarray, eig_idx: int | np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return ``(compact_indices, found, conj_mask)`` for a query.
 
-        Pairs not present in the stored top-L set are returned as zeros, matching the
-        behavior of the dense result (those entries were truncated to zero when the
-        sparse result was created).
-
-        Parameters
-        ----------
-        k_idx : int | np.ndarray
-            Actual angular-frequency index or indices.
-        eig_idx : int | np.ndarray
-            Eigenvalue index or indices.
-        return_u, return_s, return_vh : bool
-            Which arrays to return; others are ``None``.
-
-        Returns
-        -------
-        tuple[np.ndarray | None, ...]
-            Same shape contract as :meth:`DecompositionResult.get_component`.
+        ``compact_indices`` is ``-1`` (and ``found`` False) for pairs outside the
+        stored top-L set.
         """
-        if not (return_u or return_s or return_vh):
-            raise ValueError(
-                "At least one of return_u, return_s, return_vh must be True."
-            )
-
-        k_idx_arr = np.atleast_1d(k_idx)
-        k_stored = np.atleast_1d(self.k_to_stored(k_idx_arr))
-        eig_idx_arr = np.atleast_1d(eig_idx)
-        conj_mask = np.atleast_1d(self.is_conjugate_mode(k_idx_arr))
-        L_query = len(k_stored)
-
+        k_stored, eig_arr, conj_mask = self._resolve_pairs(k_idx, eig_idx)
         compact_indices = np.array(
             [
                 self._index_map.get((int(k), int(e)), -1)
-                for k, e in zip(k_stored, eig_idx_arr, strict=False)
-            ]
+                for k, e in zip(k_stored, eig_arr, strict=True)
+            ],
+            dtype=np.int64,
         )
-        found = compact_indices >= 0
+        return compact_indices, compact_indices >= 0, conj_mask
 
-        u = None
-        s = None
-        vh = None
+    def get_u(self, k_idx: int | np.ndarray, eig_idx: int | np.ndarray) -> np.ndarray:
+        """Left singular vectors, shape ``(V, FF, O, L)``; see the base class.
 
-        if return_u:
-            u = np.zeros(
-                (
-                    self.num_volumes,
-                    self.num_fourier_filters,
-                    self.num_orientations,
-                    L_query,
-                ),
-                dtype=np.complex64,
-            )
-            if found.any():
-                u[..., found] = _read_fancy_last_axis(
-                    self._U_data, compact_indices[found]
-                )
-            if conj_mask.any():
-                u[..., conj_mask] = u[..., conj_mask].conj()
+        Pairs outside the stored top-L set are zeros, as in the dense result they
+        were truncated from.
+        """
+        compact, found, conj_mask = self._compact_lookup(k_idx, eig_idx)
+        u = np.zeros(
+            (
+                self.num_volumes,
+                self.num_fourier_filters,
+                self.num_orientations,
+                len(compact),
+            ),
+            dtype=np.complex64,
+        )
+        if found.any():
+            u[..., found] = _read_fancy_last_axis(self._U_data, compact[found])
+        if conj_mask.any():
+            u[..., conj_mask] = u[..., conj_mask].conj()
+        return u
 
-        if return_s:
-            s = np.zeros(L_query, dtype=np.float32)
-            if found.any():
-                s[found] = self._S_data[compact_indices[found]]
+    def get_s(self, k_idx: int | np.ndarray, eig_idx: int | np.ndarray) -> np.ndarray:
+        """Singular values, shape ``(L,)``; zeros outside the stored set."""
+        compact, found, _ = self._compact_lookup(k_idx, eig_idx)
+        s = np.zeros(len(compact), dtype=np.float32)
+        s[found] = self._S_data[compact[found]]
+        return s
 
-        if return_vh:
-            vh = np.zeros((L_query, self.num_radial_components), dtype=np.complex64)
-            if found.any():
-                vh[found] = self._Vh_data[compact_indices[found]]
-            if conj_mask.any():
-                vh[conj_mask] = vh[conj_mask].conj()
-
-        return u, s, vh
+    def get_vh(self, k_idx: int | np.ndarray, eig_idx: int | np.ndarray) -> np.ndarray:
+        """Right singular vectors, shape ``(L, R)``; zeros outside the stored set."""
+        compact, found, conj_mask = self._compact_lookup(k_idx, eig_idx)
+        vh = np.zeros((len(compact), self.num_radial_components), dtype=np.complex64)
+        vh[found] = self._Vh_data[compact[found]]
+        if conj_mask.any():
+            vh[conj_mask] = vh[conj_mask].conj()
+        return vh
 
     def get_top_n(self, top_k: int, include_negative: bool = True) -> np.ndarray:
         """Get the top-n pairs from compact storage, ranked by ``|S|``.

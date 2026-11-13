@@ -110,6 +110,12 @@ class Reconstructor:
                 "kernels and the adjoint need real-valued projections"
             )
 
+    def _vh_tensor(self, k: int | np.ndarray, m: int | np.ndarray) -> torch.Tensor:
+        """``(M, R)`` complex64 right singular vectors on :attr:`device` (no ``U``)."""
+        return torch.as_tensor(
+            self.result.get_vh(k, m), dtype=torch.complex64, device=self.device
+        )
+
     # -- basis features --------------------------------------------------------------
 
     def angular_phase_component(self, k: int, phase_shift: float = 0.0) -> torch.Tensor:
@@ -145,7 +151,7 @@ class Reconstructor:
     ) -> torch.Tensor:
         """``(A, R)`` complex polar feature ``a_k (x) Vh_km``."""
         angular = self.angular_phase_component(k, in_plane_rotation)
-        _, _, vh = self.result.get_svd_tensors(np.array([[k, m]]), self.device)
+        vh = self._vh_tensor(k, m)
         return torch.outer(angular, vh[0])
 
     def cartesian_feature(
@@ -290,7 +296,7 @@ class Reconstructor:
             with stream:
                 return self._build_group_separable(k, ms, self._separable)
         indices = np.column_stack([np.full(len(ms), k), np.asarray(ms)])
-        _, _, vh = self.result.get_svd_tensors(indices, self.device)  # (M, R)
+        vh = self._vh_tensor(indices[:, 0], indices[:, 1])  # (M, R)
         angular = self.angular_phase_component(k)  # (A,)
         polar = angular[None, :, None] * vh[:, None, :]  # (M, A, R) complex64
         return self._warp(polar).to(torch.complex64)
@@ -392,7 +398,7 @@ class Reconstructor:
             ang = (filt(a.real), filt(a.imag))  # (A',)
             sep["angular"][k] = ang
         indices = np.column_stack([np.full(len(ms), k), np.asarray(ms)])
-        _, _, vh = self.result.get_svd_tensors(indices, self.device)  # (M, R)
+        vh = self._vh_tensor(indices[:, 0], indices[:, 1])  # (M, R)
         vh = vh.to(torch.complex64)
         if self.warp.preserve_energy and sep["jac"] is not None:
             vh = vh / sep["jac"][None, :]

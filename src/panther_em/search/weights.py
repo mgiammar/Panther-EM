@@ -22,7 +22,7 @@ class WeightSource:
     ----------
     result : DecompositionBase
         Dense or sparse single-volume decomposition (sparse pairs absent from the
-        stored set are zeros, as in :meth:`~DecompositionBase.get_component`).
+        stored set are zeros, as in :meth:`~DecompositionBase.get_u`).
     device : torch.device or str
         Where the weights live.
     cells_union : Rectangle or sequence of Rectangle, optional
@@ -68,10 +68,11 @@ class WeightSource:
                 )
         self.k_start, self.m_start, self.k_stop, self.m_stop = k0, m0, k1, m1
 
-        ks, ms = np.meshgrid(np.arange(k0, k1), np.arange(m0, m1), indexing="ij")
-        u, s, _ = result.get_component(ks.reshape(-1), ms.reshape(-1), return_vh=False)
-        assert u is not None and s is not None
-        us = (u * s[None, None, :]).reshape(
+        k_grid, m_grid = np.meshgrid(
+            np.arange(k0, k1), np.arange(m0, m1), indexing="ij"
+        )
+        ks, ms = k_grid.reshape(-1), m_grid.reshape(-1)
+        us = (result.get_u(ks, ms) * result.get_s(ks, ms)[None, None, :]).reshape(
             self.n_filters * self.n_orientations, k1 - k0, m1 - m0
         )
         self.us: torch.Tensor = torch.as_tensor(us, dtype=torch.complex64).to(

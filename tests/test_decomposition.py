@@ -5,7 +5,8 @@ Covers:
 - precompute_volume_dft: shape, padding, edge-value handling
 - apply_fourier_filters: output shape and identity behavior
 - the pipeline's block order (complex: centered on DC) and recorded block energies
-- DecompositionResult: shape validation, index helpers, get_component, get_top_n
+- DecompositionResult: shape validation, index helpers, get_u/get_s/get_vh,
+  get_top_n
 - DecompositionResult save/load round-trip
 """
 
@@ -517,54 +518,77 @@ class TestIsConjugateMode:
 
 
 # ===========================================================================
-# DecompositionResult — get_component
+# DecompositionBase — get_u / get_s / get_vh
 # ===========================================================================
 
 
-class TestGetComponent:
-    """get_component: retrieves correct shapes and applies conjugation."""
+class TestComponentGetters:
+    """get_u / get_s / get_vh: shapes, conjugation, dense/sparse parity."""
 
-    def test_scalar_indices_real(self):
+    @pytest.mark.parametrize(("is_complex", "k"), [(False, 1), (True, 2)])
+    def test_scalar_indices(self, is_complex: bool, k: int):
+        result = _make_result(is_complex=is_complex)
+        assert result.get_u(k, 0).shape == (NUM_VOL, NUM_FF, NUM_OR, 1)
+        assert result.get_s(k, 0).shape == (1,)
+        assert result.get_vh(k, 0).shape == (1, NUM_R)
+
+    def test_array_indices_match_storage(self):
         result = _make_result(is_complex=False)
-        u, s, vh = result.get_component(k_idx=1, eig_idx=0)
-        assert u.shape == (NUM_VOL, NUM_FF, NUM_OR, 1)
-        assert s.shape == (1,)
-        assert vh.shape == (1, NUM_R)
+        ks, ms = np.array([0, 2, 1]), np.array([1, 0, 2])
+        np.testing.assert_array_equal(result.get_u(ks, ms), result.U[..., ks, ms])
+        np.testing.assert_array_equal(result.get_s(ks, ms), result.S[ks, ms])
+        np.testing.assert_array_equal(result.get_vh(ks, ms), result.Vh[ks, ms])
 
-    def test_scalar_indices_complex(self):
-        result = _make_result(is_complex=True)
-        u, s, vh = result.get_component(k_idx=2, eig_idx=1)
-        assert u.shape == (NUM_VOL, NUM_FF, NUM_OR, 1)
-        assert s.shape == (1,)
-        assert vh.shape == (1, NUM_R)
-
-    def test_return_flags_subset(self):
+    def test_scalar_k_broadcasts_over_eig(self):
         result = _make_result(is_complex=False)
-        u, s, vh = result.get_component(
-            k_idx=1, eig_idx=0, return_u=False, return_s=True, return_vh=False
-        )
-        assert u is None
-        assert s is not None
-        assert vh is None
-
-    def test_all_false_raises(self):
-        result = _make_result(is_complex=False)
-        with pytest.raises(ValueError):
-            result.get_component(
-                k_idx=1, eig_idx=0, return_u=False, return_s=False, return_vh=False
-            )
+        sparse = result.to_sparse(n=K_MAX * EIG_MAX)
+        ms = np.arange(EIG_MAX)
+        for r in (result, sparse):
+            assert r.get_s(1, ms).shape == (EIG_MAX,)
+            np.testing.assert_array_equal(r.get_s(1, ms), result.S[1, ms])
 
     def test_negative_k_conjugates_real(self):
         result = _make_result(is_complex=False)
-        _, _, vh_pos = result.get_component(k_idx=2, eig_idx=0, return_u=False)
-        _, _, vh_neg = result.get_component(k_idx=-2, eig_idx=0, return_u=False)
-        np.testing.assert_array_almost_equal(vh_neg, vh_pos.conj())
+        np.testing.assert_array_equal(result.get_vh(-2, 0), result.get_vh(2, 0).conj())
+        np.testing.assert_array_equal(result.get_u(-2, 0), result.get_u(2, 0).conj())
+        np.testing.assert_array_equal(result.get_s(-2, 0), result.get_s(2, 0))
 
     def test_negative_k_no_conjugate_complex(self):
         result = _make_result(is_complex=True)
-        _, _, vh_neg = result.get_component(k_idx=-2, eig_idx=0, return_u=False)
         k_stored = result.k_to_stored(-2)
-        np.testing.assert_array_equal(vh_neg[0], result.Vh[k_stored, 0])
+        np.testing.assert_array_equal(result.get_vh(-2, 0)[0], result.Vh[k_stored, 0])
+
+    def test_conjugation_does_not_mutate_storage(self):
+        result = _make_result(is_complex=False)
+        u_before, vh_before = result.U.copy(), result.Vh.copy()
+        result.get_u(-2, 0)
+        result.get_vh(-2, 0)
+        np.testing.assert_array_equal(result.U, u_before)
+        np.testing.assert_array_equal(result.Vh, vh_before)
+
+    def test_sparse_matches_dense_including_missing_pairs(self):
+        result = _make_result(is_complex=False)
+        sparse = result.to_sparse(n=5)
+        truncated = sparse.to_dense()
+        # every pair, including negative k and pairs outside the stored top 5
+        ks, ms = np.meshgrid(
+            np.arange(-(K_MAX - 1), K_MAX), np.arange(EIG_MAX), indexing="ij"
+        )
+        ks, ms = ks.reshape(-1), ms.reshape(-1)
+        s = sparse.get_s(ks, ms)
+        assert (s == 0).sum() > 0  # some pairs are outside the stored set
+        np.testing.assert_array_equal(s, truncated.get_s(ks, ms))
+        np.testing.assert_array_equal(sparse.get_u(ks, ms), truncated.get_u(ks, ms))
+        np.testing.assert_array_equal(sparse.get_vh(ks, ms), truncated.get_vh(ks, ms))
+
+    def test_get_svd_tensors_matches_getters(self):
+        result = _make_result(is_complex=False)
+        indices = np.array([[1, 0], [-2, 1]])
+        u, s, vh = result.get_svd_tensors(indices, "cpu")
+        ks, ms = indices[:, 0], indices[:, 1]
+        np.testing.assert_array_equal(u.numpy(), result.get_u(ks, ms))
+        np.testing.assert_array_equal(s.numpy(), result.get_s(ks, ms))
+        np.testing.assert_array_equal(vh.numpy(), result.get_vh(ks, ms))
 
 
 # ===========================================================================
@@ -764,14 +788,14 @@ class TestMultiVolumeShapes:
                 coordinate_transform=None,
             )
 
-    def test_get_component_includes_volume_axis(self):
+    def test_get_u_includes_volume_axis(self):
         result = _make_result(is_complex=False, num_volumes=NUM_VOL)
-        u, _s, _vh = result.get_component(k_idx=1, eig_idx=0)
+        u = result.get_u(k_idx=1, eig_idx=0)
         assert u.shape == (NUM_VOL, NUM_FF, NUM_OR, 1)
 
     def test_volumes_have_independent_left_singular_vectors(self):
         result = _make_result(is_complex=False, num_volumes=NUM_VOL)
-        u, _s, _vh = result.get_component(k_idx=1, eig_idx=0)
+        u = result.get_u(k_idx=1, eig_idx=0)
         # Different volumes were filled with independent random data, so their
         # left-singular-vector slices should differ.
         assert not np.allclose(u[0], u[1])
