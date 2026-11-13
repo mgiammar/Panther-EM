@@ -265,3 +265,19 @@ def test_mask_moves_to_the_cpu(whitening):
     mask = image_mask().cuda()
     gpu = prepare(whitening, device="cuda").with_mask(mask)
     assert gpu.mask.device.type == "cpu" and torch.equal(gpu.mask, mask.cpu())
+
+
+@requires_cuda
+def test_to_moves_image_and_ctf_only(whitening, tmp_path):
+    cpu = prepare(whitening).with_mask(image_mask())
+    gpu = cpu.to("cuda")
+    assert gpu.image.is_cuda and gpu.ctf.is_cuda
+    assert not (gpu.noise.is_cuda or gpu.level.is_cuda or gpu.mask.is_cuda)
+    assert torch.equal(gpu.image.cpu(), cpu.image) and not cpu.image.is_cuda
+    back = gpu.to("cpu")
+    for field in ("image", "ctf", "frequencies", "noise", "signal", "level", "mask"):
+        assert torch.equal(getattr(back, field), getattr(cpu, field))
+
+    cpu.save(tmp_path / "m2.h5")
+    loaded = Micrograph.load(tmp_path / "m2.h5", "cuda")
+    assert loaded.image.is_cuda and loaded.ctf.is_cuda and not loaded.mask.is_cuda

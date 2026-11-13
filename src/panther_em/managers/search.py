@@ -19,6 +19,7 @@ import json
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -224,6 +225,31 @@ def execution_config(spec: dict[str, Any]) -> ExecutionConfig:
     return ExecutionConfig(**fields, tuning=Tuning(**tuning))
 
 
+@dataclass(frozen=True)
+class _Loaded:
+    """A micrograph's host data: its cached :class:`Micrograph` (CPU) or raw image."""
+
+    entry: MicrographEntry
+    data: Micrograph | torch.Tensor
+    mask: torch.Tensor | None
+
+
+def _read(config: SearchConfig, entry: MicrographEntry) -> _Loaded:
+    """Read ``entry``'s cached micrograph, or its MRC, and its mask (host only)."""
+    cached = config.micrograph_path(entry.key)
+    data: Micrograph | torch.Tensor
+    if config.cache_micrographs and cached.exists() and not config.overwrite:
+        data = Micrograph.load(cached)
+        shape = data.image_shape
+    else:
+        data = read_micrograph(entry.path)
+        if config.invert_contrast:
+            data = -data
+        shape = (int(data.shape[0]), int(data.shape[1]))
+    mask = None if entry.mask is None else read_mask(entry.mask, shape)
+    return _Loaded(entry, data, mask)
+
+
 class _Run:
     """The objects one run builds once: template, tables, searchers by image shape."""
 
@@ -282,9 +308,11 @@ class _Run:
             return None
         n_pixels = self.n_searchable(micrograph)
         return [
-            self.threshold(spec, n_pixels)
-            if spec.decision.threshold == "auto"
-            else None
+            (
+                self.threshold(spec, n_pixels)
+                if spec.decision.threshold == "auto"
+                else None
+            )
             for spec in self.config.stages
         ]
 
@@ -327,22 +355,14 @@ class _Run:
             )
         return self.searchers[shape]
 
-    def micrograph(self, entry: MicrographEntry) -> Micrograph:
-        """The prepared micrograph of ``entry`` (from the cache when allowed)."""
-        config, name = self.config, entry.key
-        cached = config.micrograph_path(name)
-        if config.cache_micrographs and cached.exists() and not config.overwrite:
-            micrograph = Micrograph.load(cached, self.device)
-            mask = None
-            if entry.mask is not None:
-                mask = read_mask(entry.mask, micrograph.image_shape)
-            return micrograph.with_mask(mask)
-        raw = read_micrograph(entry.path, self.device)
-        mask = None
-        if entry.mask is not None:
-            mask = read_mask(entry.mask, (int(raw.shape[0]), int(raw.shape[1])))
-        if config.invert_contrast:
-            raw = -raw
+    def prepare(self, loaded: _Loaded) -> Micrograph:
+        """The searched micrograph of a :func:`_read` (device work and the cache)."""
+        config, entry = self.config, loaded.entry
+
+        if isinstance(loaded.data, Micrograph):
+            return loaded.data.to(self.device).with_mask(loaded.mask)
+
+        raw = loaded.data.to(self.device)
         optics = config.optics
         mean = (entry.defocus_u + entry.defocus_v) / 2
         ctf = ctf_planes(
@@ -359,16 +379,27 @@ class _Run:
         )
         micrograph = Micrograph.prepare(
             raw,
-            name,
+            entry.key,
             self.whitening,
             ctf,
             self.tables[config.noise_tag],
             pixel_size=optics.pixel_size,
-            mask=mask,
+            mask=loaded.mask,
         )
+
         if config.cache_micrographs:
-            save_output(micrograph.save, cached, config, micrograph=name)
+            save_output(
+                micrograph.save,
+                config.micrograph_path(entry.key),
+                config,
+                micrograph=entry.key,
+            )
+
         return micrograph
+
+    def micrograph(self, entry: MicrographEntry) -> Micrograph:
+        """The prepared micrograph of ``entry`` (from the cache when allowed)."""
+        return self.prepare(_read(self.config, entry))
 
     def release(self) -> None:
         for searcher in self.searchers.values():
