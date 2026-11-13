@@ -7,7 +7,8 @@ loaded from the cache) and searched, and the
 ``output_dir/<name>_result.h5``, which also holds Leopard-EM's match-template maps
 (:func:`~.leopard.write_match_template_maps`: the file is a Leopard-EM result too). A
 micrograph whose result exists is skipped, so an interrupted run resumes where it
-stopped. ``search_summary.json`` collects each
+stopped. Results are written on a background thread while the next micrograph is
+searched (``pending_writes``). ``search_summary.json`` collects each
 micrograph's label counts.
 """
 
@@ -15,6 +16,8 @@ from __future__ import annotations
 
 import json
 import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -148,6 +151,9 @@ class SearchConfig(ProgramConfig):
         Search (and prepare) again micrographs that already have results.
     keep_stage_results : bool
         Keep each stage's maps in the result files. Default True.
+    pending_writes : int
+        When >=1, the next micrograph is searched while the previous result is written.
+        When 0, results are written before starting the next search. Default 1.
     device : str
         Compute device. Default ``"cpu"``.
     """
@@ -169,6 +175,7 @@ class SearchConfig(ProgramConfig):
     cache_micrographs: bool = True
     overwrite: bool = False
     keep_stage_results: bool = True
+    pending_writes: int = Field(default=1, ge=0)
     device: str = "cpu"
 
     @model_validator(mode="after")
@@ -339,9 +346,11 @@ def _summary(result: SearchResult, timing: dict[str, float]) -> dict:
     """Labels and wall-clock seconds of one micrograph.
 
     ``timing`` holds the manager's steps (``prepare_s``: load, CTF and whitening, or
-    the micrograph cache; ``search_s``; ``save_result_s``; ``leopard_maps_s``); each
-    stage adds its own ``featurize_s``, ``execute_s`` (correlation) and ``other_s``
-    (planning, seeding, ledger write and decision).
+    the micrograph cache; ``search_s``; ``handoff_s``: Leopard-EM maps and the copy
+    to host; then, on the writer thread and overlapping the next search,
+    ``save_result_s`` and ``leopard_maps_s``); each stage adds its own
+    ``featurize_s``, ``execute_s`` (correlation) and ``other_s`` (planning, seeding,
+    ledger write and decision).
     """
     return {
         "elapsed_s": sum(timing.values()),
@@ -366,6 +375,28 @@ def _summary(result: SearchResult, timing: dict[str, float]) -> dict:
     }
 
 
+def _write(
+    config: SearchConfig,
+    name: str,
+    path: Path,
+    result: SearchResult,
+    maps: dict[str, torch.Tensor],
+    timing: dict[str, float],
+) -> tuple[str, Path, dict]:
+    """Write ``result`` and its Leopard-EM ``maps`` to ``path`` (writer thread)."""
+
+    def save(file: Path) -> None:
+        t0 = time.perf_counter()
+        result.save(file)
+        t1 = time.perf_counter()
+        leopard.write_match_template_maps(file, result, maps)
+        timing["save_result_s"] = t1 - t0
+        timing["leopard_maps_s"] = time.perf_counter() - t1
+
+    save_output(save, path, config, micrograph=name)
+    return name, path, _summary(result, timing)
+
+
 def run(config: SearchConfig) -> dict[str, Path]:
     """Search every micrograph without a result; returns each micrograph's result."""
     out = Path(config.output_dir)
@@ -374,39 +405,46 @@ def run(config: SearchConfig) -> dict[str, Path]:
     summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
     done = {}
     state = None
-    try:
-        for entry in config.micrographs:
-            name, path = entry.key, config.result_path(entry.key)
-            if path.exists() and not config.overwrite:
-                done[name] = path
-                continue
-            state = state or _Run(config)
-            timing: dict[str, float] = {}
-            t0 = time.perf_counter()
-            micrograph = state.micrograph(entry)
-            shape = (int(micrograph.image.shape[-2]), int(micrograph.image.shape[-1]))
-            t1 = time.perf_counter()
-            result = state.searcher(shape).run(micrograph)
-            timing["prepare_s"] = t1 - t0
-            timing["search_s"] = time.perf_counter() - t1
+    pending: deque[Future[tuple[str, Path, dict]]] = deque()
 
-            def save(
-                file: Path,
-                result: SearchResult = result,
-                timing: dict[str, float] = timing,
-            ) -> None:
+    def finish(write: Future[tuple[str, Path, dict]]) -> None:
+        name, path, record = write.result()
+        done[name] = path
+        summary[name] = record
+        summary_path.write_text(json.dumps(summary, indent=1))
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="writer") as writer:
+        try:
+            for entry in config.micrographs:
+                name, path = entry.key, config.result_path(entry.key)
+                if path.exists() and not config.overwrite:
+                    done[name] = path
+                    continue
+                state = state or _Run(config)
+                timing: dict[str, float] = {}
                 t0 = time.perf_counter()
-                result.save(file)
+                micrograph = state.micrograph(entry)
+                shape = (
+                    int(micrograph.image.shape[-2]),
+                    int(micrograph.image.shape[-1]),
+                )
                 t1 = time.perf_counter()
-                leopard.write_match_template_maps(file, result)
-                timing["save_result_s"] = t1 - t0
-                timing["leopard_maps_s"] = time.perf_counter() - t1
-
-            done[name] = save_output(save, path, config, micrograph=name)
-            summary[name] = _summary(result, timing)
-            summary_path.write_text(json.dumps(summary, indent=1))
-            del micrograph, result
-    finally:
-        if state is not None:
-            state.release()
+                result = state.searcher(shape).run(micrograph)
+                t2 = time.perf_counter()
+                maps = leopard.match_template_maps(result)  # on the compute device
+                result = result.to("cpu")
+                timing["prepare_s"] = t1 - t0
+                timing["search_s"] = t2 - t1
+                timing["handoff_s"] = time.perf_counter() - t2
+                pending.append(
+                    writer.submit(_write, config, name, path, result, maps, timing)
+                )
+                del micrograph, result, maps
+                while len(pending) > config.pending_writes:
+                    finish(pending.popleft())
+        finally:
+            if state is not None:
+                state.release()
+            while pending:
+                finish(pending.popleft())
     return done

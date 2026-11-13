@@ -192,7 +192,7 @@ def test_search_resumes(pipeline, tmp_path, monkeypatch):
     assert sorted(done) == ["m0", "m1", "m2"]
     # the summary breaks the micrograph's time down by pipeline step
     record = json.loads((tmp_path / "search_summary.json").read_text())["m1"]
-    steps = ("prepare_s", "search_s", "save_result_s", "leopard_maps_s")
+    steps = ("prepare_s", "search_s", "handoff_s", "save_result_s", "leopard_maps_s")
     assert all(record[k] >= 0.0 for k in steps)
     assert record["elapsed_s"] == pytest.approx(sum(record[k] for k in steps))
     for stage in record["stages"]:
@@ -202,6 +202,33 @@ def test_search_resumes(pipeline, tmp_path, monkeypatch):
     again = h5py.File(tmp_path / "m1_result.h5", "r")
     with original, again:
         np.testing.assert_array_equal(original["label"][()], again["label"][()])
+
+
+def test_search_write_error_surfaces_after_pending_writes(
+    pipeline, tmp_path, monkeypatch
+):
+    """A failed background write raises from ``run`` once the other writes finish."""
+    _, out = pipeline
+    config = SearchConfig.from_yaml(out / "search.yaml")
+    for name in ("m0", "m1", "m2"):
+        shutil.copy(out / f"{name}_micrograph.h5", tmp_path / f"{name}_micrograph.h5")
+    config = config.model_copy(update={"output_dir": tmp_path, "pending_writes": 1})
+    write = leopard.write_match_template_maps
+
+    def fails_on_m1(path, result, maps=None):
+        if "m1" in Path(path).name:
+            raise RuntimeError("disk full")
+        write(path, result, maps)
+
+    monkeypatch.setattr(leopard, "write_match_template_maps", fails_on_m1)
+    with pytest.raises(RuntimeError, match="disk full"):
+        search.run(config)
+    assert sorted(p.name for p in tmp_path.glob("*_result.h5")) == [
+        "m0_result.h5",
+        "m2_result.h5",
+    ]
+    summary = json.loads((tmp_path / "search_summary.json").read_text())
+    assert sorted(summary) == ["m0", "m2"]
 
 
 def test_export_stack(pipeline):

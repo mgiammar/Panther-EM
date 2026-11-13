@@ -4,11 +4,16 @@ Every file carries the attributes ``panther_em_format`` (what it holds) and
 ``format_version`` (the layout version of that kind). A loader rejects a file of
 another kind or of a newer version than it reads; files written before the tags
 existed carry neither and load as version 0.
+
+:func:`create_dataset` writes the result maps: integer and boolean arrays (labels,
+indices) are gzip-compressed, float arrays (correlations, angles) are not.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+
+import numpy as np
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -23,6 +28,19 @@ FORMAT_VERSIONS = {
     "search_result": 1,
 }
 """The layout version each kind of file is written with (and the newest read)."""
+
+INTEGER_COMPRESSION = {"compression": "gzip", "compression_opts": 1, "shuffle": True}
+
+
+def create_dataset(
+    group: h5py.Group, name: str, data: np.ndarray | np.generic
+) -> h5py.Dataset:
+    """Write ``data`` as ``group[name]``, compressing integer and boolean arrays."""
+    data = np.asarray(data)
+    compress = data.dtype.kind in "biu" and data.ndim > 0 and data.size > 0
+    return group.create_dataset(
+        name, data=data, **(INTEGER_COMPRESSION if compress else {})
+    )
 
 
 def write_format(f: h5py.File, kind: str) -> None:
