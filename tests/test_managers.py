@@ -6,6 +6,7 @@ in process; the tests reuse its files and configs.
 
 from __future__ import annotations
 
+import gzip
 import importlib.util
 import json
 import shutil
@@ -29,6 +30,7 @@ from leopard_em.pydantic_models.formats import (
 from leopard_em.pydantic_models.results.match_template_result import (
     MatchTemplateResultHDF5,
 )
+from PIL import Image
 from pydantic import ValidationError
 
 from panther_em.cli import main
@@ -217,9 +219,29 @@ def test_read_mask(tmp_path):
         read = read_mask(tmp_path / name, (3, 4))
         assert read.dtype is torch.bool and read.device.type == "cpu"
         assert torch.nonzero(read).tolist() == [[1, 2]]
+    # PNG: 1-bit, 8-bit gray, 16-bit gray, palette and RGB, plain or gzipped
+    gray = (mask * 255).astype(np.uint8)
+    pngs = {
+        "1": Image.fromarray(gray).convert("1"),
+        "L": Image.fromarray(gray),
+        "I;16": Image.fromarray(mask.astype(np.uint16) * 1000),
+        "P": Image.fromarray(gray).convert("P"),
+        "RGB": Image.fromarray(gray).convert("RGB"),
+    }
+    for mode, image in pngs.items():
+        assert image.mode == mode
+        image.save(tmp_path / f"{mode}.png", optimize=True)
+        with gzip.open(tmp_path / f"{mode}.png.gz", "wb") as f:
+            image.save(f, format="PNG")
+        for name in (f"{mode}.png", f"{mode}.png.gz"):
+            read = read_mask(tmp_path / name, (3, 4))
+            assert read.dtype is torch.bool, name
+            assert torch.nonzero(read).tolist() == [[1, 2]], name
+    with pytest.raises(ValueError, match="micrograph's"):
+        read_mask(tmp_path / "L.png", (4, 3))
     with pytest.raises(ValueError, match="micrograph's"):
         read_mask(tmp_path / "m.npy", (4, 3))
-    with pytest.raises(ValueError, match=r"\.mrc or \.npy"):
+    with pytest.raises(ValueError, match=r"\.png\.gz file"):
         read_mask(tmp_path / "m.txt", (3, 4))
 
 
