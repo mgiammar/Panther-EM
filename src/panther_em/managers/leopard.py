@@ -125,9 +125,14 @@ def match_template_maps(result: SearchResult) -> dict[str, torch.Tensor]:
     return out
 
 
-def write_match_template_maps(path: str | Path, result: SearchResult) -> None:
+def write_match_template_maps(
+    path: str | Path,
+    result: SearchResult,
+    maps: dict[str, torch.Tensor] | None = None,
+) -> None:
     """Add Leopard-EM's match-template maps and attributes to the file at ``path``."""
-    maps = match_template_maps(result)
+    if maps is None:
+        maps = match_template_maps(result)
     n_psi = max(result.n_psi_of_stage)
     space = result.space
     with h5py.File(path, "a") as f:
