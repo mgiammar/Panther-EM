@@ -82,6 +82,38 @@ def test_geometry_center_mode_by_box_size_and_override():
         SearchGeometry.from_images(SearchImages.single(torch.zeros(10, 10)), (20, 20))
 
 
+@pytest.mark.parametrize("box", [(11, 11), (10, 7)])
+def test_grid_mask_crops_an_image_mask_to_box_centers(box):
+    geo = SearchGeometry.from_images(SearchImages.single(torch.zeros(30, 32)), box)
+    out_h, out_w = geo.grid
+    for r, c in [(0, 0), (3, 5), (out_h - 1, out_w - 1)]:
+        image_mask = torch.zeros(30, 32, dtype=torch.bool)
+        image_mask[r + box[0] // 2, c + box[1] // 2] = True
+        grid = geo.grid_mask(image_mask)
+        assert grid.shape == geo.grid
+        assert torch.nonzero(grid).tolist() == [[r, c]]
+    # centers within half a box of the edge have no position
+    edge = torch.zeros(30, 32, dtype=torch.bool)
+    edge[: box[0] // 2] = True
+    edge[:, : box[1] // 2] = True
+    assert not geo.grid_mask(edge).any()
+
+    with pytest.raises(ValueError, match="image shape"):
+        geo.grid_mask(torch.ones(*geo.grid, dtype=torch.bool))
+    with pytest.raises(ValueError, match="bool"):
+        geo.grid_mask(torch.ones(30, 32))
+
+
+def test_grid_mask_in_center_mode_reads_the_box_center():
+    geo = SearchGeometry.from_images(
+        SearchImages.single(torch.zeros(24, 24), center_only=True), (20, 20)
+    )
+    image_mask = torch.zeros(24, 24, dtype=torch.bool)
+    assert geo.grid_mask(image_mask).tolist() == [False]
+    image_mask[2 + 10, 2 + 10] = True  # (24 - 20) // 2 + 20 // 2
+    assert geo.grid_mask(image_mask).tolist() == [True]
+
+
 def test_pixel_selection_all_subset_scatter():
     geo = SearchGeometry.from_images(
         SearchImages.from_stack(torch.zeros(2, 30, 30)), (20, 20)

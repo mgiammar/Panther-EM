@@ -6,6 +6,7 @@ in process; the tests reuse its files and configs.
 
 from __future__ import annotations
 
+import gzip
 import importlib.util
 import json
 import shutil
@@ -29,6 +30,7 @@ from leopard_em.pydantic_models.formats import (
 from leopard_em.pydantic_models.results.match_template_result import (
     MatchTemplateResultHDF5,
 )
+from PIL import Image
 from pydantic import ValidationError
 
 from panther_em.cli import main
@@ -44,6 +46,7 @@ from panther_em.managers import (
 )
 from panther_em.managers._common import (
     read_config,
+    read_mask,
     read_micrograph,
     read_volume,
     save_output,
@@ -54,6 +57,7 @@ from panther_em.search import (
     PixelLabel,
     Searcher,
     SearchResult,
+    zscore_threshold,
 )
 from panther_em.search.correlation.contraction import BatchShape
 
@@ -182,7 +186,9 @@ def test_search_resumes(pipeline, tmp_path, monkeypatch):
     searched = []
     run = Searcher.run
     monkeypatch.setattr(
-        Searcher, "run", lambda self, m: searched.append(m.name) or run(self, m)
+        Searcher,
+        "run",
+        lambda self, m, **kw: searched.append(m.name) or run(self, m, **kw),
     )
     monkeypatch.setattr(  # the cached micrograph is reused, not prepared again
         Micrograph, "prepare", classmethod(lambda *a, **k: pytest.fail("prepared"))
@@ -202,6 +208,125 @@ def test_search_resumes(pipeline, tmp_path, monkeypatch):
     again = h5py.File(tmp_path / "m1_result.h5", "r")
     with original, again:
         np.testing.assert_array_equal(original["label"][()], again["label"][()])
+
+
+def test_read_mask(tmp_path):
+    mask = np.zeros((3, 4), dtype=np.float32)
+    mask[1, 2] = 1.0
+    mrcfile.write(str(tmp_path / "m.mrc"), mask[None])
+    np.save(tmp_path / "m.npy", mask.astype(np.uint8))
+    for name in ("m.mrc", "m.npy"):
+        read = read_mask(tmp_path / name, (3, 4))
+        assert read.dtype is torch.bool and read.device.type == "cpu"
+        assert torch.nonzero(read).tolist() == [[1, 2]]
+    # PNG: 1-bit, 8-bit gray, 16-bit gray, palette and RGB, plain or gzipped
+    gray = (mask * 255).astype(np.uint8)
+    pngs = {
+        "1": Image.fromarray(gray).convert("1"),
+        "L": Image.fromarray(gray),
+        "I;16": Image.fromarray(mask.astype(np.uint16) * 1000),
+        "P": Image.fromarray(gray).convert("P"),
+        "RGB": Image.fromarray(gray).convert("RGB"),
+    }
+    for mode, image in pngs.items():
+        assert image.mode == mode
+        image.save(tmp_path / f"{mode}.png", optimize=True)
+        with gzip.open(tmp_path / f"{mode}.png.gz", "wb") as f:
+            image.save(f, format="PNG")
+        for name in (f"{mode}.png", f"{mode}.png.gz"):
+            read = read_mask(tmp_path / name, (3, 4))
+            assert read.dtype is torch.bool, name
+            assert torch.nonzero(read).tolist() == [[1, 2]], name
+    with pytest.raises(ValueError, match="micrograph's"):
+        read_mask(tmp_path / "L.png", (4, 3))
+    with pytest.raises(ValueError, match="micrograph's"):
+        read_mask(tmp_path / "m.npy", (4, 3))
+    with pytest.raises(ValueError, match=r"\.png\.gz file"):
+        read_mask(tmp_path / "m.txt", (3, 4))
+
+
+def masked_search(pipeline, tmp_path):
+    """The pipeline's search with m0 under a partial mask and m1 fully masked."""
+    module, out = pipeline
+    config = SearchConfig.from_yaml(out / "search.yaml")
+    for name in ("m0", "m1", "m2"):
+        shutil.copy(out / f"{name}_micrograph.h5", tmp_path / f"{name}_micrograph.h5")
+    shape = (module.MICROGRAPH, module.MICROGRAPH)
+    image_mask = np.zeros(shape, dtype=np.float32)
+    image_mask[:60, :70] = 1.0  # keeps the planted particle's box center
+    mrcfile.write(str(tmp_path / "m0_mask.mrc"), image_mask)
+    np.save(tmp_path / "m1_mask.npy", np.zeros(shape, dtype=bool))
+    entries = [
+        entry.model_copy(update={"mask": mask})
+        for entry, mask in zip(
+            config.micrographs,
+            [tmp_path / "m0_mask.mrc", tmp_path / "m1_mask.npy", None],
+            strict=True,
+        )
+    ]
+    config = config.model_copy(update={"output_dir": tmp_path, "micrographs": entries})
+    return config, torch.from_numpy(image_mask != 0)
+
+
+def test_masked_search(pipeline, tmp_path):
+    """Only positions under a micrograph's mask are searched; the auto threshold
+    counts only them; a fully masked micrograph is skipped."""
+    module, _ = pipeline
+    config, image_mask = masked_search(pipeline, tmp_path)
+    done = search.run(config)
+    assert sorted(done) == ["m0", "m2"]
+    assert not (tmp_path / "m1_result.h5").exists()
+
+    result = SearchResult.load(tmp_path / "m0_result.h5")
+    grid = result.geometry.grid_mask(image_mask)
+    assert torch.equal(result.label[0] == int(PixelLabel.MASKED), ~grid)
+    assert (result.last_stage[0][~grid] == -1).all()
+    assert (result.last_stage[0][grid] >= 0).all()
+
+    summary = json.loads((tmp_path / "search_summary.json").read_text())
+    n_searchable = int(grid.sum())
+    n_hypotheses = 2 * 12 * module.N_PSI
+    m0, m1, m2 = summary["m0"], summary["m1"], summary["m2"]
+    assert m0["mask"] == str(tmp_path / "m0_mask.mrc")
+    assert m0["n_searchable"] == n_searchable < grid.numel()
+    assert m0["final"]["MASKED"] == grid.numel() - n_searchable
+    assert m0["thresholds"] == pytest.approx(
+        [zscore_threshold(n_searchable, n_hypotheses)] * 2
+    )
+    assert m2["mask"] is None and m2["n_searchable"] == grid.numel()
+    assert m2["thresholds"] == pytest.approx(
+        [zscore_threshold(grid.numel(), n_hypotheses)] * 2
+    )
+    assert m0["thresholds"][0] < m2["thresholds"][0]
+    assert m1["n_searchable"] == 0 and "skipped" in m1
+
+    # Leopard-EM: masked positions are padded, never picked, and not in the scale
+    maps = leopard.match_template_maps(result)
+    assert bool((maps["scaled_mip"][~grid] == 0).all())
+    assert bool((maps["correlation_variance"][~grid] == LARGE_STD_PADDING).all())
+    std = result.variance[0].double().clamp_min(0.0).sqrt()
+    assert leopard.correlation_scale(result) == pytest.approx(float(std[grid].median()))
+    pos_y, pos_x = leopard.pick_particles(result, radius=10.0)
+    assert len(pos_y) > 0 and grid[pos_y, pos_x].all()
+    assert (int(pos_y[0]), int(pos_x[0])) == module.PARTICLE["top_left"]
+
+
+def test_masked_search_mask_overrides_the_cache(pipeline, tmp_path):
+    """The entry's mask replaces a cached micrograph's, or drops it."""
+    config, image_mask = masked_search(pipeline, tmp_path)
+    m0, _, m2 = config.micrographs
+    state = search._Run(config)
+    # m2 cached with a mask, but its entry has none
+    cached = Micrograph.load(tmp_path / "m2_micrograph.h5").with_mask(~image_mask)
+    cached.save(tmp_path / "m2_micrograph.h5")
+    assert state.micrograph(m2).mask is None
+    # m0 cached without a mask, its entry has one
+    assert torch.equal(state.micrograph(m0).mask, image_mask)
+    # prepared afresh, the cache records the entry's mask
+    fresh = config.model_copy(update={"overwrite": True})
+    prepared = search._Run(fresh).micrograph(m0)
+    assert torch.equal(prepared.mask, image_mask)
+    assert torch.equal(Micrograph.load(tmp_path / "m0_micrograph.h5").mask, image_mask)
 
 
 def test_search_write_error_surfaces_after_pending_writes(

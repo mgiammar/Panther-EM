@@ -224,3 +224,44 @@ def test_save_and_load_round_trip(whitening, tmp_path):
     for field in ("image", "ctf", "frequencies", "noise", "signal", "level"):
         got, want = getattr(loaded, field), getattr(prepared, field)
         assert got.dtype == want.dtype and torch.equal(got, want.cpu())
+    assert loaded.mask is None
+
+
+def image_mask(seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    return torch.rand(SHAPE, generator=generator) > 0.3
+
+
+def test_mask_is_kept_validated_and_saved(whitening, tmp_path):
+    mask = image_mask()
+    raw = dict(micrographs())["m2"]
+    table = error_table(whitening)
+    masked = Micrograph.prepare(
+        raw, "m2", whitening, ctf_planes(SHAPE), table, pixel_size=PIXEL_SIZE, mask=mask
+    )
+    assert torch.equal(masked.mask, mask)
+    # the noise model does not read the mask
+    plain = prepare(whitening)
+    for field in ("image", "noise", "signal", "level"):
+        assert torch.equal(getattr(masked, field), getattr(plain, field))
+
+    other = image_mask(1)
+    replaced = masked.with_mask(other)
+    assert torch.equal(replaced.mask, other) and torch.equal(masked.mask, mask)
+    assert replaced.with_mask(None).mask is None
+
+    masked.save(tmp_path / "m2.h5")
+    loaded = Micrograph.load(tmp_path / "m2.h5")
+    assert loaded.mask.dtype is torch.bool and torch.equal(loaded.mask, mask)
+
+    with pytest.raises(ValueError, match="mask must be"):
+        plain.with_mask(mask[:, :-1])
+    with pytest.raises(ValueError, match="mask must be"):
+        plain.with_mask(mask.to(torch.uint8))
+
+
+@requires_cuda
+def test_mask_moves_to_the_cpu(whitening):
+    mask = image_mask().cuda()
+    gpu = prepare(whitening, device="cuda").with_mask(mask)
+    assert gpu.mask.device.type == "cpu" and torch.equal(gpu.mask, mask.cpu())

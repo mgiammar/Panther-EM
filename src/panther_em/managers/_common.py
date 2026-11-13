@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gzip
+import io
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, ClassVar, Self, TypeVar
 
@@ -10,6 +12,7 @@ import mrcfile
 import numpy as np
 import torch
 import yaml
+from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 
 if TYPE_CHECKING:
@@ -119,6 +122,40 @@ def read_micrograph(
         raise ValueError(f"'{path}' is not a 2-D image: shape {data.shape}")
     image = torch.from_numpy(data.copy())
     return (image - image.mean()).to(device)
+
+
+def read_mask(path: str | Path, shape: tuple[int, int]) -> torch.Tensor:
+    """A micrograph's ``shape`` bool CPU mask: nonzero where a particle may lie.
+
+    Read from an MRC (``.mrc``), NumPy (``.npy``), PNG (``.png``, any bit depth or
+    color mode, nonzero in grayscale) or gzipped PNG (``.png.gz``) file of the
+    micrograph's shape. Rows are taken as stored (a PNG's first row is the
+    micrograph array's first row).
+    """
+    path = Path(path)
+    name = path.name.lower()
+    if name.endswith(".npy"):
+        data = np.load(path, allow_pickle=False)
+    elif name.endswith(".mrc"):
+        data = np.asarray(mrcfile.read(str(path)))
+    elif name.endswith(".png"):
+        with Image.open(path) as image:
+            data = np.asarray(image.convert("L"))
+    elif name.endswith(".png.gz"):
+        with Image.open(io.BytesIO(gzip.decompress(path.read_bytes()))) as image:
+            data = np.asarray(image.convert("L"))
+    else:
+        raise ValueError(
+            f"'{path}': a mask is read from a .mrc, .npy, .png or .png.gz file"
+        )
+    if data.ndim == 3 and data.shape[0] == 1:
+        data = data[0]
+    if tuple(data.shape) != tuple(shape):
+        raise ValueError(
+            f"'{path}': mask shape {tuple(data.shape)} is not the micrograph's "
+            f"{tuple(shape)}"
+        )
+    return torch.from_numpy(np.asarray(data != 0))
 
 
 def read_volume(path: str | Path) -> np.ndarray:
