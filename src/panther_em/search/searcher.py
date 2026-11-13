@@ -327,7 +327,8 @@ class SearchSession:
         The template, stages and shared resources.
     images : Micrograph or SearchImages
         One micrograph with its noise model (searched as its whitened image under its
-        CTF planes), or a plain stack for stages without a threshold test.
+        CTF planes, at the positions its ``mask`` allows), or a plain stack for stages
+        without a threshold test.
 
     Attributes
     ----------
@@ -352,6 +353,13 @@ class SearchSession:
         if isinstance(images, Micrograph):
             noise = images
             images = SearchImages.single(noise.image, filters=noise.ctf)
+            if noise.mask is not None:
+                geometry = SearchGeometry.from_images(
+                    images, searcher.template.template_shape
+                )
+                images = SearchImages.single(
+                    noise.image, filters=noise.ctf, mask=geometry.grid_mask(noise.mask)
+                )
         if images.n_defocus != searcher.space.n_defocus:
             raise ValueError(
                 f"image set carries {images.n_defocus} defocus plane(s); the searcher "

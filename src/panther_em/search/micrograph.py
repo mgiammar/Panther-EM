@@ -7,17 +7,19 @@
 - ``level (H, W)``: the relative local noise level, the mean over the template's
   support disk at every pixel of the image flattened by its own noise curve inside
   the band (mean 1).
+- ``mask (H, W)``: optional, the pixels a particle center may lie on; only those
+  are searched.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import h5py
 import torch
 
-from panther_em._hdf5 import check_format, write_format
+from panther_em._hdf5 import check_format, create_dataset, write_format
 from panther_em.filters.curves import curve_to_grid
 
 if TYPE_CHECKING:
@@ -81,6 +83,12 @@ class Micrograph:
         ``(H, W)`` float32 CPU relative noise level (mean 1).
     pixel_size : float
         Angstrom per pixel, for the B-factor envelope of the signal weight.
+    mask : torch.Tensor, optional
+        ``(H, W)`` bool CPU mask in image coordinates: ``True`` where a particle center
+        may lie. Only those pixels are searched (the search grid's position ``(r, c)``
+        is the box centered on image pixel ``(r + kH // 2, c + kW // 2)``). THe other
+        positions are labeled ``MASKED``. ``None`` (default) searches every position.
+        A mask over search positions instead of image pixels may be supported later.
     """
 
     name: str
@@ -91,6 +99,7 @@ class Micrograph:
     signal: torch.Tensor
     level: torch.Tensor
     pixel_size: float
+    mask: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         """Validate (never coerce); see :meth:`prepare`."""
@@ -145,6 +154,14 @@ class Micrograph:
         if not self.pixel_size > 0.0:
             raise ValueError("pixel_size must be positive")
 
+        m = self.mask
+        if m is not None and (
+            tuple(m.shape) != (h, w)
+            or m.dtype is not torch.bool
+            or m.device.type != "cpu"
+        ):
+            raise ValueError(f"mask must be a bool CPU {(h, w)} tensor")
+
     @classmethod
     def prepare(
         cls,
@@ -155,6 +172,7 @@ class Micrograph:
         table: PerSpatialFrequencyErrorTable,
         *,
         pixel_size: float,
+        mask: torch.Tensor | None = None,
     ) -> Micrograph:
         """Whiten one micrograph and estimate its noise-model curves and level map.
 
@@ -174,6 +192,8 @@ class Micrograph:
             the curves, its support disk the level map.
         pixel_size : float
             Angstrom per pixel.
+        mask : torch.Tensor, optional
+            ``(H, W)`` bool mask for pixels with a valid a particle center.
 
         Returns
         -------
@@ -232,7 +252,21 @@ class Micrograph:
         image_noise = ring_mean(power) / float(h * w)  # the unfiltered image's curve
         level = _level_map(spectrum, image_noise, freq, table.support, whitening, shape)
 
-        return cls(str(name), image, ctf, freq, noise, signal, level, float(pixel_size))
+        return cls(
+            str(name),
+            image,
+            ctf,
+            freq,
+            noise,
+            signal,
+            level,
+            float(pixel_size),
+            mask=None if mask is None else mask.to("cpu"),
+        )
+
+    def with_mask(self, mask: torch.Tensor | None) -> Micrograph:
+        """A copy searched under ``mask`` (``(H, W)`` bool, moved to the CPU)."""
+        return replace(self, mask=None if mask is None else mask.to("cpu"))
 
     # -- sizes -----------------------------------------------------------------
 
@@ -261,6 +295,8 @@ class Micrograph:
             f.attrs["pixel_size"] = self.pixel_size
             for field in ("image", "ctf", "frequencies", "noise", "signal", "level"):
                 f[field] = getattr(self, field).cpu().numpy()
+            if self.mask is not None:
+                create_dataset(f, "mask", self.mask.numpy())
 
     @classmethod
     def load(cls, path: str | Path, device: torch.device | str = "cpu") -> Micrograph:
@@ -281,6 +317,7 @@ class Micrograph:
                 signal=read("signal"),
                 level=read("level"),
                 pixel_size=float(f.attrs["pixel_size"]),
+                mask=read("mask") if "mask" in f else None,
             )
 
 

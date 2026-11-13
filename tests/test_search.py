@@ -463,6 +463,60 @@ def test_two_stage_search_under_the_threshold_test(tmp_path):
     assert loaded.stages[1].decision.test is None  # tests are not restored
 
 
+@pytest.mark.parametrize("mode", ["fft", "direct"])
+def test_micrograph_mask_limits_every_stage_to_its_pixels(mode):
+    """Only positions whose box center lies under the micrograph's mask are searched,
+    in every stage, and they score as in the unmasked search."""
+    case = noise_case()
+    rects = [(0, 0, 2, 3)]
+    table = case.table(rects)
+    images = case.images(table)
+    image_mask = torch.zeros(images.image_shape, dtype=torch.bool)
+    image_mask[20:70, 30:80] = True
+    image_mask[40:50, 40:50] = False  # a hole
+    masked = images.with_mask(image_mask)
+    execution = replace(EXEC, featurize_mode=mode)
+
+    def searcher(stages, **kwargs):
+        return Searcher(
+            case.template, stages, execution=execution, n_defocus=3, **kwargs
+        )
+
+    plain = [Stage.create(rects, n_psi=16)]
+    full = searcher(plain).run(images)
+    session = searcher(plain).session(masked)
+    grid = session.geometry.grid_mask(image_mask)
+    assert torch.equal(session.images.mask, grid) and session.noise is masked
+    one = session.run_all()
+    assert torch.equal(one.label[0] == int(PixelLabel.MASKED), ~grid)
+    assert (one.last_stage[0][~grid] == -1).all()
+    assert torch.isnan(one.mip[0][~grid]).all()
+    for name in ("mip", "zscore", "mean", "variance"):
+        torch.testing.assert_close(
+            getattr(one, name)[0][grid],
+            getattr(full, name)[0][grid],
+            rtol=1e-4,
+            atol=1e-4,
+        )
+
+    threshold = float(one.zscore[0][grid].quantile(0.8))
+    stages = [
+        Stage.create(
+            rects,
+            n_psi=16,
+            decision=Decision(threshold, ThresholdTest(table), accept=False),
+        ),
+        Stage.create([(0, 0, 3, 4)], n_psi=16, decision=Decision(threshold)),
+    ]
+    res = searcher(stages, keep_stage_results=True).run(masked)
+    assert len(res.stage_results) == 2 and res.stage_results[1].n_pixels > 0
+    for stage_result in res.stage_results:
+        assert grid.reshape(-1)[stage_result.pixel_index].all()
+    assert torch.equal(res.label[0] == int(PixelLabel.MASKED), ~grid)
+    assert (res.last_stage[0][grid] >= 0).all()
+    assert (res.last_stage[0][~grid] == -1).all()
+
+
 def test_center_mode_orientation_subset_and_run_many(template):
     stub = StubFeaturizer()
     coarse = torch.arange(0, template.space.n_orientations, 2)

@@ -266,6 +266,28 @@ class SearchGeometry:
             f"the per-image {self.dense_shape}"
         )
 
+    def grid_mask(self, image_mask: torch.Tensor) -> torch.Tensor:
+        """Image-shaped mask ``(H, W)`` to restrict correlation grid."""
+        if image_mask.dtype != torch.bool:
+            raise ValueError(f"mask must be a bool tensor, got {image_mask.dtype}")
+
+        if tuple(image_mask.shape) != self.image_shape:
+            raise ValueError(
+                f"image mask shape {tuple(image_mask.shape)} is not the image shape "
+                f"{self.image_shape}"
+            )
+
+        (h, w), (k_h, k_w) = self.image_shape, self.template_shape
+        r0, c0 = k_h // 2, k_w // 2
+
+        if self.mode == "center":
+            r0, c0 = r0 + (h - k_h) // 2, c0 + (w - k_w) // 2
+            return image_mask[r0, c0].reshape(1)
+
+        out_h, out_w = self.grid
+
+        return image_mask[r0 : r0 + out_h, c0 : c0 + out_w]
+
     def flat_index(self, mask: torch.Tensor | None) -> torch.Tensor:
         """Sorted flat int64 indices of the selected pixels (all if no ``mask``)."""
         if mask is None:
