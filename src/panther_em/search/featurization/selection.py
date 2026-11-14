@@ -13,6 +13,7 @@ from panther_em.search.featurization.fft_featurization import (
     DEFAULT_CELL_CHUNK,
     FFTFeaturization,
 )
+from panther_em.search.featurization.zipfft_backend import DEFAULT_ZIPFFT_BATCH
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     from panther_em.search.featurization.direct_featurization import (
         ContractionName,
     )
+    from panther_em.search.featurization.zipfft_backend import FFTBackend
     from panther_em.search.images import SearchGeometry
 
 Mode = Literal["fft", "direct"]
@@ -57,13 +59,21 @@ def make_featurization(
     mode: Mode,
     *,
     cell_chunk: int = DEFAULT_CELL_CHUNK,
+    fft_backend: FFTBackend = "auto",
+    zipfft_batch: int = DEFAULT_ZIPFFT_BATCH,
     batch: int = DEFAULT_BATCH,
     precision: Precision | str = DEFAULT_PRECISION,
     contraction: ContractionName = "adjoint",
 ) -> BaseImageFeaturization:
     """The ``mode`` featurization of ``rect``."""
     if mode == "fft":
-        return FFTFeaturization(reconstructor, rect, cell_chunk=cell_chunk)
+        return FFTFeaturization(
+            reconstructor,
+            rect,
+            cell_chunk=cell_chunk,
+            backend=fft_backend,
+            max_batch=zipfft_batch,
+        )
 
     if mode == "direct":
         return DirectFeaturization(

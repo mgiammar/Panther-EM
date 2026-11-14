@@ -5,7 +5,8 @@
 * :class:`FFTFeaturization` -- overlap-save FFT correlation over the positions'
   bounding box (dense selections: a band of a micrograph), in whole-width strips.
 * :class:`StripSpec` / :class:`Strip` -- the FFT sizes a backend runs and how a
-  region's rows are covered with them.
+  region's rows are covered with them; :data:`FFTBackend` -- cuFFT (torch) at any
+  size or zipFFT at its compiled shapes (:mod:`.zipfft_backend`).
 * :class:`DirectFeaturization` -- box gather + :class:`BoxContraction` per position
   (sparse selections); the contraction is :class:`AdjointContraction`, with
   :class:`PlanarContraction` as the fallback.
@@ -44,6 +45,7 @@ from panther_em.search.featurization.store import (
     StoreLike,
 )
 from panther_em.search.featurization.strips import Strip, StripSpec
+from panther_em.search.featurization.zipfft_backend import FFTBackend
 
 __all__ = [
     "DIRECT_MAX_BOX_EXCESS",
@@ -54,6 +56,7 @@ __all__ = [
     "ColumnGroup",
     "ColumnSubset",
     "DirectFeaturization",
+    "FFTBackend",
     "FFTFeaturization",
     "FeatureChunk",
     "FeatureStore",

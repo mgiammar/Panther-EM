@@ -167,6 +167,8 @@ class Searcher:
             or functools.partial(
                 make_featurization,
                 cell_chunk=tuning.cell_chunk,
+                fft_backend=self.execution.fft_backend,
+                zipfft_batch=tuning.zipfft_batch,
                 batch=tuning.image_batch,
                 precision=self.execution.direct_precision,
                 contraction=self.execution.direct_contraction,
@@ -331,7 +333,9 @@ class Searcher:
             local=self.local.get(index),
             seeds=seeds,
             seeded=self.seeded.get(index),
-            strips=self.featurization(stage.rectangles[0], "fft").strip_spec,
+            strips=self.featurization(stage.rectangles[0], "fft").strip_spec(
+                geometry.grid[-1]
+            ),
         )
 
     def session(self, images: Micrograph | SearchImages) -> SearchSession:

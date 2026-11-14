@@ -18,6 +18,10 @@ from panther_em.search.featurization import (
 from panther_em.search.featurization import (
     direct_featurization as direct_module,
 )
+from panther_em.search.featurization.zipfft_backend import (
+    split_batch,
+    zipfft_shapes,
+)
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*__array_wrap__ must accept.*:DeprecationWarning",
@@ -171,7 +175,7 @@ def test_fft_strips_match_reference(warp):
     rows = torch.randint(0, 41, (200,), generator=gen).sort().values
     cols = torch.randint(0, 12, (200,), generator=gen)
     f = FFTFeaturization(warp, RECT, cell_chunk=4, **STRIPS)
-    assert f.strip_spec.fixed
+    assert f.strip_spec(12).fixed
     (r0, _), _, fft_w, strips = f.strips(rows, cols)
     assert fft_w == 32 and len(strips) > 1
     covered = []
@@ -322,3 +326,95 @@ def test_cuda_engines_match_reference(synthetic_result, precision, tol):
         ).featurize(x, rows, cols)
         assert direct.is_cuda
         assert_features(direct, expected, tol=tol)
+
+
+# -- zipFFT backend -----------------------------------------------------------------
+
+# box-20 shapes the Panther-EM tests expect in a zipFFT build (see the issue #5 notes)
+ZIP_SHAPES = {(64, 64), (64, 128), (128, 64), (128, 128)}
+
+
+def zipfft_ready():
+    return torch.cuda.is_available() and ZIP_SHAPES <= set(
+        zipfft_shapes((BOX, BOX), "cuda")
+    )
+
+
+requires_zipfft = pytest.mark.skipif(
+    not zipfft_ready(), reason="needs zipFFT compiled with the box-20 test shapes"
+)
+
+
+def test_zipfft_batches_split_largest_first():
+    batches = (32, 16, 8, 4, 2, 1)
+    assert split_batch(32, batches, 32) == [32]
+    assert split_batch(31, batches, 32) == [16, 8, 4, 2, 1]
+    assert split_batch(32, batches, 8) == [8] * 4
+    assert split_batch(7, batches, 3) == [2, 2, 2, 1]  # no call above the cap
+    assert split_batch(6, (4, 1), 32) == [4, 1, 1]
+    assert split_batch(0, batches, 32) == []
+
+
+def test_zipfft_strip_spec_follows_the_compiled_shapes(warp):
+    f = FFTFeaturization(warp, RECT)
+    # stand in for a build: heights 64/128 at width 64, 64 only at width 256
+    f.__dict__["zipfft_shapes"] = {
+        (64, 64): (4, 1),
+        (128, 64): (4, 1),
+        (64, 256): (1,),
+    }
+    spec = f.strip_spec(40)  # 40 + 19 columns: the 64-wide FFT
+    assert (spec.heights, spec.widths) == ((64, 128), (64,))
+    spec = f.strip_spec(100)  # only the 256-wide one holds it
+    assert (spec.heights, spec.widths) == ((64,), (256,))
+    assert not f.strip_spec(300).fixed  # none holds it: any size (cuFFT)
+    # explicit sizes override the backend's
+    g = FFTFeaturization(warp, RECT, **STRIPS)
+    g.__dict__["zipfft_shapes"] = {(64, 64): (1,)}
+    assert g.strip_spec(12).heights == (24, 32)
+    # torch never asks zipFFT
+    assert FFTFeaturization(warp, RECT, backend="torch").zipfft_shapes == {}
+
+
+def test_zipfft_backend_that_cannot_run_raises(warp):
+    x = planes(d=1, h=40, w=31)
+    rows, cols = positions(5, 40, 31)
+    f = FFTFeaturization(warp, RECT, backend="zipfft")  # a CPU reconstructor
+    with pytest.raises(ValueError, match=r"fft_backend 'zipfft'.*CUDA"):
+        list(f.chunks(x, rows, cols))
+    # auto falls back to cuFFT
+    assert_features(
+        FFTFeaturization(warp, RECT).featurize(x, rows, cols),
+        reference(warp, x, rows, cols),
+    )
+    with pytest.raises(ValueError, match="backend"):
+        FFTFeaturization(warp, RECT, backend="cufft")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="max_batch"):
+        FFTFeaturization(warp, RECT, max_batch=0)
+
+
+@requires_zipfft
+@pytest.mark.parametrize("max_batch", [32, 2, 1])
+def test_zipfft_strips_match_cufft(synthetic_result, max_batch):
+    """zipFFT strips (written straight into a chunk, or through a buffer) = cuFFT."""
+    warp = make_warp(synthetic_result, device="cuda")
+    x = planes(d=2, h=150, w=128)  # 131 x 109 positions
+    f = FFTFeaturization(warp, RECT, cell_chunk=5, max_batch=max_batch)
+    torch_f = FFTFeaturization(warp, RECT, cell_chunk=5, backend="torch")
+    # 109 columns at FX = 128; 131 rows as a 128-high strip (109 rows, every valid
+    # row and column: no buffer) and a 64-high one (the 22 left)
+    r, c = torch.meshgrid(torch.arange(131), torch.arange(109), indexing="ij")
+    rows, cols = r.reshape(-1), c.reshape(-1)
+    _, _, fft_w, strips = f.strips(rows, cols)
+    assert fft_w == 128
+    assert [(s.rows, s.height) for s, _ in strips] == [(109, 128), (22, 64)]
+    dense = f.featurize(x, rows, cols)
+    torch.testing.assert_close(
+        dense, torch_f.featurize(x, rows, cols), rtol=1e-5, atol=1e-5
+    )
+    # a sorted sparse selection gathers from the buffer
+    gen = torch.Generator().manual_seed(6)
+    pick = torch.randperm(rows.numel(), generator=gen)[:300].sort().values
+    sparse = f.featurize(x, rows[pick], cols[pick])
+    assert_features(sparse, reference(warp, x, rows[pick], cols[pick]))
+    torch.testing.assert_close(sparse, dense[..., pick.to(dense.device)])

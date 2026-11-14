@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
+from panther_em.search.featurization.zipfft_backend import FFT_BACKENDS
+
 if TYPE_CHECKING:
     import torch
 
@@ -12,6 +14,7 @@ if TYPE_CHECKING:
     from panther_em.search.featurization.direct_featurization import (
         ContractionName,
     )
+    from panther_em.search.featurization.zipfft_backend import FFTBackend
 
 MIB = 1024**2
 
@@ -40,7 +43,9 @@ class Tuning:
         merged across passes. When False, the passes hold all planes' features and the
         statistics are computed in one pass.
     cell_chunk : int
-        Kernel spectra per chunk of the FFT engine.
+        Cells per chunk of the FFT engine.
+    zipfft_batch : int
+        Largest batch (kernels per call) supported by zipFFT engine, default 32.
     image_batch : int
         Positions per chunk of the direct engine.
     prepared_budget : int, optional
@@ -63,11 +68,18 @@ class Tuning:
     use_fused_kernel: bool = True
     plane_major: bool = True
     cell_chunk: int = 32
+    zipfft_batch: int = 32
     image_batch: int = 1024
     prepared_budget: int | None = None
     ledger_device: torch.device | str | None = None
     local_bytes: int = 512 * MIB
     local_weights_bytes: int | None = 2048 * MIB
+
+    def __post_init__(self) -> None:
+        """Validate the chunk sizes."""
+        for name in ("cell_chunk", "zipfft_batch", "image_batch"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be >= 1")
 
 
 @dataclass(frozen=True)
@@ -81,6 +93,11 @@ class ExecutionConfig:
         box, or box gather + contraction per position. ``"auto"`` applies
         :func:`~panther_em.search.featurization.choose_mode` to each
         stage's selection.
+    fft_backend : {"auto", "torch", "zipfft"}
+        FFT engine backend: cuFFT through torch at any FFT size, or zipFFT's fused
+        padded correlation at the FFT shapes compiled for the template's box. ``"auto"``
+        runs zipFFT where it is installed, compiled for the device and the box, and
+        cuFFT otherwise.
     direct_contraction : {"adjoint", "planar"}
         How the direct engine turns boxes into features: ``"adjoint"`` scatters each
         box onto the polar grid through the transposed warp (no Cartesian kernels;
@@ -104,6 +121,7 @@ class ExecutionConfig:
     """
 
     featurize_mode: Literal["auto", "fft", "direct"] = "auto"
+    fft_backend: FFTBackend = "auto"
     direct_contraction: ContractionName = "adjoint"
     direct_precision: Literal["fp16", "tf32", "fp32"] = "fp16"
     device_store_fraction: float = 0.5
@@ -115,6 +133,8 @@ class ExecutionConfig:
         """Validate the choices."""
         if self.featurize_mode not in ("auto", "fft", "direct"):
             raise ValueError(f"unknown featurize_mode {self.featurize_mode!r}")
+        if self.fft_backend not in FFT_BACKENDS:
+            raise ValueError(f"unknown fft_backend {self.fft_backend!r}")
         if not 0.0 < self.device_store_fraction <= 1.0:
             raise ValueError("device_store_fraction must lie in (0, 1]")
         if not isinstance(self.tuning, Tuning):

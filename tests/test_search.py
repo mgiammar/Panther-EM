@@ -19,6 +19,7 @@ from panther_em.search.featurization import (
     FeatureChunk,
     FFTFeaturization,
 )
+from panther_em.search.featurization.zipfft_backend import zipfft_shapes
 from panther_em.search.hypotheses import HypothesisSet
 from panther_em.search.images import PixelSelection, SearchImages
 from panther_em.search.ledger import PixelLedger
@@ -759,6 +760,41 @@ def test_fft_strip_bands_match_one_region(template, monkeypatch):
         torch.testing.assert_close(
             getattr(banded, name),
             getattr(one, name),
+            rtol=1e-4,
+            atol=1e-4,
+            equal_nan=True,
+        )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and (128, 128) in zipfft_shapes((20, 20), "cuda")),
+    reason="needs zipFFT compiled with the box-20 test shapes",
+)
+def test_zipfft_backend_matches_cufft(synthetic_result, monkeypatch):
+    """zipFFT strips cut the bands to whole strips and give cuFFT's maps."""
+    template = Template(synthetic_result(), device="cuda")
+    image = SearchImages.single(_image(h=150, w=128, seed=5))  # 131 x 109 pixels
+    rect = (0, 0, 4, 3)
+    stages = [Stage.create([rect], n_psi=16)]
+    exe = replace(EXEC, featurize_mode="fft", fft_backend="torch")
+    cufft = Searcher(template, stages, execution=exe).run(image)
+
+    per_pixel = feature_bytes_per_pixel([(rect, stages[0].precision, 1)])
+    budget = int(50 * 109 * per_pixel / EXEC.device_store_fraction)  # 50 rows fit
+    monkeypatch.setattr(DeviceInfo, "free_bytes", lambda self: budget)
+    zipped = replace(
+        exe, fft_backend="zipfft", tuning=replace(exe.tuning, zipfft_batch=2)
+    )
+    searcher = Searcher(template, stages, execution=zipped)
+    geometry = searcher.session(image).geometry
+    plan = searcher.plan(0, PixelSelection.all(geometry), geometry)
+    # bands of one 64-high strip (45 rows) each: 45 + 45 + 41
+    assert [len(b.pixels) // 109 for b in plan.bands] == [45, 45, 41]
+    banded = searcher.run(image)
+    for name in MAP_NAMES:
+        torch.testing.assert_close(
+            getattr(banded, name),
+            getattr(cufft, name),
             rtol=1e-4,
             atol=1e-4,
             equal_nan=True,

@@ -134,9 +134,8 @@ class BaseImageFeaturization(ABC):
         """Cells of the rectangle, ``k_extent * m_extent``."""
         return self.rect[2] * self.rect[3]
 
-    @property
-    def strip_spec(self) -> StripSpec | None:
-        """The FFT sizes the engine covers a band's rows with (``None``: no strips).
+    def strip_spec(self, width: int) -> StripSpec | None:
+        """FFT sizes covering a band ``width`` box-origin columns wide (``None``: none).
 
         The planner cuts a stage's bands to whole numbers of strips with it.
         """
