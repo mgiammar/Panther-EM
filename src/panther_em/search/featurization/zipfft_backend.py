@@ -24,7 +24,7 @@ is not compiled); ``"auto"``: zipFFT where compiled, cuFFT elsewhere."""
 
 FFT_BACKENDS = ("auto", "torch", "zipfft")
 
-DEFAULT_ZIPFFT_BATCH = 32
+DEFAULT_ZIPFFT_BATCH = 1
 """Largest batch (kernels per zipFFT call) a chunk of cells is split into."""
 
 

@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
-from panther_em.search.featurization.zipfft_backend import FFT_BACKENDS
+from panther_em.search.featurization.zipfft_backend import (
+    DEFAULT_ZIPFFT_BATCH,
+    FFT_BACKENDS,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -45,7 +48,9 @@ class Tuning:
     cell_chunk : int
         Cells per chunk of the FFT engine.
     zipfft_batch : int
-        Largest batch (kernels per call) supported by zipFFT engine, default 32.
+        Largest batch (kernels per call) supported by zipFFT engine, default 1 (the
+        fastest measured, see
+        :data:`~panther_em.search.featurization.zipfft_backend.DEFAULT_ZIPFFT_BATCH`).
     image_batch : int
         Positions per chunk of the direct engine.
     prepared_budget : int, optional
@@ -68,7 +73,7 @@ class Tuning:
     use_fused_kernel: bool = True
     plane_major: bool = True
     cell_chunk: int = 32
-    zipfft_batch: int = 32
+    zipfft_batch: int = DEFAULT_ZIPFFT_BATCH
     image_batch: int = 1024
     prepared_budget: int | None = None
     ledger_device: torch.device | str | None = None
