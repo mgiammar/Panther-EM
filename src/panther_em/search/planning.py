@@ -5,8 +5,10 @@
 * :func:`plan_memory` -- one pass's shapes (:class:`MemoryPlan`): the GEMM batch, the
   hypothesis batch, the store block size, eager or graphed loop, fused or not.
 * :func:`plan_stage` -- the whole stage (:class:`StagePlan`): its hypotheses, the
-  featurization engine, the *bands* (row-contiguous chunks of its pixels whose
-  features fit the device) and, per band, the *passes* (one defocus plane at a
+  featurization engine, the *bands* (consecutive chunks of its pixels whose
+  features fit the device: whole grid rows for the FFT engine, as many as its
+  strips cover best, see :func:`plan_row_bands`) and, per band, the *passes* (one
+  defocus plane at a
   time, or all at once), each with its memory plan. A local stage's plan also
   carries its neighborhoods and, per band, each pixel's group; a seeded stage's
   plan its seed pass (:class:`SeedPlan`) and, per band, the lattice of seeded
@@ -45,7 +47,7 @@ if TYPE_CHECKING:
         ContractionEngine,
         Precision,
     )
-    from panther_em.search.featurization import Mode
+    from panther_em.search.featurization import Mode, StripSpec
     from panther_em.search.hypotheses import HypothesisSpace, LocalHypotheses
     from panther_em.search.images import SearchGeometry
     from panther_em.search.seeding import SeedResources
@@ -398,12 +400,12 @@ class StagePlan:
 def plan_bands(
     pixels: PixelSelection, per_pixel: int, limit: int | None, gemm_pixels: int
 ) -> list[PixelSelection]:
-    """Row-contiguous chunks of ``pixels`` whose features fit ``limit`` bytes.
+    """Consecutive chunks of ``pixels`` whose features fit ``limit`` bytes.
 
     One band (the whole selection) when the features fit or no limit is known;
     otherwise the sorted selection is cut into equal chunks of a multiple of
-    ``gemm_pixels`` pixels that fit, each a band of rows the FFT engine covers with
-    one region.
+    ``gemm_pixels`` pixels that fit (the direct engine's bands; the FFT engine's
+    are :func:`plan_row_bands`).
     """
     if limit is None or len(pixels) == 0 or per_pixel * len(pixels) <= limit:
         return [pixels]
@@ -411,13 +413,51 @@ def plan_bands(
     n_bands = -(-len(pixels) // fit)
     per_band = -(-len(pixels) // n_bands)
     per_band = -(-per_band // gemm_pixels) * gemm_pixels
-    index = pixels.index
-    if not bool(torch.all(index[1:] >= index[:-1])):
-        index = torch.sort(index).values
+    index = _sorted_index(pixels)
     return [
         PixelSelection(index[i : i + per_band], pixels.geometry)
         for i in range(0, int(index.numel()), per_band)
     ]
+
+
+def plan_row_bands(
+    pixels: PixelSelection,
+    per_pixel: int,
+    limit: int | None,
+    strips: StripSpec | None = None,
+) -> list[PixelSelection]:
+    """Bands of whole grid rows whose features fit ``limit`` bytes (FFT engine)."""
+    if limit is None or len(pixels) == 0 or per_pixel * len(pixels) <= limit:
+        return [pixels]
+
+    index = _sorted_index(pixels)
+    out_h, out_w = pixels.geometry.grid
+    key = index // out_w  # image * out_h + row
+    image, row = key // out_h, key % out_h
+    widest = int(torch.unique_consecutive(key, return_counts=True)[1].max())
+    max_rows = max(1, (limit // max(1, per_pixel)) // widest)
+
+    r_lo = int(row.min())
+    n_rows = int(row.max()) - r_lo + 1
+
+    if strips is None:  # any FFT size: the fewest equal bands
+        rows = -(-n_rows // -(-n_rows // min(max_rows, n_rows)))
+    else:
+        rows = strips.band_rows(max_rows, n_rows)
+
+    band = image * -(-n_rows // rows) + (row - r_lo) // rows
+    counts = torch.unique_consecutive(band, return_counts=True)[1].tolist()
+
+    return [
+        PixelSelection(part, pixels.geometry) for part in torch.split(index, counts)
+    ]
+
+
+def _sorted_index(pixels: PixelSelection) -> torch.Tensor:
+    index = pixels.index
+    if not bool(torch.all(index[1:] >= index[:-1])):
+        index = torch.sort(index).values
+    return index
 
 
 def plan_stage(
@@ -434,6 +474,7 @@ def plan_stage(
     local: LocalHypotheses | None = None,
     seeds: torch.Tensor | None = None,
     seeded: SeedResources | None = None,
+    strips: StripSpec | None = None,
 ) -> StagePlan:
     """Plan one stage over ``pixels``.
 
@@ -465,6 +506,9 @@ def plan_stage(
         ``(P,)`` seed orientation of each pixel, in ``pixels`` order (local only).
     seeded : SeedResources, optional
         A seeded stage's seed templates and neighborhoods.
+    strips : StripSpec, optional
+        The FFT engine's sizes for the stage's box: an FFT stage's bands hold whole
+        numbers of its strips (``None``: any size).
     """
     execution = execution or ExecutionConfig()
     if (local is None) != (seeds is None) or (local is None) == stage.is_local:
@@ -519,7 +563,11 @@ def plan_stage(
         if free_bytes is None
         else int(free_bytes * execution.device_store_fraction)
     )
-    bands = plan_bands(pixels, per_pixel, limit, memory.gemm_pixels)
+    bands = (
+        plan_row_bands(pixels, per_pixel, limit, strips)
+        if mode == "fft" and geometry.mode == "grid"
+        else plan_bands(pixels, per_pixel, limit, memory.gemm_pixels)
+    )
     # the bands are consecutive slices of the (sorted) selection
     offsets = [0]
     for band in bands:

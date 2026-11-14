@@ -17,10 +17,12 @@ from panther_em.search.decision import Decision, PixelLabel
 from panther_em.search.featurization import (
     BaseImageFeaturization,
     FeatureChunk,
+    FFTFeaturization,
 )
 from panther_em.search.hypotheses import HypothesisSet
-from panther_em.search.images import SearchImages
+from panther_em.search.images import PixelSelection, SearchImages
 from panther_em.search.ledger import PixelLedger
+from panther_em.search.planning import DeviceInfo, feature_bytes_per_pixel
 from panther_em.search.results import MAP_NAMES, SearchResult, StageResult
 from panther_em.search.searcher import Searcher
 from panther_em.search.stage import Stage
@@ -729,6 +731,38 @@ def test_session_store_is_released_after_the_session(template):
         gc.enable()
     assert block_ref() is None  # and nothing (the cached loop's plan) kept its blocks
     assert searcher.correlator.loops  # the loop cache survives for the next image set
+
+
+def test_fft_strip_bands_match_one_region(template, monkeypatch):
+    """Fixed FFT heights: bands of whole strips give the maps of one region."""
+    image = SearchImages.single(_image(h=50, w=30, seed=3))  # 31 x 11 pixels
+    rect = (0, 0, 4, 3)
+    stages = [Stage.create([rect], n_psi=16)]
+    exe = replace(EXEC, featurize_mode="fft")
+    one = Searcher(template, stages, execution=exe).run(image)
+
+    def strips(warp, rect, mode):
+        return FFTFeaturization(
+            warp, rect, cell_chunk=4, strip_heights=(24, 32), strip_widths=(32, 64)
+        )
+
+    per_pixel = feature_bytes_per_pixel([(rect, stages[0].precision, 1)])
+    budget = int(15 * 11 * per_pixel / EXEC.device_store_fraction)  # 15 rows fit
+    monkeypatch.setattr(DeviceInfo, "free_bytes", lambda self: budget)
+    searcher = Searcher(template, stages, execution=exe, featurization=strips)
+    geometry = searcher.session(image).geometry
+    plan = searcher.plan(0, PixelSelection.all(geometry), geometry)
+    # bands of one 32-high strip (13 rows), the 5 rows left in a 24-high one
+    assert [len(b.pixels) // 11 for b in plan.bands] == [13, 13, 5]
+    banded = searcher.run(image)
+    for name in MAP_NAMES:
+        torch.testing.assert_close(
+            getattr(banded, name),
+            getattr(one, name),
+            rtol=1e-4,
+            atol=1e-4,
+            equal_nan=True,
+        )
 
 
 def test_plane_major_passes_match_the_joint_search(template):

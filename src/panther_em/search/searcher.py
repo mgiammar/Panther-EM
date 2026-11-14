@@ -317,9 +317,10 @@ class Searcher:
 
         A local stage needs ``seeds``: each pixel's previous best orientation.
         """
+        stage = self.stages[index]
         return plan_stage(
             index,
-            self.stages[index],
+            stage,
             pixels,
             geometry,
             space=self.space,
@@ -330,6 +331,7 @@ class Searcher:
             local=self.local.get(index),
             seeds=seeds,
             seeded=self.seeded.get(index),
+            strips=self.featurization(stage.rectangles[0], "fft").strip_spec,
         )
 
     def session(self, images: Micrograph | SearchImages) -> SearchSession:

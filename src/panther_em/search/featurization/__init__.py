@@ -3,7 +3,9 @@
 * :class:`BaseImageFeaturization` -- the interface: ``(D, H, W)`` planes and ``(P,)``
   box origins in, a stream of :class:`FeatureChunk` s out (caller's position order).
 * :class:`FFTFeaturization` -- overlap-save FFT correlation over the positions'
-  bounding box (dense selections: a band of a micrograph).
+  bounding box (dense selections: a band of a micrograph), in whole-width strips.
+* :class:`StripSpec` / :class:`Strip` -- the FFT sizes a backend runs and how a
+  region's rows are covered with them.
 * :class:`DirectFeaturization` -- box gather + :class:`BoxContraction` per position
   (sparse selections); the contraction is :class:`AdjointContraction`, with
   :class:`PlanarContraction` as the fallback.
@@ -41,6 +43,7 @@ from panther_em.search.featurization.store import (
     ReadyBlock,
     StoreLike,
 )
+from panther_em.search.featurization.strips import Strip, StripSpec
 
 __all__ = [
     "DIRECT_MAX_BOX_EXCESS",
@@ -58,6 +61,8 @@ __all__ = [
     "PlanarContraction",
     "ReadyBlock",
     "StoreLike",
+    "Strip",
+    "StripSpec",
     "box_contraction",
     "choose_mode",
     "make_featurization",

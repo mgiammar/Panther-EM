@@ -2,7 +2,7 @@
 
 The rectangle's Cartesian kernels are built once, on first use, and held by the
 featurization (a searcher keeps one per rectangle across images); their spectra at a
-region's FFT shape are computed per chunk of cells on every call.
+strip's FFT shape are computed per chunk of cells on every call.
 """
 
 from __future__ import annotations
@@ -11,12 +11,12 @@ from functools import cached_property
 from typing import TYPE_CHECKING
 
 import torch
-from scipy.fft import next_fast_len
 
 from panther_em.search.featurization.base import (
     BaseImageFeaturization,
     FeatureChunk,
 )
+from panther_em.search.featurization.strips import Strip, StripSpec
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
@@ -37,7 +37,9 @@ class FFTFeaturization(BaseImageFeaturization):
     rect : Rectangle
         ``(k_start, m_start, k_extent, m_extent)``.
     cell_chunk : int, optional
-        Kernel spectra per chunk (each is ``8 Fh Fw`` bytes, 134 MB at 4096^2).
+        Kernel spectra per chunk (each is ``8 S Fw`` bytes, 134 MB at 4096^2).
+    strip_heights, strip_widths : sequence of int, optional
+        FFT heights / widths to run, or ``None`` for any size.
     """
 
     def __init__(
@@ -46,6 +48,8 @@ class FFTFeaturization(BaseImageFeaturization):
         rect: Sequence[int],
         *,
         cell_chunk: int = DEFAULT_CELL_CHUNK,
+        strip_heights: Sequence[int] | None = None,
+        strip_widths: Sequence[int] | None = None,
     ) -> None:
         super().__init__(reconstructor, rect)
 
@@ -53,16 +57,28 @@ class FFTFeaturization(BaseImageFeaturization):
             raise ValueError("cell_chunk must be >= 1")
 
         self.cell_chunk = int(cell_chunk)
+        self.strip_heights = (
+            None if strip_heights is None else tuple(int(h) for h in strip_heights)
+        )
+        self.strip_widths = (
+            None if strip_widths is None else tuple(int(w) for w in strip_widths)
+        )
 
     @cached_property
     def kernels(self) -> torch.Tensor:
         """``(n_cells, kH, kW)`` complex64 kernels of the rectangle (built once)."""
         return self.reconstructor.kernels(self.cells)
 
+    @cached_property
+    def strip_spec(self) -> StripSpec:
+        """The FFT sizes this featurization runs (see :mod:`.strips`)."""
+        return StripSpec(self.box_shape, self.strip_heights, self.strip_widths)
+
+    @staticmethod
     def region(
-        self, rows: torch.Tensor, cols: torch.Tensor
-    ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
-        """``(origin, output shape, FFT shape)`` of the correlated region.
+        rows: torch.Tensor, cols: torch.Tensor
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        """``(origin, output shape)`` of the positions' bounding box.
 
         Parameters
         ----------
@@ -72,13 +88,45 @@ class FFTFeaturization(BaseImageFeaturization):
             ``(N,)`` int64 column positions.
         """
         r0, c0 = int(rows.min()), int(cols.min())
-        out = (int(rows.max()) - r0 + 1, int(cols.max()) - c0 + 1)
-        k_h, k_w = self.box_shape
-        fft_shape = (
-            int(next_fast_len(out[0] + k_h - 1)),
-            int(next_fast_len(out[1] + k_w - 1)),
+        return (r0, c0), (int(rows.max()) - r0 + 1, int(cols.max()) - c0 + 1)
+
+    def strips(
+        self, rows: torch.Tensor, cols: torch.Tensor
+    ) -> tuple[tuple[int, int], int, int, tuple[tuple[Strip, slice], ...]]:
+        """``(origin, out_w, fft_width, ((strip, columns), ...))`` of the positions."""
+        (r0, c0), (out_h, out_w) = self.region(rows, cols)
+        spec = self.strip_spec
+        fft_w = spec.fft_width(out_w)
+
+        if fft_w is None:
+            raise ValueError(
+                f"no FFT width of {spec.widths} holds {out_w} box columns of a "
+                f"{self.box_shape} box"
+            )
+
+        strips = spec.strips(out_h)
+        n = int(rows.numel())
+
+        if len(strips) == 1:
+            return (r0, c0), out_w, fft_w, ((strips[0], slice(0, n)),)
+
+        if not bool(torch.all(rows[1:] >= rows[:-1])):
+            raise ValueError(
+                "positions spanning several strips must be sorted by row "
+                f"({out_h} rows over FFT heights {spec.heights})"
+            )
+
+        starts = torch.tensor(
+            [r0 + s.row for s in strips] + [r0 + out_h], device=rows.device
         )
-        return (r0, c0), out, fft_shape
+        bounds = torch.searchsorted(rows, starts).tolist()
+
+        return (
+            (r0, c0),
+            out_w,
+            fft_w,
+            tuple((s, slice(bounds[i], bounds[i + 1])) for i, s in enumerate(strips)),
+        )
 
     def chunks(
         self, planes: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor
@@ -86,15 +134,42 @@ class FFTFeaturization(BaseImageFeaturization):
         """See :meth:`~.base.BaseImageFeaturization.chunks`."""
         self.validate(planes, rows, cols)
 
-        n_positions = int(rows.numel())
-
-        if n_positions == 0:
+        if int(rows.numel()) == 0:
             return
 
+        (r0, c0), out_w, fft_w, strips = self.strips(rows, cols)
+        for strip, columns in strips:
+            if columns.stop > columns.start:
+                yield from self._strip_chunks(
+                    planes,
+                    rows[columns] - (r0 + strip.row),
+                    cols[columns] - c0,
+                    strip,
+                    (r0 + strip.row, c0),
+                    (out_w, fft_w),
+                    columns,
+                )
+
+    def _strip_chunks(
+        self,
+        planes: torch.Tensor,
+        rows: torch.Tensor,
+        cols: torch.Tensor,
+        strip: Strip,
+        origin: tuple[int, int],
+        widths: tuple[int, int],
+        columns: slice,
+    ) -> Iterator[FeatureChunk]:
+        """One strip's chunks; ``rows``/``cols`` relative to the strip's origin."""
         device = self.device
-        (r0, c0), (out_h, out_w), fft_shape = self.region(rows, cols)
+        n_positions = int(rows.numel())
+        (r0, c0), (out_w, fft_w) = origin, widths
         k_h, k_w = self.box_shape
-        region = (slice(r0, r0 + out_h + k_h - 1), slice(c0, c0 + out_w + k_w - 1))
+        fft_shape = (strip.height, fft_w)
+        region = (
+            slice(r0, r0 + strip.rows + k_h - 1),
+            slice(c0, c0 + out_w + k_w - 1),
+        )
         image_ffts = [
             torch.fft.fft2(
                 plane[region].to(device=device, dtype=torch.float32), s=fft_shape
@@ -102,8 +177,8 @@ class FFTFeaturization(BaseImageFeaturization):
             for plane in planes
         ]
 
-        local = ((rows - r0) * out_w + (cols - c0)).to(device)
-        whole = n_positions == out_h * out_w and bool(
+        local = (rows * out_w + cols).to(device)
+        whole = n_positions == strip.rows * out_w and bool(
             torch.equal(local, torch.arange(n_positions, device=device))
         )
         for start in range(0, self.n_cells, self.cell_chunk):
@@ -115,6 +190,6 @@ class FFTFeaturization(BaseImageFeaturization):
                 )
                 for i, spectrum in enumerate(spectra):
                     correlation = torch.fft.ifft2(image_fft * spectrum)
-                    valid = correlation[:out_h, :out_w].reshape(-1)
+                    valid = correlation[: strip.rows, :out_w].reshape(-1)
                     values[i] = valid if whole else valid[local]
-                yield FeatureChunk(d, cells, slice(0, n_positions), values)
+                yield FeatureChunk(d, cells, columns, values)

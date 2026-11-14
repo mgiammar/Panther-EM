@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
     from panther_em.approximation.reconstructor import Reconstructor
     from panther_em.decomposition.rectangles import Rectangle
+    from panther_em.search.featurization.strips import StripSpec
 
 
 def rectangle_cells(rect: Rectangle) -> torch.Tensor:
@@ -132,6 +133,14 @@ class BaseImageFeaturization(ABC):
     def n_cells(self) -> int:
         """Cells of the rectangle, ``k_extent * m_extent``."""
         return self.rect[2] * self.rect[3]
+
+    @property
+    def strip_spec(self) -> StripSpec | None:
+        """The FFT sizes the engine covers a band's rows with (``None``: no strips).
+
+        The planner cuts a stage's bands to whole numbers of strips with it.
+        """
+        return None
 
     @cached_property
     def cells(self) -> torch.Tensor:

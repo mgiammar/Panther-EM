@@ -9,6 +9,7 @@ import torch
 
 from panther_em.search.config import ExecutionConfig, Tuning
 from panther_em.search.correlation.contraction import BatchShape
+from panther_em.search.featurization import StripSpec
 from panther_em.search.hypotheses import HypothesisSpace
 from panther_em.search.images import (
     PixelSelection,
@@ -83,23 +84,83 @@ def test_engine_choice_and_override(setup):
     assert plan(setup, stage, forced).mode == "direct"
 
 
-def test_bands_cover_the_pixels_and_fit(setup):
+def test_fft_bands_are_whole_rows_that_fit(setup):
     stage = Stage.create([RECT], n_psi=16, planes=(1,))
     per_pixel = feature_bytes_per_pixel([(RECT, stage.precision, 1)])
     assert per_pixel == 4 * 5 * 8  # complex64 features of one plane
-    budget = 300 * per_pixel  # a band holds 300 pixels -> 296 (whole GEMM batches)
+    budget = 300 * per_pixel  # a band holds 300 pixels -> 6 whole rows of 45
     p = plan(setup, stage, free_bytes=int(budget / EXEC.device_store_fraction))
+    assert p.mode == "fft"
     sizes = [len(b.pixels) for b in p.bands]
-    # 7 bands of equal size, rounded up to whole GEMM batches; the last takes the rest
-    assert sizes == [296] * 6 + [45 * 45 - 6 * 296]
+    # 45 rows in the fewest equal bands of at most 6 rows: 8 bands of 6, the rest 3
+    assert sizes == [6 * 45] * 7 + [3 * 45]
     assert all(s * per_pixel <= budget for s in sizes)
     assert torch.equal(p.pixel_index, torch.arange(45 * 45))  # bands in row order
+    geometry = setup[1]
+    seen: set[int] = set()
     for band in p.bands:
+        rows = set(geometry.positions(band.pixels.index)[1].tolist())
+        assert not rows & seen  # no row is shared between bands
+        seen |= rows
         (step,) = band.passes
         assert step.planes == (1,)
         assert step.memory.block_pixels >= min(len(band.pixels), 8)
     # a budget the stage fits in keeps one band
     assert len(plan(setup, stage, free_bytes=10**9).bands) == 1
+
+
+def test_fft_bands_hold_whole_strips(setup):
+    """With fixed FFT heights a band holds the rows of whole strips."""
+    space, geometry, every = setup
+    stage = Stage.create([RECT], n_psi=16, planes=(1,))
+    per_pixel = feature_bytes_per_pixel([(RECT, stage.precision, 1)])
+    strips = StripSpec((20, 20), heights=(24, 32))  # 5 and 13 rows per strip
+    p = plan_stage(
+        0,
+        stage,
+        every,
+        geometry,
+        space=space,
+        device=CPU,
+        execution=EXEC,
+        free_bytes=int(15 * 45 * per_pixel / EXEC.device_store_fraction),
+        strips=strips,
+    )
+    # up to 15 rows fit: bands of one 32-high strip (13 rows), the 6 left in a
+    # 24-high one, 3 x 32 + 24 = 120 rows of FFT, less than 3 equal bands of 15
+    # rows (each 32 + 24)
+    assert [len(b.pixels) // 45 for b in p.bands] == [13, 13, 13, 6]
+    # a masked selection keeps the bands on the same rows
+    keep = geometry.positions(every.index)[1] % 4 != 1
+    masked = PixelSelection.create(every.index[keep], geometry)
+    q = plan_stage(
+        0,
+        stage,
+        masked,
+        geometry,
+        space=space,
+        device=CPU,
+        execution=EXEC,
+        free_bytes=int(15 * 45 * per_pixel / EXEC.device_store_fraction),
+        strips=strips,
+    )
+    for band, full in zip(q.bands, p.bands, strict=True):
+        rows = geometry.positions(band.pixels.index)[1]
+        full_rows = geometry.positions(full.pixels.index)[1]
+        assert int(rows.min()) >= int(full_rows.min())
+        assert int(rows.max()) <= int(full_rows.max())
+
+
+def test_direct_bands_are_whole_gemm_batches(setup):
+    stage = Stage.create([RECT], n_psi=16, planes=(1,))
+    per_pixel = feature_bytes_per_pixel([(RECT, stage.precision, 1)])
+    budget = 300 * per_pixel  # a band holds 300 pixels -> 296 (whole GEMM batches)
+    direct = replace(EXEC, featurize_mode="direct")
+    p = plan(setup, stage, direct, free_bytes=int(budget / EXEC.device_store_fraction))
+    sizes = [len(b.pixels) for b in p.bands]
+    # 7 bands of equal size, rounded up to whole GEMM batches; the last takes the rest
+    assert sizes == [296] * 6 + [45 * 45 - 6 * 296]
+    assert torch.equal(p.pixel_index, torch.arange(45 * 45))
 
 
 def test_execution_config_validation():

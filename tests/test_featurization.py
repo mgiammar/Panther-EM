@@ -151,10 +151,67 @@ def test_fft_matches_reference_in_the_callers_order(warp):
 
 def test_fft_region_is_the_bounding_box(warp):
     f = FFTFeaturization(warp, RECT)
-    rows, cols = torch.tensor([3, 9, 5]), torch.tensor([2, 4, 7])
-    origin, out, fft_shape = f.region(rows, cols)
-    assert origin == (3, 2) and out == (7, 6)
-    assert fft_shape[0] >= 7 + BOX - 1 and fft_shape[1] >= 6 + BOX - 1
+    rows, cols = torch.tensor([3, 5, 9]), torch.tensor([2, 7, 4])
+    assert f.region(rows, cols) == ((3, 2), (7, 6))
+    # any FFT size: one strip of a fast size over the box
+    origin, out_w, fft_w, ((strip, columns),) = f.strips(rows, cols)
+    assert origin == (3, 2) and out_w == 6 and columns == slice(0, 3)
+    assert strip.row == 0 and strip.rows == 7 and strip.height >= 7 + BOX - 1
+    assert fft_w >= 6 + BOX - 1
+
+
+# FFT heights 24 and 32 (5 and 13 rows of positions per strip), widths 32 and 64
+STRIPS = {"strip_heights": (24, 32), "strip_widths": (32, 64)}
+
+
+def test_fft_strips_match_reference(warp):
+    """Fixed FFT sizes: the box's rows in several strips, each a run of positions."""
+    x = planes(d=2, h=60, w=31)  # 41 x 12 positions
+    gen = torch.Generator().manual_seed(4)
+    rows = torch.randint(0, 41, (200,), generator=gen).sort().values
+    cols = torch.randint(0, 12, (200,), generator=gen)
+    f = FFTFeaturization(warp, RECT, cell_chunk=4, **STRIPS)
+    assert f.strip_spec.fixed
+    (r0, _), _, fft_w, strips = f.strips(rows, cols)
+    assert fft_w == 32 and len(strips) > 1
+    covered = []
+    for strip, columns in strips:
+        assert strip.height in (24, 32)
+        kept = rows[columns] - r0
+        assert bool(((kept >= strip.row) & (kept < strip.row + strip.rows)).all())
+        covered.append(columns)
+    assert [c.start for c in covered[1:]] == [c.stop for c in covered[:-1]]
+    chunks = list(f.chunks(x, rows, cols))
+    assert bool((coverage(chunks, 2, 6, 200) == 1).all())
+    expected = reference(warp, x, rows, cols)
+    assert_features(f.featurize(x, rows, cols), expected)
+    # whole rows of a dense band skip the gather and agree with any-size FFTs
+    r, c = torch.meshgrid(torch.arange(3, 40), torch.arange(0, 12), indexing="ij")
+    dense_rows, dense_cols = r.reshape(-1), c.reshape(-1)
+    torch.testing.assert_close(
+        f.featurize(x, dense_rows, dense_cols),
+        FFTFeaturization(warp, RECT).featurize(x, dense_rows, dense_cols),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+def test_fft_strips_need_sorted_rows_and_a_width(warp):
+    x = planes(d=1, h=60, w=31)
+    rows, cols = torch.tensor([30, 0]), torch.tensor([0, 0])
+    f = FFTFeaturization(warp, RECT, **STRIPS)
+    with pytest.raises(ValueError, match="sorted by row"):
+        list(f.chunks(x, rows, cols))
+    # rows one strip covers may come in any order
+    near = torch.tensor([4, 0, 2])
+    assert_features(
+        f.featurize(x, near, torch.zeros(3, dtype=torch.long)),
+        reference(warp, x, near, torch.zeros(3, dtype=torch.long)),
+    )
+    narrow = FFTFeaturization(warp, RECT, strip_heights=(24,), strip_widths=(24,))
+    wide = planes(d=1, h=30, w=50)
+    with pytest.raises(ValueError, match="no FFT width"):
+        list(narrow.chunks(wide, torch.tensor([0, 0]), torch.tensor([0, 10])))
 
 
 def test_fft_dense_band_skips_the_gather(warp):
