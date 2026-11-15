@@ -46,7 +46,8 @@ class Tuning:
         merged across passes. When False, the passes hold all planes' features and the
         statistics are computed in one pass.
     cell_chunk : int
-        Cells per chunk of the FFT engine.
+        Cells per chunk of the FFT engine, rounded to the nearest size that keeps
+        chunks on whole rows of the rectangle's cells (32 is 40 for 40-wide rows).
     zipfft_batch : int
         Largest batch (kernels per call) supported by zipFFT engine, default 1 (the
         fastest measured, see

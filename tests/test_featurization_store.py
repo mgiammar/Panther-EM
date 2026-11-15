@@ -117,3 +117,46 @@ def test_fp16_layout_round_trip():
     torch.testing.assert_close(
         read_group(store, g, 1).cpu(), data[1].T.reshape(10, 2, 3), rtol=2e-3, atol=2e-3
     )
+
+
+@requires_cuda
+@pytest.mark.parametrize("precision", ["fp16", "fp32"])
+def test_write_kernel_matches_the_torch_write(precision, monkeypatch):
+    from panther_em.search.correlation.kernels import fused_kernel_loader
+
+    if fused_kernel_loader._try_compile() is None:
+        pytest.skip("CUDA extension unavailable")
+    rect = (1, 0, 3, 5)  # 15 cells in rows of 5
+    data = features(2, 15, 37, seed=3).cuda()
+    # (plane, cells, columns, offset): unaligned cells, columns straddling blocks
+    pieces = [
+        (0, slice(0, 7), slice(0, 37), 0),
+        (0, slice(7, 15), slice(0, 20), 0),
+        (0, slice(7, 15), slice(0, 17), 20),
+        (1, slice(0, 15), slice(0, 37), 0),
+    ]
+    stores = []
+    for kernel in (True, False):
+        if not kernel:
+            monkeypatch.setattr(fused_kernel_loader, "store_write", lambda *a: False)
+        store = FeatureStore([rect], precision, (3, 5), 37, 8, "cuda")
+        for plane, cells, columns, offset in pieces:
+            # strided values: the chunk is a column window of a wider tensor
+            values = data[plane][cells, offset + columns.start : offset + columns.stop]
+            store.write(rect, FeatureChunk(plane, cells, columns, values), offset)
+        store.check_complete()
+        stores.append(store.groups[0].data)
+    assert torch.equal(stores[0], stores[1])
+
+
+@requires_cuda
+def test_write_kernel_reports_what_it_cannot_write():
+    from panther_em.search.correlation.kernels import fused_kernel_loader
+
+    store = torch.zeros((2, 1, 2, 4, 6), dtype=torch.float16, device="cuda")
+    values = torch.zeros((6, 8), dtype=torch.complex64, device="cuda")
+    assert not fused_kernel_loader.store_write(store.cpu(), values, 0, 0, 0)
+    assert not fused_kernel_loader.store_write(store.float(), values, 0, 0, 0)
+    assert not fused_kernel_loader.store_write(store, values.cfloat().real, 0, 0, 0)
+    if fused_kernel_loader._try_compile() is not None:
+        assert fused_kernel_loader.store_write(store, values, 0, 0, 0)

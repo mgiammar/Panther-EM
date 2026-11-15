@@ -36,7 +36,19 @@ if TYPE_CHECKING:
     from panther_em.search.featurization.zipfft_backend import FFTBackend
 
 DEFAULT_CELL_CHUNK = 32
-"""Kernel spectra computed (and held) per chunk."""
+"""Kernel spectra computed (and held) per chunk (rounded to whole rows of cells)."""
+
+
+def row_aligned_chunk(cell_chunk: int, row: int) -> int:
+    """The chunk size nearest ``cell_chunk`` that keeps chunks on whole cell rows."""
+    n, row = max(1, int(cell_chunk)), max(1, int(row))
+    if n >= row:
+        below, above = n // row * row, -(-n // row) * row
+    else:
+        divisors = [d for d in range(1, row + 1) if row % d == 0]
+        below = max(d for d in divisors if d <= n)
+        above = min(d for d in divisors if d >= n)
+    return below if n - below <= above - n else above
 
 
 class FFTFeaturization(BaseImageFeaturization):
@@ -50,7 +62,8 @@ class FFTFeaturization(BaseImageFeaturization):
         ``(k_start, m_start, k_extent, m_extent)``.
     cell_chunk : int, optional
         Cells per chunk (on cuFFT each holds a ``8 S FX`` byte spectrum, 134 MB at
-        4096^2).
+        4096^2), rounded to whole rows of the rectangle's cells
+        (:func:`row_aligned_chunk`, :attr:`chunk_cells`).
     strip_heights, strip_widths : sequence of int, optional
         FFT heights / widths to run, overriding the backend's (``None``: the zipFFT
         shapes compiled for the box, or any size on cuFFT).
@@ -90,6 +103,11 @@ class FFTFeaturization(BaseImageFeaturization):
         self.strip_widths = (
             None if strip_widths is None else tuple(int(w) for w in strip_widths)
         )
+
+    @cached_property
+    def chunk_cells(self) -> int:
+        """Cells per chunk: ``cell_chunk`` on whole rows of the rectangle's cells."""
+        return min(row_aligned_chunk(self.cell_chunk, self.rect[3]), self.n_cells)
 
     @cached_property
     def kernels(self) -> torch.Tensor:
@@ -261,8 +279,8 @@ class FFTFeaturization(BaseImageFeaturization):
     ) -> Iterator[tuple[int, slice, torch.Tensor]]:
         """``(plane, cells, values)`` of a strip on cuFFT (``index``: gather)."""
         n_positions = rows * out_w if index is None else int(index.numel())
-        for start in range(0, self.n_cells, self.cell_chunk):
-            cells = slice(start, min(start + self.cell_chunk, self.n_cells))
+        for start in range(0, self.n_cells, self.chunk_cells):
+            cells = slice(start, min(start + self.chunk_cells, self.n_cells))
             spectra = torch.fft.fft2(self.kernels[cells], s=fft_shape).conj()
             for d, image_fft in enumerate(image_ffts):
                 values = torch.empty(
@@ -296,9 +314,7 @@ class FFTFeaturization(BaseImageFeaturization):
         valid = (fft_shape[0] - k_h + 1, fft_shape[1] - k_w + 1)
         n_positions = rows * out_w if index is None else int(index.numel())
         direct = index is None and (rows, out_w) == valid
-        largest = split_batch(
-            min(self.cell_chunk, self.n_cells), batches, self.max_batch
-        )[0]
+        largest = split_batch(self.chunk_cells, batches, self.max_batch)[0]
         workspace = torch.empty(
             (largest, *fft_shape), dtype=torch.complex64, device=device
         )
@@ -307,8 +323,8 @@ class FFTFeaturization(BaseImageFeaturization):
             if direct
             else torch.empty((largest, *valid), dtype=torch.complex64, device=device)
         )
-        for start in range(0, self.n_cells, self.cell_chunk):
-            cells = slice(start, min(start + self.cell_chunk, self.n_cells))
+        for start in range(0, self.n_cells, self.chunk_cells):
+            cells = slice(start, min(start + self.chunk_cells, self.n_cells))
             kernels = self.kernels[cells].contiguous()
             calls = split_batch(len(kernels), batches, self.max_batch)
             for d, spectrum in enumerate(spectra):

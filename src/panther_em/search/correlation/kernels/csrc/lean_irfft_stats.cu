@@ -20,6 +20,10 @@
 
 #include "lean_irfft_stats.cuh"
 
+// store_write.cu: a featurization chunk into a feature store's group tensor.
+void store_write(torch::Tensor store, torch::Tensor values, int64_t plane,
+                 int64_t cell0, int64_t col0);
+
 // Packed (sortable(-inf), 0): the value best_packed is pre-filled with. The sortable
 // map flips every bit of a negative float, so -inf (0xFF800000) maps to 0x007FFFFF.
 static int64_t sentinel_packed_i64() {
@@ -191,4 +195,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("lean_sentinel_packed", &lean_sentinel_packed,
         "int64 bit pattern of the packed (-inf, 0) sentinel best_packed is pre-filled "
         "with");
+  m.def("store_write", &store_write,
+        "Write (n_cells, P) complex64 features (cells from cell0, columns from col0) "
+        "into a (n_blocks, D, K, BP, W) float16 [Re | Im] or complex64 store's plane",
+        pybind11::arg("store"), pybind11::arg("values"), pybind11::arg("plane"),
+        pybind11::arg("cell0"), pybind11::arg("col0"));
 }

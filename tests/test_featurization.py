@@ -18,6 +18,7 @@ from panther_em.search.featurization import (
 from panther_em.search.featurization import (
     direct_featurization as direct_module,
 )
+from panther_em.search.featurization.fft_featurization import row_aligned_chunk
 from panther_em.search.featurization.zipfft_backend import (
     split_batch,
     zipfft_shapes,
@@ -142,12 +143,12 @@ def test_fft_matches_reference_in_the_callers_order(warp):
     rows, cols = positions(40, 34, 31)
     f = FFTFeaturization(warp, RECT, cell_chunk=4)
     chunks = list(f.chunks(x, rows, cols))
-    # one chunk per (cell chunk, plane), every position
+    # one chunk per (cell chunk, plane), every position; 4 cells -> rows of 3
     assert [(c.plane, c.cells) for c in chunks] == [
-        (0, slice(0, 4)),
-        (1, slice(0, 4)),
-        (0, slice(4, 6)),
-        (1, slice(4, 6)),
+        (0, slice(0, 3)),
+        (1, slice(0, 3)),
+        (0, slice(3, 6)),
+        (1, slice(3, 6)),
     ]
     assert bool((coverage(chunks, 2, 6, 40) == 1).all())
     assert_features(f.featurize(x, rows, cols), reference(warp, x, rows, cols))
@@ -343,6 +344,22 @@ def zipfft_ready():
 requires_zipfft = pytest.mark.skipif(
     not zipfft_ready(), reason="needs zipFFT compiled with the box-20 test shapes"
 )
+
+
+def test_cell_chunks_keep_to_whole_rows(warp):
+    assert [row_aligned_chunk(n, 40) for n in (32, 16, 8, 1, 60, 64, 100)] == [
+        40,
+        20,
+        8,
+        1,
+        40,  # a tie: the smaller
+        80,
+        80,
+    ]
+    assert row_aligned_chunk(32, 1) == 32 and row_aligned_chunk(32, 80) == 40
+    k_ext, m_ext = RECT[2], RECT[3]
+    f = FFTFeaturization(warp, RECT, cell_chunk=10 * k_ext * m_ext)
+    assert f.chunk_cells == k_ext * m_ext  # never above the rectangle
 
 
 def test_zipfft_batches_split_largest_first():

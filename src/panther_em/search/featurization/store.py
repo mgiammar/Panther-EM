@@ -26,6 +26,7 @@ import torch
 
 from panther_em.decomposition.rectangles import as_rectangle
 from panther_em.search.correlation.contraction import Precision, make_engine
+from panther_em.search.correlation.kernels import fused_kernel_loader
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -243,15 +244,18 @@ class FeatureStore:
             raise ValueError(f"columns [{start}, {stop}) beyond the {self.n_pixels}")
         bp = self.block_pixels
         values = chunk.values.to(self.device)
-        for b in range(start // bp, -(-stop // bp)):
-            b0, b1 = max(start, b * bp), min(stop, (b + 1) * bp)
-            block = group.data[b, chunk.plane : chunk.plane + 1]
-            group.engine.write_block(
-                block,
-                chunk.cells,
-                slice(b0 - b * bp, b1 - b * bp),
-                values[None, :, b0 - start : b1 - start],
-            )
+        if not fused_kernel_loader.store_write(
+            group.data, values, chunk.plane, chunk.cells.start, start
+        ):  # through torch, block by block
+            for b in range(start // bp, -(-stop // bp)):
+                b0, b1 = max(start, b * bp), min(stop, (b + 1) * bp)
+                block = group.data[b, chunk.plane : chunk.plane + 1]
+                group.engine.write_block(
+                    block,
+                    chunk.cells,
+                    slice(b0 - b * bp, b1 - b * bp),
+                    values[None, :, b0 - start : b1 - start],
+                )
         n_cells = chunk.cells.stop - chunk.cells.start
         self._written[group.id, chunk.plane] += n_cells * (stop - start)
 

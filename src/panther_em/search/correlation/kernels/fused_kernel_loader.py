@@ -1,5 +1,8 @@
 """JIT-compile glue for the register-resident fused iRFFT + moments + max kernel.
 
+The same extension carries the feature store's write kernel (``csrc/store_write.cu``,
+:func:`store_write`).
+
 The kernel (``csrc/lean_irfft_stats.cuh``, generated transforms in
 ``csrc/lean_fft_gen.cuh``) recovers every in-plane angle of a hypothesis batch's
 angular spectrum and reduces it to the per-pixel moment sums and the packed maximum,
@@ -31,6 +34,7 @@ _CSRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
 
 _warned_compile_failure = False
 _warned_runtime_failure = False
+_warned_write_failure = False
 
 
 @functools.lru_cache(maxsize=1)
@@ -71,7 +75,10 @@ def _try_compile() -> Any:
 
         return load(
             name=EXTENSION_NAME,
-            sources=[os.path.join(_CSRC_DIR, "lean_irfft_stats.cu")],
+            sources=[
+                os.path.join(_CSRC_DIR, "lean_irfft_stats.cu"),
+                os.path.join(_CSRC_DIR, "store_write.cu"),
+            ],
             extra_include_paths=[_CSRC_DIR],
             extra_cuda_cflags=nvcc_flags,
             extra_cflags=["-O3", "-std=c++17"],
@@ -204,3 +211,56 @@ def lean_sentinel_packed() -> int | None:
     """int64 bit pattern of the packed ``(-inf, 0)`` sentinel (``None``: no kernel)."""
     module = _try_compile()
     return int(module.lean_sentinel_packed()) if module is not None else None
+
+
+def store_write(
+    store: torch.Tensor, values: torch.Tensor, plane: int, cell0: int, col0: int
+) -> bool:
+    """Write a featurization chunk into a store's group tensor in one launch.
+
+    ``store[block, plane, k, row, m] = values[cell - cell0, col - col0]`` for the
+    row-major cells ``cell = k * M + m`` from ``cell0`` and the columns ``col = block *
+    BP + row`` from ``col0`` (see ``csrc/store_write.cu``).
+
+    Parameters
+    ----------
+    store : torch.Tensor
+        Contiguous ``(n_blocks, D, K, BP, 2M)`` float16 ``[Re | Im]`` or ``(n_blocks,
+        D, K, BP, M)`` complex64 CUDA tensor.
+    values : torch.Tensor
+        ``(n_cells, P)`` complex64 on the store's device.
+    plane, cell0, col0 : int
+        Plane of ``store``, first cell, first column.
+
+    Returns
+    -------
+    bool
+        Whether the kernel wrote the chunk (``False``: the extension is unavailable,
+        the tensors do not fit it, or it raised (a warning is issued once) -- the
+        caller writes it).
+    """
+    global _warned_write_failure
+
+    if not (store.is_cuda and values.is_cuda) or store.device != values.device:
+        return False
+    if store.dtype not in (torch.float16, torch.complex64) or not store.is_contiguous():
+        return False
+    if values.dtype is not torch.complex64:
+        return False
+    module = _try_compile()
+    if module is None:
+        return False
+    if values.dim() == 2 and values.shape[1] > 1 and values.stride(1) != 1:
+        values = values.contiguous()
+    try:
+        module.store_write(store, values, int(plane), int(cell0), int(col0))
+    except Exception as exc:
+        if not _warned_write_failure:
+            warnings.warn(
+                f"Feature store write kernel raised, writing through torch: {exc}",
+                UserWarning,
+                stacklevel=2,
+            )
+            _warned_write_failure = True
+        return False
+    return True
