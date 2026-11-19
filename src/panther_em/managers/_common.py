@@ -111,17 +111,27 @@ def read_config(path: str | Path, cls: type[C]) -> C | None:
 # --------------------------------------------------------------------------- #
 
 
-def read_micrograph(
-    path: str | Path, device: torch.device | str = "cpu"
-) -> torch.Tensor:
-    """A 2-D MRC image as float32 on ``device``, its mean subtracted."""
+def read_image(path: str | Path) -> np.ndarray:
+    """A 2-D MRC image as a float32 array, as stored."""
     data = np.asarray(mrcfile.read(str(path)), dtype=np.float32)
     if data.ndim == 3 and data.shape[0] == 1:
         data = data[0]
     if data.ndim != 2:
         raise ValueError(f"'{path}' is not a 2-D image: shape {data.shape}")
-    image = torch.from_numpy(data.copy())
-    return (image - image.mean()).to(device)
+    return data
+
+
+def centered(image: np.ndarray | torch.Tensor) -> torch.Tensor:
+    """A float32 CPU copy of ``image`` with its mean subtracted."""
+    tensor = torch.as_tensor(np.array(image, dtype=np.float32, copy=True))
+    return tensor - tensor.mean()
+
+
+def read_micrograph(
+    path: str | Path, device: torch.device | str = "cpu"
+) -> torch.Tensor:
+    """A 2-D MRC image as float32 on ``device``, its mean subtracted."""
+    return centered(read_image(path)).to(device)
 
 
 def read_mask(path: str | Path, shape: tuple[int, int]) -> torch.Tensor:

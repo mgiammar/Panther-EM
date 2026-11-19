@@ -8,7 +8,10 @@ In pipeline order:
    (and the cheap errors and rank suggestions);
 4. :mod:`.search` -- micrographs -> one search result each (resumable);
 5. :mod:`.export` -- search results -> a Leopard-EM particle stack (HDF5) for its
-   template refinement (the Leopard-EM interface: :mod:`.leopard`).
+   template refinement (the Leopard-EM interface: :mod:`.leopard`);
+6. :mod:`.null` -- a search config -> its null: phase-randomised copies of its
+   micrographs searched identically, and/or the analytic prediction, with the
+   thresholds for target false positives per micrograph.
 
 Each program's ``run(config)`` builds the domain objects and calls them; the domain
 constructors validate the values. Every file a program writes records its config
@@ -20,6 +23,7 @@ follows back to the optics, the micrograph and the template volume. The
 from panther_em.managers.calibrate import CalibrateConfig
 from panther_em.managers.decompose import DecomposeConfig
 from panther_em.managers.export import ExportConfig
+from panther_em.managers.null import NullConfig
 from panther_em.managers.search import SearchConfig
 from panther_em.managers.whitening import WhiteningConfig
 
@@ -27,6 +31,7 @@ __all__ = [
     "CalibrateConfig",
     "DecomposeConfig",
     "ExportConfig",
+    "NullConfig",
     "SearchConfig",
     "WhiteningConfig",
 ]

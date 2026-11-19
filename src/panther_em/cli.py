@@ -7,6 +7,7 @@
     panther-em calibrate calibrate.yaml
     panther-em search search.yaml
     panther-em export export.yaml
+    panther-em null null.yaml
 
 ``panther-em <program> --example`` prints a config with every field (defaults
 filled, required ones marked) to start from.
@@ -25,6 +26,7 @@ from panther_em.managers import (
     calibrate,
     decompose,
     export,
+    null,
     search,
     whitening,
 )
@@ -40,6 +42,7 @@ PROGRAMS: dict[str, tuple[ModuleType, type[ProgramConfig]]] = {
     "calibrate": (calibrate, calibrate.CalibrateConfig),
     "search": (search, search.SearchConfig),
     "export": (export, export.ExportConfig),
+    "null": (null, null.NullConfig),
 }
 
 

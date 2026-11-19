@@ -54,6 +54,7 @@ class Template:
         self.reconstructor = Reconstructor(result, warp, device=self.device)
         self._weights_cells = weights_cells
         self._weights: WeightSource | None = None
+        self._row_scale: torch.Tensor | None = None
 
     @property
     def warp(self) -> WarpConfig:
@@ -82,10 +83,45 @@ class Template:
 
     @property
     def weights(self) -> WeightSource:
-        """Device-resident ``U * S`` (built on first access)."""
+        """Device-resident ``U * S`` (built on first access), rows scaled if set."""
         if self._weights is None:
             self._weights = WeightSource(self.result, self.device, self._weights_cells)
+            if self._row_scale is not None:
+                self._weights.us.mul_(self._row_scale_on(self.device))
         return self._weights
+
+    @property
+    def row_scale(self) -> torch.Tensor | None:
+        """``(N,)`` float64 CPU factor every template row's weights carry, or ``None``.
+
+        Set by :meth:`scale_rows` (after-CTF normalization,
+        :mod:`panther_em.search.normalization`).
+        """
+        return self._row_scale
+
+    def scale_rows(self, scale: torch.Tensor) -> None:
+        """Multiply template row ``n``'s weights ``U * S`` by ``scale[n]``.
+
+        The correlation of row ``n`` with any image scales by ``scale[n]``; every set
+        derived from the weights (moment forms, seed templates, packed operands) is
+        built from the scaled weights. Replaces a previous scale. Call before the
+        first search (derived sets cached by a searcher are not rebuilt).
+        """
+        s = torch.as_tensor(scale, dtype=torch.float64).reshape(-1).cpu()
+        if s.numel() != self.n_templates:
+            raise ValueError(f"{s.numel()} scales for {self.n_templates} template rows")
+        if not bool(torch.isfinite(s).all()) or bool((s <= 0).any()):
+            raise ValueError("row scales must be finite and positive")
+        if self._weights is not None:
+            new = s.to(self.device, torch.float32)[:, None, None]
+            if self._row_scale is not None:
+                new = new / self._row_scale_on(self.device)
+            self._weights.us.mul_(new)
+        self._row_scale = s
+
+    def _row_scale_on(self, device: torch.device) -> torch.Tensor:
+        assert self._row_scale is not None
+        return self._row_scale.to(device, torch.float32)[:, None, None]
 
     @cached_property
     def space(self) -> HypothesisSpace:
