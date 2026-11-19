@@ -21,8 +21,16 @@ an extra factor ``c`` (the template norm, ~185 on xenon_216), so unscaled maps g
 ``z = cc / (c sigma) - mu / sigma``: the correlation term is suppressed by ``c`` and
 the argmax over the shift window follows ``mu / sigma``, pulling refined positions to
 the window's edge. ``mip``, ``correlation_average`` and ``correlation_variance`` are
-therefore divided by :func:`correlation_scale`, the median ``sigma``, which restores
-``mu ~ 0`` and ``sigma ~ 1``. ``scaled_mip`` is a z-score and needs no scale.
+therefore divided by the median ``sigma``, which restores ``mu ~ 0`` and ``sigma ~ 1``.
+``scaled_mip`` is a z-score and needs no scale.
+
+The median is taken per stage (:func:`correlation_scales`): each pixel's maps are
+divided by the median ``sigma`` of the pixels its own last stage scored. Stages differ
+in scale (more planes, a larger feature rectangle). In a two-stage search most pixels
+stop at stage 1, so one median over every pixel is stage 1's, and the final stage's
+pixels (the particles) keep ``sigma / c`` ~ 1.1. Leopard-EM's refined z, divided by
+that ``sigma / c``, then comes out ~9% low (xenon_131: 0.87-0.92 of the search's z at
+the same pose).
 """
 
 from __future__ import annotations
@@ -79,18 +87,42 @@ def _hypotheses(result: SearchResult, n_psi: int) -> int:
     return space.n_defocus * space.n_filters * space.n_orientations * n_psi
 
 
-def correlation_scale(result: SearchResult) -> float:
-    """Median standard deviation of ``result``'s correlations over searched pixels.
+def correlation_scales(result: SearchResult) -> dict[int, float]:
+    """Median standard deviation of ``result``'s correlations, per stage.
 
-    Estimated factor from approximated correlation units in Panther-EM and the
-    normalized cross-correlation values in Leopard-EM.
+    For every stage that was the last to score some pixel, the median ``sigma`` over
+    those pixels: the factor from Panther-EM's approximated correlation units to
+    Leopard-EM's normalized cross-correlation at that stage's pixels.
     """
-    searched = (result.last_stage[0] >= 0).cpu()
-    std = result.variance[0].detach().cpu().double().clamp_min(0.0).sqrt()[searched]
-    std = std[torch.isfinite(std)]
-    scale = float(std.median()) if std.numel() else float("nan")
-    if not scale > 0.0:
+    last = result.last_stage[0].cpu()
+    std = result.variance[0].detach().cpu().double().clamp_min(0.0).sqrt()
+    scales: dict[int, float] = {}
+    for stage in sorted(int(v) for v in torch.unique(last[last >= 0])):
+        values = std[last == stage]
+        values = values[torch.isfinite(values)]
+        if values.numel() and float(values.median()) > 0.0:
+            scales[stage] = float(values.median())
+    if not scales:
         raise ValueError("the result has no searched pixel with a positive variance")
+    return scales
+
+
+def correlation_scale(result: SearchResult) -> float:
+    """The final stage's :func:`correlation_scales` (the stage particles come from).
+
+    Its pixels are the last scored by the highest stage; for a one-stage search, the
+    median standard deviation over every searched pixel.
+    """
+    scales = correlation_scales(result)
+    return scales[max(scales)]
+
+
+def _scale_map(result: SearchResult) -> torch.Tensor:
+    """``(H, W)`` float64: each pixel's stage's :func:`correlation_scales` (else 1)."""
+    last = result.last_stage[0].cpu()
+    scale = torch.ones(last.shape, dtype=torch.float64)
+    for stage, value in correlation_scales(result).items():
+        scale[last == stage] = value
     return scale
 
 
@@ -100,14 +132,14 @@ def match_template_maps(result: SearchResult) -> dict[str, torch.Tensor]:
         raise ValueError("a Leopard-EM result holds one micrograph")
     decoded = result.decode()
     searched = (result.last_stage[0] >= 0).cpu()
-    scale = correlation_scale(result)
+    scale = _scale_map(result).to(torch.float32)
 
     def plane(values: torch.Tensor | None) -> torch.Tensor:
         if values is None:
             return torch.zeros(searched.shape, dtype=torch.float32)
         return values[0].detach().to("cpu", torch.float32)
 
-    maps = {  # correlations in units of the scale, Leopard-EM's
+    maps = {  # correlations in units of each pixel's stage scale, Leopard-EM's
         "mip": plane(result.mip) / scale,
         "scaled_mip": plane(result.zscore),
         "correlation_average": plane(result.mean) / scale,
@@ -141,6 +173,9 @@ def write_match_template_maps(
         f.attrs["total_orientations"] = space.n_orientations * space.n_filters * n_psi
         f.attrs["total_defocus"] = space.n_defocus
         f.attrs["panther_em_correlation_scale"] = correlation_scale(result)
+        f.attrs["panther_em_correlation_scales"] = json.dumps(
+            {str(k): v for k, v in correlation_scales(result).items()}
+        )
         if HDF5_TENSORS_GROUP in f:
             del f[HDF5_TENSORS_GROUP]
         group = f.create_group(HDF5_TENSORS_GROUP)

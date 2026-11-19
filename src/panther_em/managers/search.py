@@ -11,7 +11,9 @@ stopped. A micrograph's ``mask`` restricts the search to the positions whose box
 center it covers (one whose mask leaves none is not searched). Results are written
 on a background thread while the next micrograph is searched (``pending_writes``),
 and the next micrographs can be read on another (``prefetch``).
-``search_summary.json`` collects each micrograph's label counts.
+``search_summary.json`` collects each micrograph's label counts. With ``fdr`` set (the
+default) each micrograph's final picks are cut at its own false-discovery-rate
+threshold after the search (:mod:`~panther_em.managers.fdr`).
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import torch
 from pydantic import Field, model_validator
@@ -31,13 +33,21 @@ from panther_em._precision import Precision
 from panther_em.approximation import PerSpatialFrequencyErrorTable
 from panther_em.filters import WhiteningFilter, ctf_planes
 from panther_em.managers import leopard
+from panther_em.managers._analytic import AnalyticSpec
 from panther_em.managers._common import (
     Model,
     ProgramConfig,
     Rectangle,
     read_mask,
     read_micrograph,
+    read_volume,
     save_output,
+)
+from panther_em.managers.fdr import (
+    FdrNull,
+    apply_fdr,
+    calibrated_null_rate,
+    null_cut_1fp,
 )
 from panther_em.search import (
     Calibration,
@@ -56,6 +66,15 @@ from panther_em.search import (
 )
 from panther_em.search.correlation.contraction import BatchShape
 from panther_em.search.images import SearchGeometry
+from panther_em.search.normalization import (
+    AfterCtfNormalization,
+    CtfSpec,
+    reference_noise,
+    scale_table,
+)
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 class Optics(Model):
@@ -169,6 +188,68 @@ class SearchConfig(ProgramConfig):
         when its search starts.
     device : str
         Compute device. Default ``"cpu"``.
+    normalization : {"after_ctf", "before_ctf"}
+        Where each hypothesis's noise level is set. ``"after_ctf"`` (default): every
+        ``(plane, template)`` hypothesis is rescaled to (nearly) the same noise
+        variance under its CTF plane, as Leopard-EM and cisTEM normalize their
+        CTF-filtered projections -- a factor per template row (once per run) times a
+        factor per CTF plane (per micrograph). Lowers the null tail (the noise-only
+        maximum) without changing particle z on average. ``"before_ctf"``: Panther's
+        original behaviour, every template projection at unit variance before the
+        CTF, so a hypothesis's noise variance varies with how much of its power the
+        plane's CTF passes; set it to reproduce results made before the default
+        changed (z-scores, null calibrations and thresholds from those runs do not
+        carry over). See :mod:`panther_em.search.normalization` and
+        ``docs/after_ctf_normalization.md``.
+    fdr : float or None
+        False discovery rate of the final picks, default 0.05: per micrograph, after
+        the search, only the peaks above the Benjamini-Hochberg threshold under the
+        micrograph's null (``fdr_null``) stay ACCEPTED. Applies when the final stage's
+        threshold is ``"auto"``. ``None``: the fixed ``"auto"`` threshold, one
+        expected false detection per micrograph (the behaviour before this option).
+        See :mod:`panther_em.managers.fdr` and ``docs/fdr_detection.md``.
+    fdr_reach : float
+        With ``fdr`` set, the final stage's ``"auto"`` threshold -- the lowest z the
+        FDR cut can reach (the floor) -- sits this many z below the 1-FP threshold
+        (``fdr_anchor``'s). Default 0.5.
+    fdr_gate_reach : float
+        With ``fdr`` set, the earlier stages' ``"auto"`` thresholds (the stage-1
+        gate) sit this many z below their 1-FP thresholds, moved with the final
+        stage's (``fdr_anchor``). The gate's own margin keeps pixels about 0.3 z
+        further down, so 0.25 covers the 0.5 floor; it sets the extra cost (1.6 to
+        1.9x the search time on a 4k micrograph at B 0: stage 2 sees ~3x the
+        pixels). Default 0.25.
+    fdr_anchor : {"null", "formula"}
+        Which 1-FP threshold ``fdr_reach`` and ``fdr_gate_reach`` are measured
+        from. ``"null"`` (default): the micrograph's FDR null's own 1-FP cut, so
+        the floor sits ``fdr_reach`` below the cut the null itself puts at one
+        false peak. Every ``"auto"`` threshold moves by that cut minus the
+        formula's: down for a smooth field (a blurred template), where the null is
+        far below the formula and the FDR cut falls with it. ``"formula"``: the
+        independent-trial 1-FP threshold, which ignores the template (the behaviour
+        before this option). With ``fdr_null: formula``, or a null without a 1-FP
+        crossing, both are the formula's.
+    fdr_peak_radius : float
+        Minimum distance between the peaks the FDR rule counts, pixels. Default 10
+        (the particle export's ``peak_radius``).
+    fdr_null : {"analytic", "formula"} or Path
+        The FDR rule's null. ``"analytic"`` (default): each micrograph's analytic null,
+        computed from the search's own template, filters, grid and the micrograph's
+        power spectrum (``panther_em.managers.null.predict_search_null``; about a
+        minute per 13-plane 4k micrograph on a GPU). ``"formula"``: the
+        independent-trial count (conservative: about half the requested FDR on
+        xenon_131 and Track S). A path: the ``null_summary.json`` of ``panther-em
+        null`` for this search config (``fdr_null_source`` picks its null). A
+        micrograph the analytic model cannot cover (or the summary lacks) keeps the
+        formula, and its record says why.
+    fdr_null_source : {"analytic", "empirical"}
+        With a ``null_summary.json``: its analytic prediction (default) or the
+        phase-randomised copies' rate table.
+    fdr_volume : Path, optional
+        The template volume for ``fdr_null: analytic``; default the one the
+        decomposition records.
+    fdr_analytic : AnalyticSpec
+        Sampling of ``fdr_null: analytic`` (as ``panther-em null``'s ``analytic``).
     """
 
     program: ClassVar[str] = "search"
@@ -191,6 +272,16 @@ class SearchConfig(ProgramConfig):
     pending_writes: int = Field(default=1, ge=0)
     prefetch: int = Field(default=0, ge=0)
     device: str = "cpu"
+    normalization: Literal["after_ctf", "before_ctf"] = "after_ctf"
+    fdr: float | None = Field(default=0.05, gt=0.0, lt=1.0)
+    fdr_reach: float = Field(default=0.5, ge=0.0)
+    fdr_gate_reach: float = Field(default=0.25, ge=0.0)
+    fdr_anchor: Literal["null", "formula"] = "null"
+    fdr_peak_radius: float = Field(default=10.0, gt=0.0)
+    fdr_null: Literal["analytic", "formula"] | Path = "analytic"
+    fdr_null_source: Literal["analytic", "empirical"] = "analytic"
+    fdr_volume: Path | None = None
+    fdr_analytic: AnalyticSpec = AnalyticSpec()
 
     @model_validator(mode="after")
     def _links(self) -> SearchConfig:
@@ -281,19 +372,202 @@ class _Run:
         self.execution = execution_config(config.execution)
         self.offsets = torch.tensor(config.defocus_offsets, dtype=torch.float32)
         self.searchers: dict[tuple[int, int], Searcher] = {}
+        self.normalization: AfterCtfNormalization | None = None
+        # (frequencies, (D, F) reference noise) the row factors were computed under
+        self.reference_noise: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.normalization_reports: dict[str, dict] = {}
+        self.fdr_reports: dict[str, dict] = {}
+        self._fdr_volume: np.ndarray | None = None
+        if config.normalization == "after_ctf":
+            self._normalize_after_ctf()
 
-    def threshold(self, spec: StageSpec, n_pixels: int) -> float:
-        """The stage's threshold for a micrograph of ``n_pixels`` searched positions."""
-        if spec.decision.threshold != "auto":
-            return float(spec.decision.threshold)
+    def _final_table_tag(self) -> str:
+        """The table of the last stage that has one (the reported z-scores' stage)."""
+        for spec in reversed(self.config.stages):
+            if spec.table is not None:
+                return spec.table
+        return self.config.noise_tag
+
+    def _normalize_after_ctf(self) -> None:
+        """Apply the run-wide row factors ``a_n`` to the template and every table.
+
+        ``a_n`` equalizes, over the template rows, the noise variance of the final
+        stage's kept correlation under a reference noise model: white noise under
+        each searched plane's ring-averaged ``CTF^2``, averaged over the run's
+        micrographs (:func:`~panther_em.search.normalization.reference_noise`). The
+        per-plane factors follow per micrograph (:meth:`prepare`).
+        """
+        config = self.config
+        table = self.tables[self._final_table_tag()]
+        noise_table = self.tables[config.noise_tag]
+        if not torch.equal(table.frequencies, noise_table.frequencies):
+            # the micrographs' curves live on the noise table's axis
+            table = noise_table
+        optics = config.optics
+        reference = reference_noise(
+            table,
+            [
+                CtfSpec(
+                    (m.defocus_u + m.defocus_v) / 2,
+                    (m.defocus_u - m.defocus_v) / 2,
+                    m.astigmatism_angle,
+                )
+                for m in config.micrographs
+            ],
+            config.defocus_offsets,
+            pixel_size=optics.pixel_size,
+            voltage=optics.voltage,
+            spherical_aberration=optics.spherical_aberration,
+            amplitude_contrast=optics.amplitude_contrast_ratio,
+            phase_shift=optics.phase_shift,
+            device=self.device,
+        )
+        self.normalization = AfterCtfNormalization.create(table, reference)
+        self.reference_noise = (table.frequencies, reference)
+        a = self.normalization.row_scale
+        self.template.scale_rows(a)
+        self.tables = {tag: scale_table(t, a) for tag, t in self.tables.items()}
+
+    def n_hypotheses(self, spec: StageSpec) -> int:
+        """Hypotheses per position: planes x filters x orientations x ``spec.n_psi``."""
         space = self.template.space
-        n_hypotheses = (
+        return (
             len(self.config.defocus_offsets)
             * space.n_filters
             * space.n_orientations
             * spec.n_psi
         )
-        return zscore_threshold(n_pixels, n_hypotheses)
+
+    @property
+    def fdr_active(self) -> bool:
+        """Whether the FDR rule sets the final picks (``fdr`` set, final stage auto)."""
+        final = self.config.stages[-1].decision.threshold
+        return self.config.fdr is not None and final == "auto"
+
+    def threshold(self, spec: StageSpec, n_pixels: int, shift: float = 0.0) -> float:
+        """The stage's threshold for a micrograph of ``n_pixels`` searched positions.
+
+        Its own, or for ``"auto"`` the 1-FP formula's. When the FDR rule is on, an
+        ``"auto"`` threshold is moved by ``shift`` (the anchor, :meth:`prepare_fdr`)
+        and lowered by ``fdr_reach`` (final stage) or ``fdr_gate_reach`` (earlier
+        stages).
+        """
+        if spec.decision.threshold != "auto":
+            return float(spec.decision.threshold)
+        t = zscore_threshold(n_pixels, self.n_hypotheses(spec))
+        if not self.fdr_active:
+            return t
+        final = spec is self.config.stages[-1]
+        reach = self.config.fdr_reach if final else self.config.fdr_gate_reach
+        return t + shift - reach
+
+    def prepare_fdr(
+        self, n_pixels: int, name: str = "", micrograph: Micrograph | None = None
+    ) -> FdrNull:
+        """The micrograph's FDR null, and where it anchors the ``"auto"`` thresholds.
+
+        Computed before the search: with ``fdr_anchor: null`` every ``"auto"``
+        threshold moves by the null's 1-FP cut minus the formula's (``shift``), so
+        the stages keep the pixels an FDR cut under this null can reach.
+        """
+        rate, record = self._fdr_null(n_pixels, name, micrograph)
+        final = self.config.stages[-1]
+        formula = zscore_threshold(n_pixels, self.n_hypotheses(final))
+        anchor: dict[str, Any] = {"anchor": "formula", "formula_cut_1fp": formula}
+        shift = 0.0
+        if self.config.fdr_anchor == "null" and rate is not None:
+            cut = null_cut_1fp(rate)
+            if cut is None:
+                anchor["anchor_note"] = "the null has no 1-FP crossing"
+            else:
+                shift = cut - formula
+                anchor.update(anchor="null", anchor_cut_1fp=cut, anchor_shift=shift)
+        return FdrNull(rate, {**(record or {"null": "formula"}), **anchor}, shift)
+
+    def apply_fdr(
+        self,
+        result: SearchResult,
+        n_pixels: int,
+        name: str = "",
+        micrograph: Micrograph | None = None,
+        prepared: FdrNull | None = None,
+    ) -> tuple[SearchResult, dict]:
+        """Keep ACCEPTED only the peaks above the micrograph's BH threshold.
+
+        ``n_pixels`` is the micrograph's searched positions (under its mask).
+        ``prepared`` is the null the search's thresholds were set with
+        (:meth:`prepare_fdr`); without it the null is computed here and the floor
+        is the formula's (a search run with the unmoved thresholds). The null is
+        ``fdr_null``'s: the analytic null of ``micrograph`` (the prepared one),
+        ``name``'s from a null summary, or the formula's.
+        """
+        final = self.config.stages[-1]
+        assert self.config.fdr is not None
+        if prepared is None:
+            rate, record = self._fdr_null(n_pixels, name, micrograph)
+            prepared = FdrNull(rate, record or {"null": "formula"}, 0.0)
+        return apply_fdr(
+            result,
+            q=self.config.fdr,
+            n_positions=n_pixels,
+            n_hypotheses=self.n_hypotheses(final),
+            floor=self.threshold(final, n_pixels, prepared.shift),
+            peak_radius=self.config.fdr_peak_radius,
+            absorb_radius=final.decision.absorb_radius,
+            rate=prepared.rate,
+            null_record=prepared.record,
+        )
+
+    def _fdr_null(
+        self, n_pixels: int, name: str, micrograph: Micrograph | None
+    ) -> tuple[Any, dict[str, Any] | None]:
+        """The FDR null's rate and its record (``None`` rate: the formula)."""
+        choice = self.config.fdr_null
+        if choice == "formula":
+            return None, None
+        if choice != "analytic":
+            found = calibrated_null_rate(
+                Path(choice), name, n_pixels, self.config.fdr_null_source
+            )
+            if found is None:
+                return None, {
+                    "null": "formula",
+                    "note": f"no calibrated null for {name}",
+                }
+            return found
+        if micrograph is None:
+            return None, {"null": "formula", "note": "no micrograph to model"}
+        # lazy: the null program imports this module
+        from leopard_em.analysis.fdr import null_rate
+
+        from panther_em.managers.null import predict_search_null, search_volume
+
+        start = time.perf_counter()
+        try:
+            if self._fdr_volume is None:
+                path = search_volume(self.config, self.config.fdr_volume)
+                self._fdr_volume = read_volume(path)
+            prediction = predict_search_null(
+                self,
+                micrograph,
+                n_pixels,
+                self._fdr_volume,
+                spec=self.config.fdr_analytic,
+                mask_radius=self.config.fdr_peak_radius,
+            )
+        except (NotImplementedError, ValueError, FileNotFoundError) as err:
+            return None, {
+                "null": "formula",
+                "note": f"analytic null unavailable: {err}",
+            }
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return null_rate(prediction), {
+            "null": "analytic",
+            "null_cut_1fp": prediction.zscore_cutoff(1.0),
+            "null_seconds": time.perf_counter() - start,
+        }
 
     def n_positions(self, shape: tuple[int, int]) -> int:
         """Search positions of an unmasked micrograph of ``shape``."""
@@ -309,14 +583,20 @@ class _Run:
         )
         return int(geometry.grid_mask(micrograph.mask).sum())
 
-    def thresholds(self, micrograph: Micrograph) -> list[float | None] | None:
-        """Per-stage thresholds of a masked micrograph (``None``: the searcher's)."""
-        if micrograph.mask is None:
+    def thresholds(
+        self, micrograph: Micrograph, shift: float = 0.0
+    ) -> list[float | None] | None:
+        """Per-stage thresholds of a masked or FDR-anchored micrograph.
+
+        ``shift`` moves every ``"auto"`` threshold (:meth:`prepare_fdr`). ``None``:
+        the searcher's own (no mask, no shift).
+        """
+        if micrograph.mask is None and shift == 0.0:
             return None
         n_pixels = self.n_searchable(micrograph)
         return [
             (
-                self.threshold(spec, n_pixels)
+                self.threshold(spec, n_pixels, shift)
                 if spec.decision.threshold == "auto"
                 else None
             )
@@ -363,7 +643,19 @@ class _Run:
         return self.searchers[shape]
 
     def prepare(self, loaded: _Loaded) -> Micrograph:
-        """The searched micrograph of a :func:`_read` (device work and the cache)."""
+        """The searched micrograph of a :func:`_read` (device work and the cache).
+
+        With after-CTF normalization, the per-plane factors are applied here to the
+        micrograph under its unscaled CTF planes (which is what the cache holds).
+        """
+        micrograph = self._prepare_unscaled(loaded)
+        if self.normalization is not None:
+            micrograph, report = self.normalization.apply(micrograph)
+            self.normalization_reports[loaded.entry.key] = report
+        return micrograph
+
+    def _prepare_unscaled(self, loaded: _Loaded) -> Micrograph:
+        """The micrograph under its unscaled CTF planes (cached when allowed)."""
         config, entry = self.config, loaded.entry
 
         if isinstance(loaded.data, Micrograph):
@@ -501,6 +793,10 @@ def run(config: SearchConfig) -> dict[str, Path]:
     def finish(write: Future[tuple[str, Path, dict]]) -> None:
         name, path, record = write.result()
         done[name] = path
+        if state is not None and name in state.normalization_reports:
+            record["normalization"] = state.normalization_reports[name]
+        if state is not None and name in state.fdr_reports:
+            record["fdr"] = state.fdr_reports[name]
         summary[name] = record
         summary_path.write_text(json.dumps(summary, indent=1))
 
@@ -540,15 +836,33 @@ def run(config: SearchConfig) -> dict[str, Path]:
                     summary_path.write_text(json.dumps(summary, indent=1))
                     continue
                 t2 = time.perf_counter()
+                prepared = None
+                if state.fdr_active:  # the null first: it anchors the thresholds
+                    prepared = state.prepare_fdr(
+                        state.n_searchable(micrograph), name, micrograph
+                    )
+                t2b = time.perf_counter()
+                timing["fdr_null_s"] = t2b - t2
                 result = state.searcher(shape).run(
-                    micrograph, thresholds=state.thresholds(micrograph)
+                    micrograph,
+                    thresholds=state.thresholds(
+                        micrograph, 0.0 if prepared is None else prepared.shift
+                    ),
                 )
+                if prepared is not None:
+                    result, state.fdr_reports[name] = state.apply_fdr(
+                        result,
+                        state.n_searchable(micrograph),
+                        name,
+                        micrograph,
+                        prepared,
+                    )
                 t3 = time.perf_counter()
                 maps = leopard.match_template_maps(result)  # on the compute device
                 result = result.to("cpu")
                 timing["read_wait_s"] = t1 - t0
                 timing["prepare_s"] = t2 - t1
-                timing["search_s"] = t3 - t2
+                timing["search_s"] = t3 - t2b  # the search and the FDR cut
                 timing["handoff_s"] = time.perf_counter() - t3
                 pending.append(
                     writer.submit(

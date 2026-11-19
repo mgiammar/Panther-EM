@@ -21,7 +21,10 @@ through the five programs of :mod:`panther_em.managers`, as YAML-driven runs wou
      moments; it rejects, abstains or accepts;
 
 6. ``export``: the accepted particles as a Leopard-EM particle stack
-   (``particles.h5``), ready for Leopard-EM's template refinement.
+   (``particles.h5``), ready for Leopard-EM's template refinement;
+7. ``null``: phase-randomised copies of the empty micrograph m1 searched as the
+   micrographs were, and the analytic null of the same search: the thresholds for
+   one and five false positives per micrograph (``null/null_summary.json``).
 
 Every file is written to ``--out`` and read back. CPU, well under a minute.
 """
@@ -49,7 +52,14 @@ from panther_em.decomposition.projections import (
     precompute_volume_dft,
 )
 from panther_em.filters import ctf_planes as build_ctf_planes
-from panther_em.managers import calibrate, decompose, export, search, whitening
+from panther_em.managers import (
+    calibrate,
+    decompose,
+    export,
+    null,
+    search,
+    whitening,
+)
 from panther_em.orientations import healpix_orientations, ring_neighborhoods
 from panther_em.search import (
     Calibration,
@@ -77,6 +87,7 @@ PIXEL_SIZE = 1.5  # A
 DEFOCUS_UM = (1.0, 2.0)  # the two CTF planes: 1.5 um fitted, -/+ 0.5 um offsets
 PARTICLE = {"micrograph": "m0", "orientation": 3, "plane": 1, "top_left": (20, 44)}
 NAMES = ("m0", "m1", "m2")
+NULL_SEEDS = [1, 2, 3]  # phase-randomised copies of m1 (step 7)
 
 # Micrograph i is drawn with seed NOISE_SEED + i.
 #
@@ -238,10 +249,25 @@ def configs(out: Path, device: str, noise_seed: int) -> dict:
             output_dir=out,
             cache_micrographs=True,  # the evaluation reads the prepared micrographs
             device=device,
+            # the FDR rule's analytic null, sampled as the null step's (fast on a CPU)
+            fdr_analytic=null.AnalyticSpec(
+                n_mean_samples=200, n_kappa_pairs=8, n_lattice_samples=16
+            ),
         ),
         "export": export.ExportConfig(
             results=[out / f"{name}_result.h5" for name in NAMES],
             output=out / "particles.h5",
+        ),
+        "null": null.NullConfig(
+            search=out / "search.yaml",
+            output_dir=out / "null",
+            mode="both",
+            micrographs=["m1"],
+            seeds=NULL_SEEDS,
+            false_positives=[1.0, 5.0],
+            analytic=null.AnalyticSpec(
+                n_mean_samples=200, n_kappa_pairs=8, n_lattice_samples=16
+            ),
         ),
     }
 
@@ -257,6 +283,7 @@ def run(out: Path, device: str = "cpu", noise_seed: int = NOISE_SEED) -> dict:
         ("calibrate", calibrate),
         ("search", search),
         ("export", export),
+        ("null", null),
     ):
         programs[name].to_yaml(out / f"{name}.yaml")
         module.run(programs[name])  # type: ignore[attr-defined]
@@ -306,6 +333,8 @@ def run(out: Path, device: str = "cpu", noise_seed: int = NOISE_SEED) -> dict:
                 "defocus": int(loaded.decode()["defocus_index"][0, r, c]),
             }
         summary["micrographs"][name] = record
+    nulls = json.loads((out / "null" / "null_summary.json").read_text())
+    summary["null"] = nulls["micrographs"]["m1"]["cuts"]
     summary["elapsed_s"] = time.perf_counter() - t0
     (out / "summary.json").write_text(json.dumps(summary, indent=1))
     return summary
@@ -333,6 +362,12 @@ def main() -> None:
         print(f"{name}: score {lo:.2f} .. {hi:.2f}, max z {rec['zscore_max']:.2f}")
         if "particle" in rec:
             print(f"{name}: particle pixel {rec['particle']}")
+    for cut in summary["null"]:
+        print(
+            f"m1 null, {cut['false_positives']:g} FP per micrograph: measured "
+            f"{cut['empirical']}, predicted {cut['analytic']:.3f}, formula "
+            f"{cut['formula']:.3f}"
+        )
     print(f"{summary['elapsed_s']:.1f} s; files in {args.out}")
 
 

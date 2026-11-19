@@ -39,6 +39,7 @@ from panther_em.managers import (
     CalibrateConfig,
     DecomposeConfig,
     ExportConfig,
+    NullConfig,
     SearchConfig,
     WhiteningConfig,
     calibrate,
@@ -52,6 +53,7 @@ from panther_em.managers._common import (
     read_volume,
     save_output,
 )
+from panther_em.managers.fdr import expected_false_peaks
 from panther_em.search import (
     ExecutionConfig,
     Micrograph,
@@ -69,6 +71,7 @@ CONFIGS = {
     "calibrate": CalibrateConfig,
     "search": SearchConfig,
     "export": ExportConfig,
+    "null": NullConfig,
 }
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -202,6 +205,7 @@ def test_search_resumes(pipeline, tmp_path, monkeypatch):
     steps = (
         "read_s",
         "prepare_s",
+        "fdr_null_s",
         "search_s",
         "handoff_s",
         "save_result_s",
@@ -300,14 +304,30 @@ def test_masked_search(pipeline, tmp_path):
     assert m0["mask"] == str(tmp_path / "m0_mask.mrc")
     assert m0["n_searchable"] == n_searchable < grid.numel()
     assert m0["final"]["MASKED"] == grid.numel() - n_searchable
-    assert m0["thresholds"] == pytest.approx(
-        [zscore_threshold(n_searchable, n_hypotheses)] * 2
-    )
     assert m2["mask"] is None and m2["n_searchable"] == grid.numel()
-    assert m2["thresholds"] == pytest.approx(
-        [zscore_threshold(grid.numel(), n_hypotheses)] * 2
-    )
-    assert m0["thresholds"][0] < m2["thresholds"][0]
+    # the formula's thresholds on the searchable positions, lowered by the reach of
+    # the default FDR rule (gate, then final stage) and moved to the null's own 1-FP
+    # cut (fdr_anchor: null); its null counts the same positions
+    reach = [config.fdr_gate_reach, config.fdr_reach]
+    for record, n_pixels in ((m0, n_searchable), (m2, grid.numel())):
+        shift = record["fdr"].get("anchor_shift", 0.0)
+        assert record["fdr"]["formula_cut_1fp"] == pytest.approx(
+            zscore_threshold(n_pixels, n_hypotheses)
+        )
+        assert record["thresholds"] == pytest.approx(
+            [zscore_threshold(n_pixels, n_hypotheses) - r + shift for r in reach]
+        )
+        cut = record["fdr"]["threshold"]
+        if cut is None:  # no peak qualifies: m2 has no particle
+            continue
+        expected = expected_false_peaks(torch.tensor([cut]), n_pixels, n_hypotheses)
+        assert record["fdr"]["expected_false_picks_formula"] == pytest.approx(
+            float(expected[0])
+        )
+    assert m0["fdr"]["threshold"] is not None  # the particle's micrograph
+    # fewer searchable positions, a lower formula cut (the anchored thresholds also
+    # follow each micrograph's own null, so they need not be ordered)
+    assert m0["fdr"]["formula_cut_1fp"] < m2["fdr"]["formula_cut_1fp"]
     assert m1["n_searchable"] == 0 and "skipped" in m1
 
     # Leopard-EM: masked positions are padded, never picked, and not in the scale
@@ -315,7 +335,13 @@ def test_masked_search(pipeline, tmp_path):
     assert bool((maps["scaled_mip"][~grid] == 0).all())
     assert bool((maps["correlation_variance"][~grid] == LARGE_STD_PADDING).all())
     std = result.variance[0].double().clamp_min(0.0).sqrt()
-    assert leopard.correlation_scale(result) == pytest.approx(float(std[grid].median()))
+    last = result.last_stage[0].cpu()
+    for stage, scale in leopard.correlation_scales(result).items():
+        assert scale == pytest.approx(float(std[grid & (last == stage)].median()))
+    final = grid & (last == last.max())
+    assert leopard.correlation_scale(result) == pytest.approx(
+        float(std[final].median())
+    )
     pos_y, pos_x = leopard.pick_particles(result, radius=10.0)
     assert len(pos_y) > 0 and grid[pos_y, pos_x].all()
     assert (int(pos_y[0]), int(pos_x[0])) == module.PARTICLE["top_left"]
@@ -487,11 +513,35 @@ def test_export_stack(pipeline):
     accepted = torch.nonzero(result.label[0] == int(PixelLabel.ACCEPTED)).float()
     picks = torch.tensor(df[["pos_y", "pos_x"]].to_numpy().copy(), dtype=torch.float32)
     assert float(torch.cdist(accepted, picks).min(1).values.max()) <= 10.0
-    assert len(df) < len(accepted)
+    # <=: with the FDR default (SearchConfig.fdr) a lone particle's accepted region
+    # can shrink to its peak pixel
+    assert len(df) <= len(accepted)
 
     # Leopard-EM reads the statistic maps through the path columns
     maps = stack.get_local_stat_maps(use_stored=False)
     assert all(v.shape == (len(df), 17, 17) for v in maps.values())
+
+
+def test_correlation_scales_per_stage():
+    """Two stages with different scales: each pixel's stage gets its own median."""
+    from types import SimpleNamespace
+
+    last = torch.full((1, 6, 6), 0)
+    last[0, :2] = 1  # 12 pixels stop at stage 1
+    last[0, 5, 5] = -1  # not searched
+    sd = (
+        torch.where(last == 1, 2.2, 2.0).double()
+        * torch.linspace(0.9, 1.1, 36).reshape(1, 6, 6).double()
+    )
+    result = SimpleNamespace(last_stage=last, variance=sd**2)
+    scales = leopard.correlation_scales(result)
+    assert set(scales) == {0, 1}
+    assert scales[0] == pytest.approx(float(sd[last == 0].median()))
+    assert scales[1] == pytest.approx(float(sd[last == 1].median()))
+    assert leopard.correlation_scale(result) == scales[1]
+    scale = leopard._scale_map(result)
+    assert float(scale[0, 0]) == scales[1]
+    assert float(scale[4, 4]) == scales[0] and float(scale[5, 5]) == 1.0
 
 
 def test_result_is_a_leopard_match_template_result(pipeline):
@@ -503,14 +553,27 @@ def test_result_is_a_leopard_match_template_result(pipeline):
     assert bool(searched.all())
     # correlations in units of the median standard deviation (Leopard-EM's scale);
     # the z-score is scale-free
-    scale = leopard.correlation_scale(result)
+    # (per stage: each pixel's last stage's median standard deviation)
+    scales = leopard.correlation_scales(result)
+    last = result.last_stage[0].cpu()
+    scale = torch.ones(last.shape)
+    for stage, value in scales.items():
+        scale[last == stage] = value
     with h5py.File(path, "r") as f:
-        assert f.attrs["panther_em_correlation_scale"] == pytest.approx(scale)
+        assert f.attrs["panther_em_correlation_scale"] == pytest.approx(
+            scales[max(scales)]
+        )
+        stored = json.loads(f.attrs["panther_em_correlation_scales"])
+        assert {int(k): v for k, v in stored.items()} == pytest.approx(scales)
     std = result.variance[0].float().sqrt()
     torch.testing.assert_close(leo.scaled_mip, result.zscore[0].float())
     torch.testing.assert_close(leo.mip, result.mip[0].float() / scale)
     torch.testing.assert_close(leo.correlation_average, result.mean[0].float() / scale)
     torch.testing.assert_close(leo.correlation_variance, std / scale)
+    # every stage's pixels now sit at sigma ~ 1, Leopard-EM's unit
+    for stage in scales:
+        exported = leo.correlation_variance[last == stage]
+        assert float(exported.median()) == pytest.approx(1.0, rel=1e-5)
     assert float(leo.correlation_variance.median()) == pytest.approx(1.0, abs=1e-3)
     z = (leo.mip - leo.correlation_average) / leo.correlation_variance
     torch.testing.assert_close(z, leo.scaled_mip, rtol=1e-4, atol=1e-4)
