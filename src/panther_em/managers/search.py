@@ -56,6 +56,12 @@ from panther_em.search import (
 )
 from panther_em.search.correlation.contraction import BatchShape
 from panther_em.search.images import SearchGeometry
+from panther_em.search.normalization import (
+    AfterCtfNormalization,
+    CtfSpec,
+    reference_noise,
+    scale_table,
+)
 
 
 class Optics(Model):
@@ -169,6 +175,19 @@ class SearchConfig(ProgramConfig):
         when its search starts.
     device : str
         Compute device. Default ``"cpu"``.
+    normalization : {"after_ctf", "before_ctf"}
+        Where each hypothesis's noise level is set. ``"after_ctf"`` (default): every
+        ``(plane, template)`` hypothesis is rescaled to (nearly) the same noise
+        variance under its CTF plane, as Leopard-EM and cisTEM normalize their
+        CTF-filtered projections -- a factor per template row (once per run) times a
+        factor per CTF plane (per micrograph). Lowers the null tail (the noise-only
+        maximum) without changing particle z on average. ``"before_ctf"``: Panther's
+        original behaviour, every template projection at unit variance before the
+        CTF, so a hypothesis's noise variance varies with how much of its power the
+        plane's CTF passes; set it to reproduce results made before the default
+        changed (z-scores, null calibrations and thresholds from those runs do not
+        carry over). See :mod:`panther_em.search.normalization` and
+        ``docs/after_ctf_normalization.md``.
     """
 
     program: ClassVar[str] = "search"
@@ -191,6 +210,7 @@ class SearchConfig(ProgramConfig):
     pending_writes: int = Field(default=1, ge=0)
     prefetch: int = Field(default=0, ge=0)
     device: str = "cpu"
+    normalization: Literal["after_ctf", "before_ctf"] = "after_ctf"
 
     @model_validator(mode="after")
     def _links(self) -> SearchConfig:
@@ -281,6 +301,56 @@ class _Run:
         self.execution = execution_config(config.execution)
         self.offsets = torch.tensor(config.defocus_offsets, dtype=torch.float32)
         self.searchers: dict[tuple[int, int], Searcher] = {}
+        self.normalization: AfterCtfNormalization | None = None
+        self.normalization_reports: dict[str, dict] = {}
+        if config.normalization == "after_ctf":
+            self._normalize_after_ctf()
+
+    def _final_table_tag(self) -> str:
+        """The table of the last stage that has one (the reported z-scores' stage)."""
+        for spec in reversed(self.config.stages):
+            if spec.table is not None:
+                return spec.table
+        return self.config.noise_tag
+
+    def _normalize_after_ctf(self) -> None:
+        """Apply the run-wide row factors ``a_n`` to the template and every table.
+
+        ``a_n`` equalizes, over the template rows, the noise variance of the final
+        stage's kept correlation under a reference noise model: white noise under
+        each searched plane's ring-averaged ``CTF^2``, averaged over the run's
+        micrographs (:func:`~panther_em.search.normalization.reference_noise`). The
+        per-plane factors follow per micrograph (:meth:`prepare`).
+        """
+        config = self.config
+        table = self.tables[self._final_table_tag()]
+        noise_table = self.tables[config.noise_tag]
+        if not torch.equal(table.frequencies, noise_table.frequencies):
+            # the micrographs' curves live on the noise table's axis
+            table = noise_table
+        optics = config.optics
+        reference = reference_noise(
+            table,
+            [
+                CtfSpec(
+                    (m.defocus_u + m.defocus_v) / 2,
+                    (m.defocus_u - m.defocus_v) / 2,
+                    m.astigmatism_angle,
+                )
+                for m in config.micrographs
+            ],
+            config.defocus_offsets,
+            pixel_size=optics.pixel_size,
+            voltage=optics.voltage,
+            spherical_aberration=optics.spherical_aberration,
+            amplitude_contrast=optics.amplitude_contrast_ratio,
+            phase_shift=optics.phase_shift,
+            device=self.device,
+        )
+        self.normalization = AfterCtfNormalization.create(table, reference)
+        a = self.normalization.row_scale
+        self.template.scale_rows(a)
+        self.tables = {tag: scale_table(t, a) for tag, t in self.tables.items()}
 
     def threshold(self, spec: StageSpec, n_pixels: int) -> float:
         """The stage's threshold for a micrograph of ``n_pixels`` searched positions."""
@@ -363,7 +433,19 @@ class _Run:
         return self.searchers[shape]
 
     def prepare(self, loaded: _Loaded) -> Micrograph:
-        """The searched micrograph of a :func:`_read` (device work and the cache)."""
+        """The searched micrograph of a :func:`_read` (device work and the cache).
+
+        With after-CTF normalization, the per-plane factors are applied here to the
+        micrograph under its unscaled CTF planes (which is what the cache holds).
+        """
+        micrograph = self._prepare_unscaled(loaded)
+        if self.normalization is not None:
+            micrograph, report = self.normalization.apply(micrograph)
+            self.normalization_reports[loaded.entry.key] = report
+        return micrograph
+
+    def _prepare_unscaled(self, loaded: _Loaded) -> Micrograph:
+        """The micrograph under its unscaled CTF planes (cached when allowed)."""
         config, entry = self.config, loaded.entry
 
         if isinstance(loaded.data, Micrograph):
@@ -501,6 +583,8 @@ def run(config: SearchConfig) -> dict[str, Path]:
     def finish(write: Future[tuple[str, Path, dict]]) -> None:
         name, path, record = write.result()
         done[name] = path
+        if state is not None and name in state.normalization_reports:
+            record["normalization"] = state.normalization_reports[name]
         summary[name] = record
         summary_path.write_text(json.dumps(summary, indent=1))
 
