@@ -50,7 +50,9 @@ def amplitude_spectrum_1d(
     # a CUDA rfft2 result is not contiguous; power_spectral_density flattens with view
     dft = torch.fft.rfft2(image.to(torch.float32)).contiguous()
     dft[0, 0] = 0.0
-    spectrum = power_spectral_density(dft, rfft=True, num_freq_bins=num_freq_bins)
+    spectrum = power_spectral_density(
+        dft, rfft=True, num_freq_bins=num_freq_bins, image_shape=shape
+    )
 
     return frequency_axis(num_freq_bins, device=spectrum.device), spectrum
 

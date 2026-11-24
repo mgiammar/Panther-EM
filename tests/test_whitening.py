@@ -51,7 +51,11 @@ def test_single_micrograph_filter_is_torch_fourier_filters():
     )
     n_bins = calculate_num_freq_bins(SHAPE)
     reference = whitening_filter(
-        torch.fft.rfft2(x), rfft=True, num_freq_bins=n_bins, max_freq=0.5
+        torch.fft.rfft2(x),
+        rfft=True,
+        num_freq_bins=n_bins,
+        max_freq=0.5,
+        image_shape=SHAPE,
     )
     torch.testing.assert_close(single.average_filter(SHAPE), reference)
     torch.testing.assert_close(single.image_filter("x", SHAPE), reference)
@@ -62,6 +66,7 @@ def test_single_micrograph_filter_is_torch_fourier_filters():
         num_freq_bins=n_bins,
         max_freq=0.5,
         output_shape=BOX,
+        image_shape=SHAPE,
     )
     band = low_pass_filter(*BAND, BOX, rfft=True, fftshift=False)
     torch.testing.assert_close(single.template_filter(BOX), on_box * band)

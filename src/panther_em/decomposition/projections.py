@@ -34,6 +34,7 @@ from torch_fourier_slice.volume_utils import (
     compute_cube_face_averages,
     separable_sinc2_correction,
 )
+from torch_grid_utils import image_shape_from_dft_shape
 
 from panther_em.coordinates.transform_base import CoordinateTransform
 from panther_em.coordinates.warp_config import WarpConfig
@@ -78,8 +79,8 @@ def precompute_volume_dft(
     sinc2 = separable_sinc2_correction(volume.shape[-3:], device=volume.device)
     volume = volume / sinc2
 
-    # Center-to-origin shift, then 3D RFFT
-    dft = torch.fft.fftshift(volume, dim=(-3, -2, -1))
+    # Center-to-origin shift (the center is at index d // 2), then 3D RFFT
+    dft = torch.fft.ifftshift(volume, dim=(-3, -2, -1))
     dft = torch.fft.rfftn(dft, dim=(-3, -2, -1))
     dft = torch.fft.fftshift(dft, dim=(-3, -2))  # shift so DC is at center
 
@@ -125,10 +126,14 @@ def project_from_precomputed_dft(
         zyx_matrices=zyx_matrices,
     )
 
-    # Transform back to real space
+    # Transform back to real space, origin back to the center at index d // 2. The
+    # volume is cubic, so the real-space width is the height of the slices.
+    shape = image_shape_from_dft_shape(
+        projections.shape[-2:], rfft=True, assume_square=True
+    )
     projections = torch.fft.ifftshift(projections, dim=(-2,))
-    projections = torch.fft.irfftn(projections, dim=(-2, -1))
-    projections = torch.fft.ifftshift(projections, dim=(-2, -1))
+    projections = torch.fft.irfftn(projections, s=shape, dim=(-2, -1))
+    projections = torch.fft.fftshift(projections, dim=(-2, -1))
 
     # Unpad
     if pad_width > 0:
@@ -180,7 +185,7 @@ def apply_fourier_filters(
     else:
         projections_fft = torch.fft.rfft2(projections)
         projections_fft = projections_fft[None, ...] * fourier_filters[:, None, :, :]
-        filtered = torch.fft.irfft2(projections_fft)
+        filtered = torch.fft.irfft2(projections_fft, s=projections.shape[-2:])
     return filtered
 
 

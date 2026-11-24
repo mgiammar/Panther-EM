@@ -16,7 +16,12 @@ import h5py
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 from scipy.ndimage import gaussian_filter
+from torch_fourier_slice.volume_utils import (
+    compute_cube_face_averages,
+    separable_sinc2_correction,
+)
 
 from panther_em.coordinates.spiral_polar import SpiralPolarTransform
 from panther_em.coordinates.warp_config import WarpConfig
@@ -27,6 +32,7 @@ from panther_em.decomposition.projections import (
     do_pipelined_projection_and_transforms,
     precompute_volume_dft,
     process_batch,
+    project_from_precomputed_dft,
 )
 from panther_em.decomposition.result import (
     DecompositionBase,
@@ -225,6 +231,35 @@ class TestPrecomputeVolumeDft:
         assert pw2 > pw1 > 0
 
 
+@pytest.mark.parametrize("pad_factor", [1.0, 2.0])
+@pytest.mark.parametrize("d", [16, 17])
+def test_projection_matches_real_space_sum(d, pad_factor):
+    """Odd or even, a blob at the volume center (d // 2) projects to the image center.
+
+    At the identity orientation, without the frequency cutoff, the projection is the
+    z-sum of the sinc^2-corrected (padded) volume.
+    """
+    c = d // 2
+    vol = np.zeros((d, d, d))
+    vol[c, c, c] = 1.0
+    vol[c - 3, c + 2, c + 1] = 0.5
+    vol = torch.tensor(gaussian_filter(vol, sigma=1.5), dtype=torch.float32)
+
+    dft, edge_value_scaled, pad_width = precompute_volume_dft(vol, pad_factor)
+    projection = project_from_precomputed_dft(
+        dft, torch.eye(3)[None], edge_value_scaled, pad_width, fftfreq_max=None
+    )[0]
+
+    assert projection.shape == (d, d)
+    assert divmod(int(projection.argmax()), d) == (c, c)
+
+    edge = compute_cube_face_averages(vol, n=4)
+    padded = F.pad(vol - edge, [pad_width] * 6)
+    reference = (padded / separable_sinc2_correction(padded.shape)).sum(0)
+    reference = reference[pad_width : pad_width + d, pad_width : pad_width + d]
+    torch.testing.assert_close(projection, reference + edge * d, atol=1e-6, rtol=0)
+
+
 # ===========================================================================
 # apply_fourier_filters
 # ===========================================================================
@@ -253,6 +288,14 @@ class TestApplyFourierFilters:
         filters = self._fft_filters(f=2, h=16, w=16)
         out = apply_fourier_filters(projs, filters)
         assert out.shape == (2, 3, 16, 16)
+
+    @pytest.mark.parametrize("w", [15, 16])
+    def test_identity_filter_rfft_path_odd_and_even(self, w):
+        projs = self._real_projections(b=2, h=15, w=w)
+        filters = self._rfft_filters(f=1, h=15, w=w)
+        out = apply_fourier_filters(projs, filters)
+        assert out.shape == (1, 2, 15, w)
+        torch.testing.assert_close(out[0], projs, atol=1e-5, rtol=0)
 
     def test_identity_filter_rfft_path(self):
         projs = self._real_projections(b=4, h=16, w=16)
