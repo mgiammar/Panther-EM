@@ -22,7 +22,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import Annotated, Any, ClassVar, Literal
 
 import torch
 from pydantic import Field, model_validator
@@ -110,9 +110,14 @@ class DecisionSpec(Model):
 
 
 class StageSpec(Model):
-    """A :class:`~panther_em.search.Stage` (see :meth:`Stage.create`)."""
+    """A :class:`~panther_em.search.Stage` (see :meth:`Stage.create`).
 
-    rectangles: list[Rectangle] = Field(min_length=1)
+    ``rectangles="auto"`` takes the rectangles the stage's ``table`` was built for
+    (recorded in the table file; ``calibrate``'s error target picks them per
+    template, see :class:`~.calibrate.TableTarget`).
+    """
+
+    rectangles: Annotated[list[Rectangle], Field(min_length=1)] | Literal["auto"]
     table: str | None = None  # the ``tables`` tag of the threshold test
     precision: Precision = "fp32"
     n_psi: int = Field(default=256, ge=1)
@@ -142,7 +147,8 @@ class SearchConfig(ProgramConfig):
     invert_contrast : bool
         Negate each micrograph (when its contrast is opposite to the template's).
     stages : list of StageSpec
-        The stages in execution order.
+        The stages in execution order. A stage's ``rectangles: auto`` takes its
+        table's rectangles.
     weights_cells : Rectangle, optional
         Template weights kept resident (see :class:`~panther_em.search.Template`).
     execution : dict
@@ -210,6 +216,8 @@ class SearchConfig(ProgramConfig):
                 raise ValueError(f"stage {i}: unknown table {stage.table!r}")
             if stage.decision.calibration is not None and stage.table is None:
                 raise ValueError(f"stage {i}: a threshold test needs a table")
+            if stage.rectangles == "auto" and stage.table is None:
+                raise ValueError(f"stage {i}: rectangles 'auto' needs a table")
         if self.noise_table is not None and self.noise_table not in self.tables:
             raise ValueError(f"unknown noise_table {self.noise_table!r}")
         return self
@@ -351,6 +359,13 @@ class _Run:
             for spec in self.config.stages
         ]
 
+    def rectangles(self, spec: StageSpec) -> list[Rectangle]:
+        """The stage's rectangles: its own, or (``"auto"``) its table's."""
+        if spec.rectangles != "auto":
+            return spec.rectangles
+        assert spec.table is not None  # SearchConfig checks
+        return list(self.tables[spec.table].rectangles)
+
     def searcher(self, shape: tuple[int, int]) -> Searcher:
         """The searcher of micrographs of ``shape`` (thresholds depend on it)."""
         if shape not in self.searchers:
@@ -365,7 +380,7 @@ class _Run:
                     )
                 stages.append(
                     Stage.create(
-                        spec.rectangles,
+                        self.rectangles(spec),
                         precision=spec.precision,
                         n_psi=spec.n_psi,
                         orientations=spec.orientations,

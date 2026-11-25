@@ -105,7 +105,8 @@ steps from YAML configs; an application can also drive them directly:
    ``fourier_filters=whitening.template_filter(box)[None]``); the result records the
    warp every later step uses.
 4. Per feature selection (:func:`~panther_em.approximation.suggest_rectangles`
-   proposes ranks for an error target or a budget):
+   proposes ranks for an error target or a budget; the ``calibrate`` program can
+   take the smallest that meets a target):
    :func:`~panther_em.approximation.compute_error_tables`
    ``(volume, template.reconstructor, rectangles, whitening)`` (saved once per
    template).

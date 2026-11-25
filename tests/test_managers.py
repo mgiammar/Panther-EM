@@ -34,7 +34,10 @@ from leopard_em.pydantic_models.results.match_template_result import (
 from PIL import Image
 from pydantic import ValidationError
 
+from panther_em.approximation import PerSpatialFrequencyErrorTable, energy_spectrum
+from panther_em.approximation.errors import TABLE_NAMES
 from panther_em.cli import main
+from panther_em.decomposition import DecompositionBase
 from panther_em.managers import (
     CalibrateConfig,
     DecomposeConfig,
@@ -52,6 +55,7 @@ from panther_em.managers._common import (
     read_volume,
     save_output,
 )
+from panther_em.managers.calibrate import TableTarget
 from panther_em.search import (
     ExecutionConfig,
     Micrograph,
@@ -106,6 +110,10 @@ def test_config_validation(pipeline):
     data["stages"][0]["table"] = None
     with pytest.raises(ValidationError, match="needs a table"):
         SearchConfig.model_validate(data)
+    data["stages"][0]["decision"]["calibration"] = None
+    data["stages"][0]["rectangles"] = "auto"
+    with pytest.raises(ValidationError, match="'auto' needs a table"):
+        SearchConfig.model_validate(data)
     with pytest.raises(ValidationError, match="unique"):
         WhiteningConfig(
             micrographs=["a/m.mrc", "b/m.mrc"], output="w.h5", band_cutoff=0.3
@@ -122,6 +130,17 @@ def test_config_validation(pipeline):
             output_dir=".",
             tables={"a": [(0, 0, 0, 4)]},
         )
+    paths = {"volume": "v.mrc", "decomposition": "d.h5", "whitening": "w.h5"}
+    with pytest.raises(ValidationError, match="at least one rectangle"):
+        CalibrateConfig(**paths, output_dir=".", tables={"a": []})
+    with pytest.raises(ValidationError):  # a target needs max_error
+        CalibrateConfig.model_validate(
+            {**paths, "output_dir": ".", "tables": {"a": {"max_components": 8}}}
+        )
+    targeted = CalibrateConfig.model_validate(
+        {**paths, "output_dir": ".", "tables": {"a": {"max_error": 0.31}}}
+    )
+    assert targeted.tables["a"] == TableTarget(max_error=0.31)
 
 
 def test_execution_config():
@@ -572,3 +591,140 @@ def test_calibrate_needs_energies_for_suggestions(pipeline, tmp_path):
     )
     with pytest.raises(ValueError, match="block energies"):
         calibrate.run(config)
+
+
+def smallest_rectangle(rho: np.ndarray, allowed: np.ndarray) -> tuple:
+    """By brute force: the fewest-cell ``(0, 0, K, M)`` (lowest ``rho`` on a tie)."""
+    ks, ms = np.meshgrid(
+        np.arange(1, rho.shape[0] + 1), np.arange(1, rho.shape[1] + 1), indexing="ij"
+    )
+    order = np.lexsort((rho[allowed], (ks * ms)[allowed]))
+    return (0, 0, int(ks[allowed][order[0]]), int(ms[allowed][order[0]]))
+
+
+@pytest.fixture(scope="module")
+def targeted(pipeline, tmp_path_factory):
+    """The pipeline's calibration again with error targets beside explicit rectangles.
+
+    ``(output dir, target, expected rectangles by tag)``: the target is the
+    coarse rectangle's own pooled error, ``coarse`` meets it, ``capped`` also keeps
+    ``K`` below the uncapped pick, ``full`` is the pipeline's explicit rectangle.
+    """
+    module, out = pipeline
+    result = DecompositionBase.load(out / "decomposition.h5")
+    rho = energy_spectrum(result).rho_grid()[0]
+    k, m = module.COARSE[2:]
+    max_error = float(rho[k - 1, m - 1])
+    meets = rho <= max_error
+    expected = {"coarse": smallest_rectangle(rho, meets)}
+    k_cap = expected["coarse"][2] - 1
+    k_axis = np.arange(1, rho.shape[0] + 1)[:, None]
+    expected["capped"] = smallest_rectangle(rho, meets & (k_axis <= k_cap))
+    expected["full"] = module.FULL
+
+    target_out = tmp_path_factory.mktemp("targeted")
+    config = CalibrateConfig.from_yaml(out / "calibrate.yaml").model_copy(
+        update={
+            "output_dir": target_out,
+            "tables": {
+                "coarse": TableTarget(max_error=max_error),
+                "capped": TableTarget(max_error=max_error, max_k_extent=k_cap),
+                "full": [module.FULL],
+            },
+            "suggest": [],
+        }
+    )
+    config.to_yaml(target_out / "calibrate.yaml")
+    calibrate.run(config)
+    return target_out, max_error, expected
+
+
+def test_calibrate_error_target_picks_the_smallest_rectangle(pipeline, targeted):
+    """A target's table is built on the fewest-cell leading-corner rectangle whose
+    pooled error meets it, and calibration.json records the pick and its error."""
+    module, _ = pipeline
+    out, max_error, expected = targeted
+    # the target picks another shape than the configured coarse rectangle
+    assert expected["coarse"] != module.COARSE
+    assert expected["capped"] != expected["coarse"]
+    report = json.loads((out / "calibration.json").read_text())
+    for tag in ("coarse", "capped"):
+        rect = expected[tag]
+        table = PerSpatialFrequencyErrorTable.load(out / f"tables_{tag}.h5")
+        assert table.rectangles == (rect,)
+        entry = report["tables"][tag]
+        assert entry["rectangles"] == [list(rect)]
+        assert entry["target"]["max_error"] == max_error
+        assert entry["chosen"]["rectangle"] == list(rect)
+        assert entry["chosen"]["components"] == rect[2] * rect[3]
+        assert entry["chosen"]["rho"] <= max_error
+        assert entry["chosen"]["rho"] == pytest.approx(
+            entry["truncation_error"]["rho"], rel=1e-4
+        )
+    assert report["tables"]["capped"]["target"]["max_k_extent"] < expected["coarse"][2]
+    # the table file records the target, not the pick
+    recorded = read_config(out / "tables_coarse.h5", CalibrateConfig)
+    assert recorded.tables["coarse"] == TableTarget(max_error=max_error)
+
+
+def test_calibrate_explicit_rectangles_are_unchanged(pipeline, targeted):
+    """Explicit rectangles beside a target are kept as given: the same table."""
+    module, before = pipeline
+    out, _, _ = targeted
+    entry = json.loads((out / "calibration.json").read_text())["tables"]["full"]
+    assert entry["rectangles"] == [list(module.FULL)]
+    assert "target" not in entry and "chosen" not in entry
+    got = PerSpatialFrequencyErrorTable.load(out / "tables_full.h5")
+    want = PerSpatialFrequencyErrorTable.load(before / "tables_full.h5")
+    assert got.rectangles == want.rectangles == (module.FULL,)
+    for name in TABLE_NAMES:
+        assert torch.equal(getattr(got, name), getattr(want, name)), name
+
+
+def test_calibrate_unreachable_target(pipeline, tmp_path):
+    _, out = pipeline
+    config = CalibrateConfig.from_yaml(out / "calibrate.yaml").model_copy(
+        update={
+            "output_dir": tmp_path,
+            "tables": {"tiny": TableTarget(max_error=1e-6, max_components=1)},
+            "suggest": [],
+        }
+    )
+    with pytest.raises(ValueError, match="'tiny': no leading-corner rectangle"):
+        calibrate.run(config)
+    assert not list(tmp_path.iterdir())  # nothing written
+
+
+def test_search_auto_rectangles_take_the_tables(pipeline, targeted, tmp_path):
+    """``rectangles: auto`` resolves to the rectangles a stage's table was built for:
+    the explicit ones with the pipeline's tables, the target's pick with the
+    targeted ones; the search runs with them."""
+    module, out = pipeline
+    data = yaml.safe_load((out / "search.yaml").read_text())
+    for stage in data["stages"]:
+        stage["rectangles"] = "auto"
+    auto = SearchConfig.model_validate(data)
+    assert SearchConfig.model_validate(yaml.safe_load(auto.to_yaml())) == auto
+    shape = (module.MICROGRAPH, module.MICROGRAPH)
+    explicit = SearchConfig.from_yaml(out / "search.yaml")
+    want = [s.rectangles for s in search._Run(explicit).searcher(shape).stages]
+    got = [s.rectangles for s in search._Run(auto).searcher(shape).stages]
+    assert got == want == [(module.COARSE,), (module.FULL,)]
+
+    target_out, _, expected = targeted
+    tables = {tag: target_out / f"tables_{tag}.h5" for tag in ("coarse", "full")}
+    first = auto.micrographs[0]
+    config = auto.model_copy(
+        update={
+            "tables": tables,
+            "micrographs": [first],
+            "output_dir": tmp_path,
+            "cache_micrographs": False,
+        }
+    )
+    assert sorted(search.run(config)) == [first.key]
+    result = SearchResult.load(tmp_path / f"{first.key}_result.h5")
+    assert [s.rectangles for s in result.stages] == [
+        (expected["coarse"],),
+        (module.FULL,),
+    ]

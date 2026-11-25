@@ -4,7 +4,8 @@ In pipeline order:
 
 1. :mod:`.whitening` -- micrographs -> the dataset's whitening filter;
 2. :mod:`.decompose` -- template volume (+ whitening) -> decomposition;
-3. :mod:`.calibrate` -- decomposition + volume -> error tables per feature selection
+3. :mod:`.calibrate` -- decomposition + volume -> error tables per feature selection,
+   given as rectangles or as an error target the template's smallest rectangle meets
    (and the cheap errors and rank suggestions);
 4. :mod:`.search` -- micrographs -> one search result each (resumable);
 5. :mod:`.export` -- search results -> a Leopard-EM particle stack (HDF5) for its
