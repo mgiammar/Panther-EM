@@ -60,7 +60,7 @@ def _try_compile() -> Any:
 
         nvcc_flags = [
             "-O3",
-            "-std=c++17",
+            "-std=c++20",
             "-U__CUDA_NO_HALF_OPERATORS__",
             "-U__CUDA_NO_HALF_CONVERSIONS__",
             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
@@ -76,7 +76,7 @@ def _try_compile() -> Any:
             sources=[os.path.join(_CSRC_DIR, "lean_irfft_stats.cu")],
             extra_include_paths=[_CSRC_DIR],
             extra_cuda_cflags=nvcc_flags,
-            extra_cflags=["-O3", "-std=c++17"],
+            extra_cflags=["-O3", "-std=c++20"],
             verbose=bool(int(os.environ.get("PANTHER_EM_FUSED_KERNEL_VERBOSE", "0"))),
         )
     except Exception as exc:
