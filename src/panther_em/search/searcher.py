@@ -73,7 +73,7 @@ from panther_em.search.images import (
 )
 from panther_em.search.ledger import PixelLedger
 from panther_em.search.micrograph import Micrograph
-from panther_em.search.planning import DeviceInfo, plan_stage
+from panther_em.search.planning import DeviceInfo, featurize_mode, plan_stage
 from panther_em.search.results import SearchResult, StageResult
 from panther_em.search.runner import StageRunner, Timeline
 
@@ -283,10 +283,18 @@ class Searcher:
         A local stage needs ``seeds``: each pixel's previous best orientation.
         ``stage`` replaces ``stages[index]`` (a session's copy with another decision
         threshold).
+
+        The featurizations' resident data (the FFT engine's kernels) are allocated
+        first, so the free memory the store is sized to already excludes them.
         """
+        stage = self.stages[index] if stage is None else stage
+        if len(pixels) > 0:
+            mode = featurize_mode(self.execution, geometry, len(pixels))
+            for rect in stage.rectangles:
+                self.featurization(rect, mode).prepare()
         return plan_stage(
             index,
-            self.stages[index] if stage is None else stage,
+            stage,
             pixels,
             geometry,
             space=self.space,

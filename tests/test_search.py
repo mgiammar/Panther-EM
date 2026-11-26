@@ -19,10 +19,12 @@ from panther_em.search.decision import Decision, PixelLabel
 from panther_em.search.featurization import (
     BaseImageFeaturization,
     FeatureChunk,
+    FFTFeaturization,
 )
 from panther_em.search.hypotheses import HypothesisSet
 from panther_em.search.images import SearchImages
 from panther_em.search.ledger import PixelLedger
+from panther_em.search.planning import DeviceInfo
 from panther_em.search.results import MAP_NAMES, SearchResult, StageResult
 from panther_em.search.searcher import Searcher
 from panther_em.search.stage import Stage
@@ -755,6 +757,29 @@ def test_cuda_mixed_precision_two_stage_matches_cpu(synthetic_result):
     torch.testing.assert_close(gpu.mip[final], cpu.mip[final], rtol=1e-4, atol=1e-4)
     assert torch.equal(gpu.best_index[final], cpu.best_index[final])
     assert gpu.geometry == cpu.geometry and gpu.n_psi_of_stage == (128, 128)
+
+
+def test_fft_kernels_are_held_before_the_store_is_sized(template, monkeypatch):
+    """The planner measures the free memory after the FFT engine holds its kernels."""
+    stages = [
+        Stage.create([(0, 0, 3, 4)], n_psi=16, decision=Decision(0.0, accept=False)),
+        Stage.create([(0, 0, 4, 5)], n_psi=16),
+    ]
+    searcher = Searcher(template, stages, execution=replace(EXEC, featurize_mode="fft"))
+    held: list[list[tuple]] = []
+
+    def free_bytes(_info: DeviceInfo) -> None:
+        held.append(
+            sorted(
+                f.rect
+                for f in searcher._featurizations.values()
+                if isinstance(f, FFTFeaturization) and f.kernels is not None
+            )
+        )
+
+    monkeypatch.setattr(DeviceInfo, "free_bytes", free_bytes)
+    searcher.run(SearchImages.single(_image()))
+    assert held == [[(0, 0, 3, 4)], [(0, 0, 3, 4), (0, 0, 4, 5)]]
 
 
 def test_stage_planes_are_featurized_only_where_needed(template):

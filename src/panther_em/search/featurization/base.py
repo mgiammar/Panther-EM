@@ -22,6 +22,21 @@ if TYPE_CHECKING:
     from panther_em.decomposition.rectangles import Rectangle
 
 
+def free_device_bytes(device: torch.device) -> int | None:
+    """Memory a new allocation on ``device`` can use now (``None`` off CUDA).
+
+    Driver free memory plus what the caching allocator holds unused.
+    """
+    if device.type != "cuda":
+        return None
+
+    free = int(torch.cuda.mem_get_info(device)[0])
+
+    return free + int(
+        torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    )
+
+
 def rectangle_cells(rect: Rectangle) -> torch.Tensor:
     """``(k_extent * m_extent, 2)`` int64 ``(k, m)`` cells of ``rect``, row-major."""
     k0, m0, k_ext, m_ext = rect
@@ -139,6 +154,13 @@ class BaseImageFeaturization(ABC):
         return rectangle_cells(self.rect)
 
     # -- featurization ------------------------------------------------------------
+
+    def prepare(self) -> None:  # noqa: B027 (an optional hook, a no-op by default)
+        """Allocate what the featurization holds across calls.
+
+        The searcher calls it before it measures the free device memory a stage's
+        feature store is sized to, so that memory is not counted twice.
+        """
 
     def validate(
         self, planes: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor

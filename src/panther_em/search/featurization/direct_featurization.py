@@ -28,6 +28,7 @@ from panther_em._precision import Precision, check_precision
 from panther_em.search.featurization.base import (
     BaseImageFeaturization,
     FeatureChunk,
+    free_device_bytes,
     rectangle_cells,
 )
 
@@ -70,14 +71,8 @@ def _matmul(a: torch.Tensor, b: torch.Tensor, precision: Precision) -> torch.Ten
 
 def _free_device_bytes(device: torch.device) -> int:
     """Driver free memory plus what the caching allocator holds unused (CPU: 1 GiB)."""
-    if device.type != "cuda":
-        return 2**30
-
-    free = int(torch.cuda.mem_get_info(device)[0])
-
-    return free + int(
-        torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
-    )
+    free = free_device_bytes(device)
+    return 2**30 if free is None else free
 
 
 # --------------------------------------------------------------------------- #

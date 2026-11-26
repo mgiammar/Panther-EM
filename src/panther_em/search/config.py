@@ -41,7 +41,9 @@ class Tuning:
         merged across passes. When False, the passes hold all planes' features and the
         statistics are computed in one pass.
     cell_chunk : int
-        Kernel spectra per chunk of the FFT engine.
+        Most kernel spectra per chunk of the FFT engine; it takes fewer when their
+        working set would not fit the free device memory (see
+        :mod:`~panther_em.search.featurization.fft_featurization`).
     image_batch : int
         Positions per chunk of the direct engine.
     prepared_budget : int, optional
@@ -90,6 +92,8 @@ class ExecutionConfig:
         A stage whose store would exceed this fraction of the free device memory runs
         in *bands*: row-contiguous chunks of its pixels whose store fits, each
         featurized and reduced in turn; the maps are concatenated before the decision.
+        The FFT engine's resident kernels are allocated before the free memory is
+        measured, and its chunks are sized to what the store leaves.
     show_progress : bool
         Print per-stage progress bars.
     trace : bool

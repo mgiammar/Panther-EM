@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from itertools import pairwise
+
 import pytest
 import torch
 from conftest import count_kernel_builds, requires_cuda
@@ -17,6 +19,9 @@ from panther_em.search.featurization import (
 )
 from panther_em.search.featurization import (
     direct_featurization as direct_module,
+)
+from panther_em.search.featurization import (
+    fft_featurization as fft_module,
 )
 
 pytestmark = pytest.mark.filterwarnings(
@@ -180,6 +185,124 @@ def test_fft_builds_its_kernels_once(warp):
     assert built[0] == 6 and f.kernels.shape == (6, BOX, BOX)
     assert_features(first, reference(warp, x, rows, cols))
     assert not torch.allclose(first, second)
+
+
+# -- FFT memory ------------------------------------------------------------------------
+
+
+def pretend_free(monkeypatch, n_bytes):
+    """The FFT engine sees ``n_bytes`` of free device memory (on CPU too)."""
+    monkeypatch.setattr(fft_module, "free_device_bytes", lambda device: n_bytes)
+
+
+def dense_band(row_stop, col_stop):
+    """Every position of rows ``[0, row_stop)``, cols ``[0, col_stop)``, row-major."""
+    r, c = torch.meshgrid(torch.arange(row_stop), torch.arange(col_stop), indexing="ij")
+    return r.reshape(-1), c.reshape(-1)
+
+
+def test_working_set_sizing():
+    """A chunk holds as many cells as fit the budget, at most the limit."""
+    size = (10_000, 300, 2)  # FFT elements, positions, planes
+    one, two, three = (fft_module.working_set_bytes(n, *size) for n in (1, 2, 3))
+    assert one < two < three
+    assert fft_module.fitting_cells(two, *size, limit=32) == 2
+    assert fft_module.fitting_cells(two - 1, *size, limit=32) == 1
+    assert fft_module.fitting_cells(two, *size, limit=1) == 1
+    assert fft_module.fitting_cells(one - 1, *size, limit=32) == 0
+    assert fft_module.fitting_cells(10**15, *size, limit=32) == 32
+    # building each chunk's kernels takes more than holding them
+    built = fft_module.working_set_bytes(2, *size, kernel_size=400)
+    assert built > two
+    assert fft_module.fitting_cells(built, *size, kernel_size=400, limit=32) == 2
+    assert fft_module.fitting_cells(two, *size, kernel_size=400, limit=32) < 2
+
+
+def test_fft_chunks_are_sized_to_the_free_memory(warp, monkeypatch):
+    x = planes()
+    rows, cols = positions(40, 34, 31)
+    f = FFTFeaturization(warp, RECT, cell_chunk=4)
+    f.prepare()  # held kernels (CPU)
+    _, _, (f_h, f_w) = f.region(rows, cols)
+    need = fft_module.working_set_bytes(2, f_h * f_w, 40, 2)
+    pretend_free(monkeypatch, int(need / fft_module.WORKSPACE_FRACTION) + 1)
+    chunks = list(f.chunks(x, rows, cols))
+    assert [(c.plane, c.cells) for c in chunks[:3]] == [
+        (0, slice(0, 2)),
+        (1, slice(0, 2)),
+        (0, slice(2, 4)),
+    ]
+    assert {c.cells.stop - c.cells.start for c in chunks} == {2}
+    assert bool((coverage(chunks, 2, 6, 40) == 1).all())
+    assert_features(f.featurize(x, rows, cols), reference(warp, x, rows, cols))
+
+
+@pytest.mark.parametrize("dense", [True, False])
+def test_fft_splits_the_positions_when_one_cell_does_not_fit(warp, monkeypatch, dense):
+    """Runs of positions small enough for one cell's working set, the same features."""
+    x = planes(h=60, w=31)
+    rows, cols = dense_band(41, 12) if dense else positions(80, 60, 31)
+    n = int(rows.numel())
+    f = FFTFeaturization(warp, RECT, cell_chunk=4)
+    f.prepare()
+    _, _, (f_h, f_w) = f.region(rows, cols)
+    free = int(0.6 * fft_module.working_set_bytes(1, f_h * f_w, n, 2))
+    budget = int(fft_module.WORKSPACE_FRACTION * free)
+    tiles = f.tiles(rows, cols, 2, budget)
+    assert len(tiles) > 1
+    assert tiles[0].columns.start == 0 and tiles[-1].columns.stop == n
+    assert all(a.columns.stop == b.columns.start for a, b in pairwise(tiles))
+    for tile in tiles:
+        _, _, (h, w) = f.region(rows[tile.columns], cols[tile.columns])
+        size = tile.columns.stop - tile.columns.start
+        assert fft_module.working_set_bytes(tile.cell_chunk, h * w, size, 2) <= budget
+    pretend_free(monkeypatch, free)
+    chunks = list(f.chunks(x, rows, cols))
+    assert {c.columns for c in chunks} == {t.columns for t in tiles}
+    assert bool((coverage(chunks, 2, 6, n) == 1).all())
+    assert_features(f.featurize(x, rows, cols), reference(warp, x, rows, cols))
+
+
+def test_fft_builds_kernels_per_chunk_when_they_do_not_fit(warp, monkeypatch):
+    monkeypatch.setattr(fft_module, "KERNEL_FRACTION", 0.0)
+    pretend_free(monkeypatch, 10**12)
+    built = count_kernel_builds(warp)
+    f = FFTFeaturization(warp, RECT, cell_chunk=4)
+    x = planes()
+    rows, cols = positions(30, 34, 31)
+    first = f.featurize(x, rows, cols)
+    assert f.kernels is None and built[0] == 6
+    f.featurize(x, rows, cols)
+    assert built[0] == 12  # every call builds them again
+    assert_features(first, reference(warp, x, rows, cols))
+
+
+@requires_cuda
+def test_cuda_fft_peak_memory_stays_within_its_budget(synthetic_result, monkeypatch):
+    """The working-set model bounds the measured peak (cuFFT's work area included)."""
+    warp = make_warp(synthetic_result, device="cuda")
+    device = warp.device
+    x = planes(d=1, h=120, w=110).to(device)
+    rows, cols = (t.to(device) for t in dense_band(101, 91))
+    n = int(rows.numel())
+    f = FFTFeaturization(warp, RECT, cell_chunk=32)
+    f.prepare()
+    _, _, (f_h, f_w) = f.region(rows, cols)
+    need = fft_module.working_set_bytes(3, f_h * f_w, n, 1)
+    pretend_free(monkeypatch, int(need / fft_module.WORKSPACE_FRACTION) + 1)
+    out = torch.empty((f.n_cells, n), dtype=torch.complex64, device=device)
+    torch.cuda.synchronize(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    base = torch.cuda.memory_allocated(device)
+    cells = []
+    for chunk in f.chunks(x, rows, cols):  # holds the last chunk, as the runner does
+        out[chunk.cells, chunk.columns] = chunk.values
+        cells.append(chunk.cells.stop - chunk.cells.start)
+    torch.cuda.synchronize(device)
+    assert cells == [3, 3]
+    assert torch.cuda.max_memory_allocated(device) - base <= need
+    expected = reference(warp, x.cpu(), rows.cpu(), cols.cpu())
+    assert_features(out[None], expected)
 
 
 # -- direct ---------------------------------------------------------------------------

@@ -359,6 +359,18 @@ class StagePlan:
         return sum(len(band.passes) for band in self.bands)
 
 
+def featurize_mode(
+    execution: ExecutionConfig, geometry: SearchGeometry, n_pixels: int
+) -> Mode:
+    """The featurization engine of a stage over ``n_pixels`` of ``geometry``.
+
+    ``execution.featurize_mode``, or with ``"auto"`` :func:`choose_mode`'s.
+    """
+    if execution.featurize_mode == "auto":
+        return choose_mode(geometry, n_pixels)
+    return execution.featurize_mode
+
+
 def plan_bands(
     pixels: PixelSelection, per_pixel: int, limit: int | None, gemm_pixels: int
 ) -> list[PixelSelection]:
@@ -465,11 +477,7 @@ def plan_stage(
         if tuning.plane_major and len(planes) > 1
         else [tuple(planes)]
     )
-    mode: Mode = (
-        choose_mode(geometry, len(pixels))
-        if execution.featurize_mode == "auto"
-        else execution.featurize_mode
-    )
+    mode = featurize_mode(execution, geometry, len(pixels))
     per_pixel = feature_bytes_per_pixel(
         (rect, stage.precision, len(passes[0])) for rect in stage.rectangles
     )
