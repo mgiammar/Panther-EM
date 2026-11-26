@@ -254,7 +254,7 @@ class TestOffsetPolarTransformProperties:
         t = OffsetPolarTransform.from_image(IMAGE_SHAPE)
         h, w = IMAGE_SHAPE
         assert t.cartesian_shape == IMAGE_SHAPE
-        assert t.center == (h / 2 - 0.5, w / 2 - 0.5)
+        assert t.center == (float(h // 2), float(w // 2))  # the FFT centre
         assert t.radius == h / 2
 
     def test_from_image_custom_params(self):

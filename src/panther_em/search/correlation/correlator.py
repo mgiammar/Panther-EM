@@ -22,8 +22,12 @@ from panther_em.search.correlation.contraction import Precision
 from panther_em.search.correlation.local import LocalWeights, correlate_local
 from panther_em.search.correlation.loop import HypLoop
 from panther_em.search.correlation.maps import StageMaps
-from panther_em.search.correlation.moments import MomentForms
-from panther_em.search.correlation.reduction import make_block_stats
+from panther_em.search.correlation.moments import (
+    MomentForms,
+    block_moments,
+    moments_to_stats,
+)
+from panther_em.search.correlation.reduction import emission_sink, make_block_stats
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Hashable, Iterator, Mapping
@@ -243,10 +247,27 @@ class Correlator:
         maps = StageMaps.empty(store.n_pixels, self.device, hyps.n_evaluated)
         targets = maps.as_targets()
         loop = None
+        sink = emission_sink()
+        forms_all = None
+        if sink is not None:
+            # exact per-pixel moments before the block runs, in closed form: over every
+            # template ("all") or over the pass's own ("stage"); the cut then needs no
+            # running estimate (which plane-to-plane differences in variance would bias)
+            forms_all = (
+                self.all_template_forms(plan, source, source_key)
+                if sink.normalize == "all"
+                else self.moment_forms(plan)
+            )
+            n_all = hyps.n_defocus_selected * forms_all.n_templates * plan.stage.n_psi
+            maps.n_evaluated = n_all
         with self._on_compute():
             for block in store.blocks(plan.groups):
                 if loop is None:
                     loop = self.loop_for(plan, prepared, block.operands, source_key)
+                if forms_all is not None:
+                    s1, s2 = block_moments(plan, forms_all, block.operands, block.n_valid)
+                    mean, variance = moments_to_stats(s1, s2, n_all)
+                    loop.stats.set_external_moments(mean, variance, block.n_valid)
                 loop.run(block.operands, block.n_valid)
                 start, n_valid = block.col_range[0], block.n_valid
                 loop.stats.finalize_into(targets, start, n_valid)
@@ -265,6 +286,20 @@ class Correlator:
         with torch.cuda.stream(self.compute):
             yield
         caller.wait_stream(self.compute)
+
+    def all_template_forms(
+        self, plan: LoopPlan, source: TensorWeights, source_key: Hashable
+    ) -> MomentForms:
+        """Closed-form moments over EVERY template row of ``source`` (cached)."""
+        key = ("all", source_key, plan.layout.rectangles, plan.engine.precision,
+               plan.stage.n_psi)
+        forms = self.forms.get(key)
+        if forms is None:
+            forms = MomentForms.build(
+                source, plan.layout, plan.engine, plan.stage.n_psi, template_rows=None
+            )
+            self.forms[key] = forms
+        return forms
 
     # -- local passes ------------------------------------------------------------
 

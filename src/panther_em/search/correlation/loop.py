@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from panther_em.search.correlation.contraction import Spectrum
-from panther_em.search.correlation.reduction import SpectrumSpec
+from panther_em.search.correlation.reduction import SpectrumSpec, emission_active
 
 if TYPE_CHECKING:
     from panther_em.search.correlation.contraction import ContractionEngine
@@ -127,6 +127,7 @@ class LoopPlan:
             memory.hyps.n_defocus_selected,
             memory.fused,
             memory.loop,
+            emission_active(),  # an emitting loop is never reused as a plain one
             str(memory.device),
         )
         return cls(

@@ -26,6 +26,7 @@ index within the batch.
 
 from __future__ import annotations
 
+import contextlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -38,7 +39,7 @@ from panther_em.search.correlation.kernels.packed import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
 
     from panther_em.search.correlation.contraction import Spectrum
     from panther_em.search.hypotheses import HypBatch
@@ -107,9 +108,18 @@ def reduce_spectrum(
     imaginary Nyquist part its output depends on the batch shape (up to 4 % on the
     maximum).
     """
+    s1, s2, corr = moments_and_correlogram(spectrum, n_psi)
+    vmax, amax = corr.reshape(corr.shape[0], -1).max(dim=1)
+    return s1, s2, vmax, amax
+
+
+def moments_and_correlogram(
+    spectrum: torch.Tensor, n_psi: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(s1, s2, corr)``: :func:`reduce_spectrum`'s moment sums and the ``(P, N,
+    n_psi)`` correlogram itself (psi axis not yet reversed)."""
     spectrum, nyquist = hermitian_spectrum(spectrum, n_psi)
     corr = torch.fft.irfft(spectrum, n=n_psi, dim=-1, norm="forward")
-    p = corr.shape[0]
 
     re, im = spectrum.real, spectrum.imag
     dc_real = re[..., 0]
@@ -121,9 +131,7 @@ def reduce_spectrum(
         # the Nyquist bin is real and not doubled: replace its 2 |C|^2 by Re(C)^2
         per_hyp = per_hyp - n_psi * (2.0 * power[..., -1] - re[..., -1] * re[..., -1])
     s2 = per_hyp.sum(dim=1)
-
-    vmax, amax = corr.reshape(p, -1).max(dim=1)
-    return s1, s2, vmax, amax
+    return s1, s2, corr
 
 
 # --------------------------------------------------------------------------- #
@@ -356,6 +364,217 @@ class LeanBlockStats(BlockStats):
         return value, hyp, psi
 
 
+# --------------------------------------------------------------------------- #
+# Entry emission: every correlation above a z cut, not only the maximum
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class EmittedEntries:
+    """Correlations with per-pixel z >= ``z_cut`` collected by :func:`emit_entries`.
+
+    Every array is 1-D and aligned; ``column`` is the stage's compact pixel order
+    (``StageResult.pixel_index[column]`` is the flat pixel id), ``virtual`` the
+    plan's virtual hypothesis id, ``psi`` the in-plane index (already reversed like
+    the maps' ``best_psi``), ``value`` the raw correlation and ``mean``/``std`` that
+    pixel's moments over every (hypothesis, psi) of the stage.
+    """
+
+    z_cut: float
+    margin: float = 0.5
+    normalize: str = "stage"
+    #: added to emitted columns: the runner's position of the current band in the
+    #: stage's concatenated (compact) pixel order
+    column_offset: int = 0
+    chunks: list[dict[str, torch.Tensor]] | None = None
+
+    def __post_init__(self) -> None:
+        self.chunks = []
+
+    def add(self, **arrays: torch.Tensor) -> None:
+        assert self.chunks is not None
+        self.chunks.append({k: v.detach().cpu() for k, v in arrays.items()})
+
+    def gather(self) -> dict[str, torch.Tensor]:
+        """Every chunk concatenated (empty arrays when nothing was emitted)."""
+        assert self.chunks is not None
+        keys = ("column", "virtual", "psi", "value", "z", "mean", "std")
+        if not self.chunks:
+            return {k: torch.empty(0) for k in keys}
+        return {k: torch.cat([c[k] for c in self.chunks]) for k in keys}
+
+    @property
+    def n_entries(self) -> int:
+        assert self.chunks is not None
+        return sum(int(c["value"].numel()) for c in self.chunks)
+
+
+_EMIT: EmittedEntries | None = None
+
+
+def emission_active() -> bool:
+    """Whether passes planned now must emit entries (and so skip the fused kernel)."""
+    return _EMIT is not None
+
+
+def emission_sink() -> EmittedEntries | None:
+    """The active :func:`emit_entries` sink, if any."""
+    return _EMIT
+
+
+@contextlib.contextmanager
+def emit_entries(
+    z_cut: float, margin: float = 0.5, normalize: str = "stage"
+) -> Iterator[EmittedEntries]:
+    """Collect every correlation with per-pixel z >= ``z_cut`` from the passes run
+    inside the context (the correlation table of a 2DTM search).
+
+    Passes planned inside the context take the reference reduction (planning drops
+    the fused kernel while emission is active, and emitting loops are cached apart).
+
+    ``normalize="stage"``: z over the pass's own hypotheses. Each batch keeps
+    correlations above ``mean + (z_cut - margin) sd`` of the pixel's moments so far;
+    the block's exact moments then apply the cut.
+
+    ``normalize="all"``: each pixel's mean and sd over EVERY template of the
+    searcher's weights (all planes, all psi), in closed form (:mod:`.moments`), while
+    the pass correlates only its own hypotheses -- an angular restriction then limits
+    what may be detected, not what z is measured against (Leopard-EM's default). The
+    maps' mean, variance and z-score use the same moments, known before the block
+    runs, so the cut applies directly.
+    """
+    if normalize not in ("stage", "all"):
+        raise ValueError(f"normalize must be 'stage' or 'all', not {normalize!r}")
+    global _EMIT
+    previous, _EMIT = _EMIT, EmittedEntries(
+        z_cut=float(z_cut), margin=float(margin), normalize=normalize
+    )
+    try:
+        yield _EMIT
+    finally:
+        _EMIT = previous
+
+
+class EmittingBlockStats(TorchBlockStats):
+    """:class:`TorchBlockStats` that also emits entries above a z cut."""
+
+    def __init__(
+        self,
+        *,
+        n_sub: int,
+        gemm_pixels: int,
+        n_psi: int,
+        device: torch.device,
+        sink: EmittedEntries,
+    ) -> None:
+        super().__init__(
+            n_sub=n_sub, gemm_pixels=gemm_pixels, n_psi=n_psi, device=device
+        )
+        self._sink = sink
+        self.seen = torch.zeros(self.n_sub, dtype=torch.float64)
+        self.buffer: list[tuple[torch.Tensor, ...]] = []
+        #: ``(mean, sd)`` of the block's rows over a wider template set, set by the
+        #: correlator before each block when the sink normalises over every template
+        self.external: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def set_external_moments(
+        self, mean: torch.Tensor, variance: torch.Tensor, n_valid: int
+    ) -> None:
+        """Use these ``(n_valid,)`` moments for this block (padding rows never emit)."""
+        n = self.n_sub * self.gemm_pixels
+        m = torch.zeros(n, device=self.device, dtype=torch.float32)
+        sd = torch.full((n,), float("inf"), device=self.device, dtype=torch.float32)
+        m[:n_valid] = mean[:n_valid]
+        sd[:n_valid] = variance[:n_valid].clamp_min(0.0).sqrt().clamp_min(1e-12)
+        self.external = (m, sd)
+
+    @property
+    def sink(self) -> EmittedEntries:
+        return _EMIT if _EMIT is not None else self._sink
+
+    def _clear_best(self) -> None:
+        super()._clear_best()
+        self.seen.zero_()
+        self.buffer.clear()
+
+    def _consume(self, spectrum: Spectrum, batch: HypBatch, rows: slice) -> None:
+        n_psi = self.n_psi
+        s1, s2, corr = moments_and_correlogram(spectrum.pnf(), n_psi)
+        self.corr_sum[rows] += s1
+        self.corr_sum2[rows] += s2
+        flat = corr.reshape(corr.shape[0], -1)
+        vmax, amax = flat.max(dim=1)
+        best = self.best_corr[rows]
+        improved = vmax > best
+        hyp = batch.virtual_offset + torch.div(amax, n_psi, rounding_mode="floor")
+        psi = (n_psi - amax % n_psi) % n_psi
+        torch.where(improved, vmax, best, out=best)
+        best_hyp = self.best_hypothesis[rows]
+        torch.where(improved, hyp, best_hyp, out=best_hyp)
+        best_psi = self.best_psi[rows]
+        torch.where(improved, psi, best_psi, out=best_psi)
+
+        if self.external is not None:  # exact moments, known up front
+            mean, sd = (v[rows] for v in self.external)
+            floor = mean + self.sink.z_cut * sd
+        else:  # the pixel's moments so far, less a margin
+            sub = rows.start // self.gemm_pixels
+            self.seen[sub] += batch.size * n_psi
+            n = float(self.seen[sub])
+            mean = self.corr_sum[rows] / n
+            sd = (self.corr_sum2[rows] / n - mean * mean).clamp_min(0.0).sqrt()
+            floor = mean + (self.sink.z_cut - self.sink.margin) * sd
+        hit = (corr >= floor[:, None, None]).nonzero()
+        if hit.numel():
+            p, q, a = hit.unbind(1)
+            self.buffer.append(
+                (
+                    p + rows.start,
+                    batch.virtual_offset + q,
+                    (n_psi - a) % n_psi,
+                    corr[p, q, a],
+                )
+            )
+
+    @torch.no_grad()
+    def finalize_into(
+        self, outs: Mapping[str, torch.Tensor], start: int, n_valid: int
+    ) -> None:
+        super().finalize_into(outs, start, n_valid)
+        if self.external is not None:
+            mean, sd = self.external
+            best = self.best_corr[:n_valid]
+            for key, value in (
+                ("mean", mean[:n_valid]),
+                ("variance", sd[:n_valid] ** 2),
+                ("zscore", (best - mean[:n_valid]) / sd[:n_valid]),
+            ):
+                target = outs[key]
+                target[start : start + n_valid] = value.to(target.device, target.dtype)
+        else:
+            n = max(self.n_evaluated, 1)
+            mean = self.corr_sum / n
+            sd = (self.corr_sum2 / n - mean * mean).clamp_min(0.0).sqrt().clamp_min(1e-12)
+        self.external = None
+        if not self.buffer:
+            return
+        row, virtual, psi, value = (torch.cat(c) for c in zip(*self.buffer))
+        self.buffer.clear()
+        z = (value - mean[row]) / sd[row]
+        keep = (z >= self.sink.z_cut) & (row < n_valid)
+        if bool(keep.any()):
+            row = row[keep]
+            self.sink.add(
+                column=row + start + self.sink.column_offset,
+                virtual=virtual[keep],
+                psi=psi[keep],
+                value=value[keep],
+                z=z[keep],
+                mean=mean[row],
+                std=sd[row],
+            )
+
+
 def fused_stats_supported(spec: SpectrumSpec) -> bool:
     """Whether a pass with ``spec`` reduces on the fused kernel.
 
@@ -374,6 +593,19 @@ def fused_stats_supported(spec: SpectrumSpec) -> bool:
 
 def make_block_stats(spec: SpectrumSpec, *, fused: bool) -> BlockStats:
     """A fresh block accumulator for ``spec`` (the fused kernel when ``fused``)."""
+    if _EMIT is not None:
+        if fused:
+            raise RuntimeError(
+                "entry emission needs the reference reduction: search with "
+                "Tuning(use_fused_kernel=False, use_cuda_graph=False)"
+            )
+        return EmittingBlockStats(
+            n_sub=spec.n_sub,
+            gemm_pixels=spec.gemm_pixels,
+            n_psi=spec.n_psi,
+            device=spec.device,
+            sink=_EMIT,
+        )
     cls: type[BlockStats] = LeanBlockStats if fused else TorchBlockStats
     return cls(
         n_sub=spec.n_sub,

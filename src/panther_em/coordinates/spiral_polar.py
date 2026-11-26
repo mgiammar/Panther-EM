@@ -618,7 +618,7 @@ class SpiralPolarTransform(CoordinateTransform):
             Number of angular samples (spiral arms). Defaults to
             ``round((h * w / num_radius) / spacing_ratio_relative_to_cartesian)``.
         center : tuple[float, float] | None, optional
-            ``(row, col)`` centre. Defaults to image centre.
+            ``(row, col)`` centre. Defaults to the FFT centre ``(h // 2, w // 2)``.
         radius : float | None, optional
             Maximum radius in pixels. Defaults to ``height / 2``.
         c : float, optional
@@ -636,7 +636,12 @@ class SpiralPolarTransform(CoordinateTransform):
         height, width = image_shape
 
         if center is None:
-            center = (height / 2 - 0.5, width / 2 - 0.5)
+            # The centre of a Fourier-slice projection (and of an FFT-centred image):
+            # index n // 2, not (n - 1) / 2. For an even box the old (n / 2 - 0.5)
+            # rotated every template in-plane about a point half a pixel off its
+            # centre, moving the correlation peak by (I - R(-psi)) (1/2, 1/2) px.
+            # Odd boxes are unchanged (n // 2 == (n - 1) / 2).
+            center = (float(height // 2), float(width // 2))
 
         if radius is None:
             radius = height / 2  # Assuming square images, radius is half the height

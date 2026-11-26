@@ -29,6 +29,7 @@ from panther_em.search.correlation.kernels import fused_kernel_loader
 from panther_em.search.correlation.loop import cuda_graph_capture_supported
 from panther_em.search.correlation.reduction import (
     SpectrumSpec,
+    emission_active,
     fused_stats_supported,
 )
 from panther_em.search.featurization import choose_mode
@@ -249,7 +250,10 @@ def plan_memory(
         device=device.device,
     )
     fused = bool(
-        tuning.use_fused_kernel and device.fused_kernel and fused_stats_supported(probe)
+        tuning.use_fused_kernel
+        and device.fused_kernel
+        and fused_stats_supported(probe)
+        and not emission_active()  # entries need the reference reduction
     )
 
     elem = torch.empty((), dtype=engine.spectrum_dtype).element_size()
@@ -503,11 +507,14 @@ def plan_stage(
     # over every plane
     passes = (
         [(p,) for p in planes]
-        if tuning.plane_major and len(planes) > 1
+        # an emitting pass needs every plane at once: z is over all of them
+        if tuning.plane_major and len(planes) > 1 and not emission_active()
         else [tuple(planes)]
     )
     mode: Mode = (
-        choose_mode(geometry, len(pixels))
+        # an emitting pass runs on a sparse survivor set: direct featurization needs no
+        # full-size kernel per cell (FFT's cost at a high rank: cells x box^2 x 8 B)
+        ("direct" if emission_active() else choose_mode(geometry, len(pixels)))
         if execution.featurize_mode == "auto"
         else execution.featurize_mode
     )

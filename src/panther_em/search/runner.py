@@ -27,6 +27,7 @@ from panther_em.search.correlation import (
     concat_stage_maps,
     merge_stage_maps,
 )
+from panther_em.search.correlation.reduction import emission_sink
 from panther_em.search.featurization import ColumnSubset, FeatureStore
 from panther_em.search.seeding import seed_work
 
@@ -160,12 +161,19 @@ class StageRunner:
             progress = bar.update
         timing = [0.0, 0.0]
         band_maps = []
+        sink = emission_sink()
+        offset = 0
         for band in plan.bands:
+            if sink is not None:  # emitted columns address the concatenated maps
+                sink.column_offset = offset
             parts = [
                 self._run_pass(plan, band, step, timing, progress)
                 for step in band.passes
             ]
             band_maps.append(merge_stage_maps(parts, plan.hyps.n_selected))
+            offset += len(band.pixels)
+        if sink is not None:
+            sink.column_offset = 0
         return StageRun(concat_stage_maps(band_maps), timing[0], timing[1])
 
     def _run_pass(
